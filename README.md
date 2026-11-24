@@ -82,7 +82,10 @@ board-tested writable-state profile.
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| GPIO and UART | Working | Nano pin names and UART0 console. |
+| GPIO | Working | Nano pin names through `espctl gpio`. |
+| UART0 | Working | Boot log and login console on D0/D1. |
+| On-chip temperature sensor | Working | Reports ESP32-S3 die temperature through `hwmon` as `temp1_input` in millidegrees Celsius. |
+| Onboard RGB LED | Working | Red, green, and blue channels under `/sys/class/leds/`. |
 | USB host | Working | HID and FAT storage. |
 | SPI2 | Working, disabled by default | Tested on the Nano header. |
 | ST7789 240×240 | Working, disabled by default | Tested as a framebuffer and boot console. |
