@@ -1,0 +1,29 @@
+diff --git a/drivers/mtd/devices/esp32s3-flash-nor-ll.c b/drivers/mtd/devices/esp32s3-flash-nor-ll.c
+--- a/drivers/mtd/devices/esp32s3-flash-nor-ll.c
++++ b/drivers/mtd/devices/esp32s3-flash-nor-ll.c
+@@ -139,6 +139,8 @@
+ 	".balign 4\n.global esp32s3_nor_blob_start\n"
+ 	"esp32s3_nor_blob_start:\n.previous\n");
+ 
++void esp32s3_nor_entry(struct fn_task *t);
++
+ __attribute__((__noinline__, __section__(".text.esp32s3_nor_template")))
+ void esp32s3_nor_entry(struct fn_task *t)
+ {
+@@ -160,6 +162,7 @@
+ 	    (rd(SPI1 + 0x54) & 7) || (rd(SPI0 + 0xe0) & 1) ||
+ 	    (rd(SPI0 + 0x08) & 0x270U) ||
+ 	    (rd(SPI1 + 0xa0) & 1) || (rd(SPI1 + 0x98) & 1) ||
++	    (rd(SPI1 + 0xa4) & 1) || !(rd(SPI1 + 0xe8) & 1) ||
+ 	    (rd(EXTMEM + 0x88) & 1) || (rd(EXTMEM + 0x28) & 7) ||
+ 	    ((rd(EXTMEM) >> 3) & 3) > 2)
+ 		return;
+@@ -200,7 +203,7 @@
+ 	}
+ 	sr2 = transact(t, 0x35, 0, 1, 0) & 0xff;
+ 	/* Never clear protection bits or change QE/calibration configuration. */
+-	if ((sr & 0x7c) || (sr2 & 0x40))
++	if ((sr & 0x7c) || (sr2 & 0xc0))
+ 		goto restore;
+ 	transact(t, 0x06, 0, 0, 0);
+ 	if ((status(t) & 3) != 2)

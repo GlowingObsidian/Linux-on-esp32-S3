@@ -1,0 +1,71 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -872,7 +872,7 @@
+ 	 * kmalloc'd objects, so it is a kernel virtual address, and the
+ 	 * whole point is to see whether the same one comes back.
+ 	 */
+-	pr_info("osi: _mutex_lock(%p) task %s caller %pS\n", m, current->comm,
++	pr_debug("osi: _mutex_lock(%p) task %s caller %pS\n", m, current->comm,
+ 		__builtin_return_address(0));
+ 
+ 	if (!m)
+@@ -896,7 +896,7 @@
+ 	struct osi_mutex *m = mutex;
+ 	int32_t ret;
+ 
+-	pr_info("osi: _mutex_unlock(%p) task %s caller %pS\n", m, current->comm,
++	pr_debug("osi: _mutex_unlock(%p) task %s caller %pS\n", m, current->comm,
+ 		__builtin_return_address(0));
+ 
+ 	if (!m)
+@@ -1097,13 +1097,13 @@
+ 		 * include/linux/semaphore.h), so the list is reached
+ 		 * through first_waiter, not a list_head on the semaphore.
+ 		 */
+-		pr_info("osi: semphr_take(%p) blocking take, task %s count=%u first_waiter=%p sp=%p caller=%pS\n",
++		pr_debug("osi: semphr_take(%p) blocking take, task %s count=%u first_waiter=%p sp=%p caller=%pS\n",
+ 			s, current->comm, s->sem.count,
+ 			s->sem.first_waiter,
+ 			__builtin_frame_address(0),
+ 			__builtin_return_address(0));
+ 		ret = down_killable(&s->sem);
+-		pr_info("osi: semphr_take(%p) blocking take done: %d\n", s, ret);
++		pr_debug("osi: semphr_take(%p) blocking take done: %d\n", s, ret);
+ 
+ 		if (ret)
+ 			pr_warn("osi: semphr_take(%p) blocking take failed: %d (task %s)\n",
+@@ -1359,7 +1359,7 @@
+ 		 * one of the three that can reach the fault this print is
+ 		 * for. See the comment on osi_queue_recv for the chain.
+ 		 */
+-		pr_info("osi: %s(%p) sp=%p ticks=%u wq=%p next=%p prev=%p\n",
++		pr_debug("osi: %s(%p) sp=%p ticks=%u wq=%p next=%p prev=%p\n",
+ 			__func__, q, __builtin_frame_address(0), ticks,
+ 			&q->wait, q->wait.head.next, q->wait.head.prev);
+ 		left = wait_event_killable_timeout(q->wait,
+@@ -1464,7 +1464,7 @@
+ 		 * entry still lands at NULL - 24, the frame is the problem.
+ 		 * If sp is already bad, the corruption is earlier.
+ 		 */
+-		pr_info("osi: %s(%p) sp=%p ticks=%u wq=%p next=%p prev=%p\n",
++		pr_debug("osi: %s(%p) sp=%p ticks=%u wq=%p next=%p prev=%p\n",
+ 			__func__, q, __builtin_frame_address(0), ticks,
+ 			&q->wait, q->wait.head.next, q->wait.head.prev);
+ 		left = wait_event_killable_timeout(q->wait,
+@@ -3913,7 +3913,7 @@
+ 	dev_info(&pdev->dev, "internal SRAM pool: %zu bytes\n",
+ 		 gen_pool_size(osi_internal_pool));
+ 
+-	osi_timer_wq = alloc_workqueue("esp_wifi_timers", WQ_MEM_RECLAIM, 1);
++	osi_timer_wq = alloc_workqueue("esp_wifi_timers", WQ_MEM_RECLAIM | WQ_PERCPU, 1);
+ 	if (!osi_timer_wq)
+ 		return -ENOMEM;
+ 	ret = devm_add_action_or_reset(&pdev->dev, osi_timers_shutdown, NULL);
+@@ -3980,6 +3980,7 @@
+ 		dev_err(&pdev->dev, "esp_wifi_init failed: %d\n", ret);
+ 		goto err_phy;
+ 	}
++	hw->adapter.dev = &pdev->dev;
+ 	g_blob = hw;
+ 
+ 	/* Install the interface before the blob runs a single instruction.

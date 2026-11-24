@@ -1,0 +1,490 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -3455,12 +3455,7 @@
+  * only transitively; spelling it out keeps the offsets visible next to
+  * the IDF struct they are filled from.
+  */
+-struct blob_disconnect_event {
+-	struct event_header header;
+-	u8  ssid[32];
+-	u8  bssid[6];
+-	u8  reason;
+-} __packed;
++
+ 
+ /*
+  * Queue one wire event for the driver's RX work, the same way a received
+@@ -3526,10 +3521,10 @@
+ 	}
+ 
+ 	case WIFI_EVENT_STA_DISCONNECTED: {
+-		struct blob_disconnect_event ev;
++		struct disconnect_event ev;
+ 		struct blob_event_sta_disconnected *d = event_data;
+ 
+-		if (!d) {
++		if (!d || event_data_size < offsetof(struct blob_event_sta_disconnected, reason) + 1) {
+ 			pr_err("event: disconnect with no data\n");
+ 			break;
+ 		}
+@@ -3703,7 +3698,6 @@
+ extern int esp_wifi_clear_ap_list(void);
+ 
+ static bool blob_sta_callback_ready(void) { return true; }
+-static int blob_sta_connect_not_ready(u8 *bssid) { return -EOPNOTSUPP; }
+ static void blob_sta_connected_notice(u8 *bssid) { }
+ static void blob_sta_disconnected_notice(u8 reason) { }
+ static bool blob_sta_handshake(void) { return false; }
+@@ -3849,15 +3843,344 @@
+ 	return ret;
+ }
+ 
++/* Linux owns SME/WPA; the blob performs MAC authentication, association
++ * and key installation through the same private APIs as esp-hosted.
++ */
++extern int esp_wifi_set_config(int ifx, const blob_wifi_config_t *config);
++extern int esp_wifi_connect(void);
++extern int esp_wifi_connect_internal(const u8 *bssid);
++extern int esp_wifi_issue_assoc_internal(u8 status);
++extern void esp_wifi_deauthenticate_internal(u8 reason);
++extern int esp_wifi_set_appie_internal(u8 type, u8 *ie, u16 len, u8 flag);
++extern int esp_wifi_unset_appie_internal(u8 type);
++extern int esp_wifi_set_sta_key_internal(int alg, u8 *addr, int index, int set_tx,
++				       u8 *seq, size_t seq_len, u8 *key, size_t key_len,
++				       int flags);
++extern int esp_wifi_set_igtk_internal(u8 ifx, const void *igtk);
++extern bool esp_wifi_auth_done_internal(void);
++extern int esp_wifi_set_mac(int ifx, const u8 *mac);
++extern int esp_wifi_set_max_tx_power(s8 power);
++extern int esp_wifi_get_max_tx_power(s8 *power);
++extern int esp_wifi_set_country_code(const char *country, bool ieee80211d);
++extern int esp_wifi_get_country_code(char *country);
++extern int hexstr2bin(const char *hex, u8 *buf, size_t len);
++static DEFINE_SPINLOCK(blob_station_lock);
++static u8 blob_station_bssid[6];
++static bool blob_station_bssid_valid;
++
++static int blob_station_connect(u8 *bssid)
++{
++	unsigned long flags;
++
++	if (!bssid)
++		return -EINVAL;
++	spin_lock_irqsave(&blob_station_lock, flags);
++	memcpy(blob_station_bssid, bssid, 6);
++	blob_station_bssid_valid = true;
++	spin_unlock_irqrestore(&blob_station_lock, flags);
++	return esp_wifi_connect_internal(bssid);
++}
++
++static int blob_station_eapol(u8 *sender, u8 *data, u32 len)
++{
++	unsigned long flags;
++	bool valid;
++
++	if (!sender || !data || len < 4 || len > 2048)
++		return -EINVAL;
++	spin_lock_irqsave(&blob_station_lock, flags);
++	valid = blob_station_bssid_valid && !memcmp(sender, blob_station_bssid, 6);
++	spin_unlock_irqrestore(&blob_station_lock, flags);
++	return valid ? blob_queue_packet(g_blob, PACKET_TYPE_EAPOL, data, len) : -EINVAL;
++}
++
++static char *blob_station_parse_string(const char *value, size_t *length)
++{
++	size_t n;
++	char *out;
++
++	if (!value || !length)
++		return NULL;
++	n = strnlen(value, 257);
++	if (n > 256)
++		return NULL;
++	if (n >= 2 && value[0] == '"' && value[n - 1] == '"') {
++		out = osi_malloc(n - 1);
++		if (!out)
++			return NULL;
++		memcpy(out, value + 1, n - 2);
++		out[n - 2] = 0;
++		*length = n - 2;
++		return out;
++	}
++	if (n & 1)
++		return NULL;
++	out = osi_malloc(n / 2 + 1);
++	if (!out)
++		return NULL;
++	if (hexstr2bin(value, (u8 *)out, n / 2)) {
++		osi_free(out);
++		return NULL;
++	}
++	out[n / 2] = 0;
++	*length = n / 2;
++	return out;
++}
++
++static int blob_station_mic_failure(u16 unicast)
++{
++	struct esp_wifi_blob *hw = g_blob;
++
++	if (hw && hw->adapter.priv[0])
++		cfg80211_michael_mic_failure(hw->adapter.priv[0]->ndev,
++			blob_station_bssid, unicast ? NL80211_KEYTYPE_PAIRWISE : NL80211_KEYTYPE_GROUP,
++			0, NULL, GFP_ATOMIC);
++	return 0;
++}
++
++static int blob_station_rsnxe(const u8 *ie, size_t len)
++{
++	/* SAE is explicitly rejected by the command path. The Linux WPA2
++	 * supplicant owns IEs, which are installed with the assoc request.
++	 */
++	return 0;
++}
++
++static int blob_station_rx_mgmt(u8 type, u8 *frame, size_t len, u8 *sender,
++			       u32 rssi, u8 channel, u64 tsf)
++{
++	u8 *body;
++	struct ieee80211_hdr_3addr *header;
++	struct event_header *event;
++	u8 own_mac[6];
++	size_t event_size;
++	unsigned long flags;
++	bool valid;
++	int ret;
++
++	if (type == 5 || type == 8)
++		return blob_scan_rx_mgmt(type, frame, len, sender, rssi, channel, tsf);
++	if (type != 11 && type != 1 && type != 3)
++		return 0;
++	if (!frame || !sender || len < 6 || len > 2304)
++		return -EINVAL;
++	spin_lock_irqsave(&blob_station_lock, flags);
++	valid = blob_station_bssid_valid && !memcmp(sender, blob_station_bssid, 6);
++	spin_unlock_irqrestore(&blob_station_lock, flags);
++	if (!valid || osi_read_mac(own_mac, 0))
++		return -EINVAL;
++	event_size = type == 11 ? sizeof(struct auth_event) : sizeof(struct assoc_event);
++	body = kzalloc(event_size + 24 + len, GFP_ATOMIC);
++	if (!body)
++		return -ENOMEM;
++	event = (void *)body;
++	event->event_code = type == 11 ? EVENT_AUTH_RX : EVENT_ASSOC_RX;
++	event->len = cpu_to_le16(event_size + 24 + len - sizeof(*event));
++	if (type == 11) {
++		struct auth_event *auth = (void *)body;
++
++		memcpy(auth->bssid, sender, 6);
++		auth->frame_type = type;
++		auth->channel = channel;
++		auth->rssi = cpu_to_le32(rssi);
++		auth->tsf = cpu_to_le64(tsf);
++		auth->frame_len = cpu_to_le16(24 + len);
++		header = (void *)auth->frame;
++	} else {
++		struct assoc_event *assoc = (void *)body;
++
++		memcpy(assoc->bssid, sender, 6);
++		assoc->frame_type = type;
++		assoc->channel = channel;
++		assoc->rssi = cpu_to_le32(rssi);
++		assoc->tsf = cpu_to_le64(tsf);
++		assoc->frame_len = cpu_to_le16(24 + len);
++		header = (void *)assoc->frame;
++	}
++	header->frame_control = cpu_to_le16(type << 4);
++	memcpy(header->addr1, own_mac, 6);
++	memcpy(header->addr2, sender, 6);
++	memcpy(header->addr3, sender, 6);
++	memcpy((u8 *)header + 24, frame, len);
++	ret = blob_post_event(g_blob, body, event_size + 24 + len);
++	kfree(body);
++	return ret;
++}
++
++static int blob_station_auth(const struct cmd_sta_auth *auth, u16 len)
++{
++	blob_wifi_config_t config = {0};
++	unsigned long flags;
++	int ret;
++
++	if (len < sizeof(*auth) || auth->auth_type != 0 || auth->auth_data_len ||
++	    !auth->ssid[0] || auth->key_len || auth->channel < 1 || auth->channel > 14)
++		return -EOPNOTSUPP; /* first target: visible open/WPA2 networks */
++	memcpy(config.sta.ssid, auth->ssid, 32);
++	memcpy(config.sta.bssid, auth->bssid, 6);
++	config.sta.bssid_set = true;
++	config.sta.channel = auth->channel;
++	config.sta.pmf_cfg.capable = true;
++	config.sta.sae_pk_mode = 2; /* disabled */
++	if (auth->pad[0]) {
++		/* Linux performs the four-way handshake. As in esp-hosted,
++		 * a nonempty placeholder selects protected MAC operation;
++		 * real temporal keys arrive via CMD_ADD_KEY, never this field.
++		 */
++		memcpy(config.sta.password, "12345678", 8);
++		config.sta.threshold.authmode = 3; /* WPA2 */
++	}
++	spin_lock_irqsave(&blob_station_lock, flags);
++	memcpy(blob_station_bssid, auth->bssid, 6);
++	blob_station_bssid_valid = true;
++	spin_unlock_irqrestore(&blob_station_lock, flags);
++	ret = esp_wifi_register_mgmt_frame_internal(BIT(1)|BIT(3)|BIT(11)|BIT(10)|BIT(12), 0);
++	if (!ret)
++		ret = esp_wifi_set_config(0, &config);
++	if (!ret)
++		ret = esp_wifi_connect();
++	return ret;
++}
++
++static int blob_station_key(const struct wifi_sec_key *key, bool deleting)
++{
++	u32 index = get_unaligned_le32(&key->index);
++	u32 size = get_unaligned_le32(&key->len);
++	u32 seq_len = get_unaligned_le32(&key->seq_len);
++	u32 alg = get_unaligned_le32(&key->algo);
++	bool pairwise = key->pad[0];
++	int ret;
++
++	if (index > 5 || size > sizeof(key->data) || seq_len > sizeof(key->seq))
++		return -EINVAL;
++	if (deleting)
++		return esp_wifi_set_sta_key_internal(0, (u8 *)key->mac_addr, index,
++			pairwise, NULL, 0, NULL, 0, pairwise ? BIT(5) : BIT(4));
++	if (alg == 7) { /* IGTK */
++		struct { u8 keyid[2], pn[6], key[32]; } igtk = {0};
++
++		if ((size != 16 && size != 32) || seq_len != 6 || index < 4)
++			return -EINVAL;
++		put_unaligned_le16(index, igtk.keyid);
++		memcpy(igtk.pn, key->seq, 6);
++		memcpy(igtk.key, key->data, size);
++		return esp_wifi_set_igtk_internal(0, &igtk);
++	}
++	if (alg != 3 || size != 16) /* CCMP first; no silent unsupported cipher */
++		return -EOPNOTSUPP;
++	ret = esp_wifi_set_sta_key_internal(alg, (u8 *)key->mac_addr, index, pairwise,
++		(u8 *)key->seq, seq_len, (u8 *)key->data, size,
++		pairwise ? BIT(5)|BIT(2)|BIT(3) : BIT(4)|BIT(2));
++	if (!ret && !pairwise)
++		esp_wifi_auth_done_internal();
++	return ret;
++}
++
++static bool blob_station_command(struct esp_wifi_blob *hw,
++				 const struct command_header *cmd, u16 len)
++{
++	int ret = -EINVAL;
++	u8 response[8] = {0};
++	u16 response_len = 0;
++
++	switch (cmd->cmd_code) {
++	case CMD_STA_AUTH:
++		ret = blob_station_auth((const void *)cmd, len);
++		break;
++	case CMD_STA_ASSOC: {
++		const struct cmd_sta_assoc *assoc = (const void *)cmd;
++
++		if (len < sizeof(*assoc) || assoc->assoc_ie_len > len - sizeof(*assoc))
++			break;
++		ret = esp_wifi_unset_appie_internal(1);
++		if (!ret && assoc->assoc_ie_len)
++			ret = esp_wifi_set_appie_internal(1, (u8 *)assoc->assoc_ie, assoc->assoc_ie_len, 0);
++		if (!ret)
++			ret = esp_wifi_issue_assoc_internal(0);
++		break;
++	}
++	case CMD_STA_DISCONNECT: {
++		const struct cmd_sta_disconnect *disc = (const void *)cmd;
++
++		if (len < sizeof(*disc))
++			break;
++		esp_wifi_deauthenticate_internal(get_unaligned_le16(&disc->reason_code));
++		ret = 0;
++		break;
++	}
++	case CMD_ADD_KEY:
++	case CMD_DEL_KEY: {
++		const struct cmd_key_operation *key = (const void *)cmd;
++
++		if (len >= sizeof(*key))
++			ret = blob_station_key(&key->key, cmd->cmd_code == CMD_DEL_KEY);
++		break;
++	}
++	case CMD_SET_MAC: {
++		const struct cmd_config_mac_address *mac = (const void *)cmd;
++
++		if (len >= sizeof(*mac)) {
++			ret = esp_wifi_set_mac(0, mac->mac_addr);
++			if (!ret) { memcpy(response, mac->mac_addr, 6); response_len = 8; }
++		}
++		break;
++	}
++	case CMD_GET_TXPOWER:
++	case CMD_SET_TXPOWER: {
++		const struct cmd_set_get_val *value = (const void *)cmd;
++		s8 power;
++
++		if (cmd->cmd_code == CMD_SET_TXPOWER && len < sizeof(*value))
++			break;
++		ret = cmd->cmd_code == CMD_GET_TXPOWER ? 0 :
++			esp_wifi_set_max_tx_power(get_unaligned_le32(&value->value));
++		if (!ret) ret = esp_wifi_get_max_tx_power(&power);
++		if (!ret) { put_unaligned_le32((s32)power, response); response_len = 4; }
++		break;
++	}
++	case CMD_SET_REG_DOMAIN:
++	case CMD_GET_REG_DOMAIN: {
++		const struct cmd_reg_domain *country = (const void *)cmd;
++		char cc[3] = {0};
++
++		if (cmd->cmd_code == CMD_SET_REG_DOMAIN && len < sizeof(*country))
++			break;
++		memcpy(cc, country->country_code, cmd->cmd_code == CMD_SET_REG_DOMAIN ? 2 : 0);
++		ret = cmd->cmd_code == CMD_GET_REG_DOMAIN ? 0 : esp_wifi_set_country_code(cc, true);
++		if (!ret) ret = esp_wifi_get_country_code(cc);
++		if (!ret) { memcpy(response, cc, 2); response_len = 4; }
++		break;
++	}
++	case CMD_SET_IP_ADDR:
++	case CMD_SET_MCAST_MAC_ADDR:
++		/* Linux owns IP configuration and receives all multicast for
++		 * filtering in its network stack; no firmware-side IP/filter.
++		 */
++		ret = 0;
++		break;
++	default:
++		return false;
++	}
++	if (ret)
++		pr_warn("native station command %u failed: %d\n", cmd->cmd_code, ret);
++	blob_post_cmd_resp(hw, cmd->cmd_code, response_len ? response : NULL,
++		response_len, ret ? CMD_RESPONSE_FAIL : CMD_RESPONSE_SUCCESS);
++	return true;
++}
++
+ static struct blob_wpa_funcs blob_sta_callbacks = {
+ 	.wpa_sta_init = blob_sta_callback_ready,
+ 	.wpa_sta_deinit = blob_sta_callback_ready,
+-	.wpa_sta_connect = blob_sta_connect_not_ready,
++	.wpa_sta_connect = blob_station_connect,
++	.wpa_sta_rx_eapol = blob_station_eapol,
++	.wpa_config_parse_string = blob_station_parse_string,
++	.wpa_michael_mic_failure = blob_station_mic_failure,
++	.wpa_sta_set_ap_rsnxe = blob_station_rsnxe,
+ 	.wpa_sta_connected_cb = blob_sta_connected_notice,
+ 	.wpa_sta_disconnected_cb = blob_sta_disconnected_notice,
+ 	.wpa_sta_in_4way_handshake = blob_sta_handshake,
+ 	.wpa_parse_wpa_ie = blob_parse_security_ie,
+-	.wpa_sta_rx_mgmt = blob_scan_rx_mgmt,
++	.wpa_sta_rx_mgmt = blob_station_rx_mgmt,
+ 	.wpa_config_done = blob_sta_config_done,
+ };
+ 
+@@ -3887,7 +4210,7 @@
+ 	if (blob_maybe_answer_cmd(hw, command->cmd_code))
+ 		return true;
+ 	if (command->cmd_code != CMD_SCAN_REQUEST)
+-		return false;
++		return blob_station_command(hw, command, len);
+ 	if (len < sizeof(*request))
+ 		ret = -EINVAL;
+ 	else {
+@@ -3923,6 +4246,7 @@
+ 	struct command_header *cmd;
+ 	u16 offset;
+ 	u16 len;
++	int ret;
+ 
+ 	if (!skb || !skb->data || skb->len < sizeof(*hdr)) {
+ 		if (skb)
+@@ -3974,9 +4298,9 @@
+ 
+ 	skb_pull(skb, offset);
+ 
+-	esp_wifi_internal_tx(NULL, skb->data, skb->len);
++	ret = esp_wifi_internal_tx(NULL, skb->data, skb->len);
+ 	dev_kfree_skb(skb);
+-	return 0;
++	return ret;
+ }
+ 
+ /*
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_cmd.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_cmd.c
+@@ -929,6 +929,9 @@
+ 	bss = req->bss;
+ 	adapter = priv->adapter;
+ 
++	if (req->ie_len > 255)
++		return -EMSGSIZE;
++
+ 	cmd_len = sizeof(struct cmd_sta_assoc) + req->ie_len;
+ 
+ 	cmd_node = prepare_command_request(adapter, CMD_STA_ASSOC, cmd_len);
+@@ -997,6 +1000,8 @@
+ 
+ 	adapter = priv->adapter;
+ 
++	if (req->auth_data_len > 255 || req->key_len > sizeof(cmd->key))
++		return -EMSGSIZE;
+ 	cmd_len = sizeof(struct cmd_sta_auth) + req->auth_data_len;
+ 
+ 	cmd_node = prepare_command_request(adapter, CMD_STA_AUTH, cmd_len);
+@@ -1006,6 +1011,24 @@
+ 		return -ENOMEM;
+ 	}
+ 	cmd = (struct cmd_sta_auth *) (cmd_node->cmd_skb->data + sizeof(struct esp_payload_header));
++
++#ifdef CONFIG_ESP32_WIFI_BLOB
++	/* Native backend has no firmware scan-summary cache. Carry the
++	 * actual selected BSS identity and security requirement explicitly.
++	 */
++	{
++		const struct cfg80211_bss_ies *ies;
++		const u8 *ssid;
++
++		rcu_read_lock();
++		ies = rcu_dereference(bss->ies);
++		ssid = ies ? cfg80211_find_ie(WLAN_EID_SSID, ies->data, ies->len) : NULL;
++		if (ssid && ssid[1] <= MAX_SSID_LEN)
++			memcpy(cmd->ssid, ssid + 2, ssid[1]);
++		rcu_read_unlock();
++		cmd->pad[0] = !!(bss->capability & WLAN_CAPABILITY_PRIVACY);
++	}
++#endif
+ 
+ 	memcpy(cmd->bssid, bss->bssid, MAC_ADDR_LEN);
+ 	cmd->channel = bss->channel->hw_value;
+@@ -1137,6 +1160,10 @@
+ 	if (mac && !is_multicast_ether_addr(mac))
+ 		memcpy((char *)&key->mac_addr, (void *)mac, MAC_ADDR_LEN);
+ 
++#ifdef CONFIG_ESP32_WIFI_BLOB
++	key->pad[0] = pairwise;
++#endif
++
+ 	key->index = key_index;
+ 	key->del = 1;
+ 
+@@ -1164,7 +1191,7 @@
+       key_index, pairwise, params->key_len, params->seq_len, params->mode, params->cipher);
+ #endif
+ 	if (!priv || !priv->adapter || !params ||
+-	    !params->key || !params->key_len || !params->seq_len) {
++	    !params->key || !params->key_len || (params->seq_len && !params->seq)) {
+ 		esp_err("Invalid argument\n");
+ 		return -EINVAL;
+ 	}
+@@ -1214,6 +1241,10 @@
+ 
+ 	if (mac && !is_multicast_ether_addr(mac))
+ 		memcpy((char *)&key->mac_addr, (void *)mac, MAC_ADDR_LEN);
++
++#ifdef CONFIG_ESP32_WIFI_BLOB
++	key->pad[0] = pairwise;
++#endif
+ 
+ 	key->index = key_index;
+ 

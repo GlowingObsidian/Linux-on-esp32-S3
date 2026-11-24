@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit hardware test: temporary users, HTTP and detached sessions; no flash."""
+"""Explicit hardware test: temporary users and detached sessions; no flash."""
 import argparse
 import importlib.util
 from pathlib import Path
@@ -44,11 +44,10 @@ def end_session():
 
 users = []
 sessions = []
-web_changed = False
 try:
     cmd('stty icrnl')
-    cmd('home-users-setup && test ! -e /www && test "$(stat -c %a /bin/busybox)" = 4755 && test "$(stat -c %a /home/root)" = 700')
-    cmd('sha256sum /home/www/index.html /home/root/README.txt && head -n 1 /home/root/README.txt')
+    cmd('test ! -e /www && test "$(stat -c %a /bin/busybox)" = 4755')
+    cmd('sha256sum /home/root/README.txt && head -n 1 /home/root/README.txt')
     for user in ('hwchecka', 'hwcheckb'):
         cmd(f'! id {user} >/dev/null 2>&1 && test ! -e /home/{user}')
         cmd(f'adduser -D -s /usr/bin/user-shell {user}')
@@ -77,16 +76,12 @@ try:
     print('PASS: wrong password rejected', flush=True)
     cmd("su - hwchecka -c 'session start hwcheck-user /bin/sh -c \"sleep 1; echo USER_SESSION_PASS > /home/hwchecka/session-result\"'")
     cmd('sleep 2; test "$(cat /home/hwchecka/session-result)" = USER_SESSION_PASS')
-    state = cmd('web-server status')
-    if 'Web server disabled:' in state:
-        cmd('web-server on')
-        web_changed = True
-    cmd('wget -qO /tmp/home-web-check http://127.0.0.1/ && cmp /tmp/home-web-check /home/www/index.html')
-    cmd('wget -qO- http://127.0.0.1/cgi-bin/status')
-    cmd("su -s /bin/sh www-data -c 'test -r /home/www/index.html && test -x /home/www/cgi-bin/status && test ! -r /etc/shadow && test ! -w /home/www/index.html && echo WEB_PERMISSIONS_PASS'")
-    if web_changed:
-        cmd('web-server off')
-        web_changed = False
+    # This image has no web server: no script to start one, no docroot to
+    # serve, no www-data to serve it as, and nothing answering on port 80.
+    cmd('test ! -e /usr/sbin/web-server && test ! -e /home/www && '
+        '! grep -q "^www-data:" /etc/passwd && ! grep -q "^www-data:" /etc/group && '
+        '! busybox --list 2>/dev/null | grep -qx httpd && echo NO_WEB_SERVER')
+    cmd('! wget -qO /dev/null -T 5 http://127.0.0.1/ 2>/dev/null && echo PORT_80_CLOSED')
     c.port.write(b"export PS1='MMU_SHELL> '; exec /usr/bin/dash -i\r")
     c.until(rb'\nMMU_SHELL> $', 15)
     c.port.write(b'stty icrnl\n')
@@ -129,11 +124,8 @@ finally:
         for name in list(sessions):
             attach(name)
             end_session()
-        if web_changed:
-            cmd('web-server off')
         for user in reversed(users):
             cmd(f'deluser {user} && rm -r /home/{user}')
-        cmd('rm -f /tmp/home-web-check')
     finally:
         c.close()
         if sessions:

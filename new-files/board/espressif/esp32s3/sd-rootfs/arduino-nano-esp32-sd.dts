@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "arduino-nano-esp32.dts"
+
+&{/chosen} {
+	bootargs = "earlycon=esp32s3uart,mmio32,0x60000000,115200n8,40000000 console=ttyS0,115200n8 root=/dev/mmcblk0p1 rootfstype=ext2 rootwait rw panic=10 panic_console_replay";
+};
+
+&{/clocks} {
+	gdma_clk: gdma_clk {
+		#clock-cells = <0>;
+		compatible = "gpio-gate-clock";
+		clocks = <&clk 2>;
+		enable-gpios = <&clk_gpio1 6 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+/* GPIO CS lets mmc_spi clock the card with CS high during initialization. */
+&spi2_out_pins {
+	pinctrl-single,pins = <
+		PIN(21) (256 | (1 << 10)) /* GPIO_OUT with GPIO output-enable */
+		PIN(38) 103
+		PIN(48) 101>;
+};
+
+&spi2 {
+	reg = <0x60024000 0x100>, <0x6003f000 0x1000>,
+	      <0x3fccc700 0x2040>;
+	reg-names = "spi", "gdma", "dma-sram";
+	clocks = <&spi2_clk>, <&gdma_clk>;
+	clock-names = "spi", "dma";
+	resets = <&reset 6>, <&reset 38>;
+	reset-names = "reset", "dma";
+	cs-gpios = <&gpio0 21 GPIO_ACTIVE_LOW>;
+	spi-num-chipselects = <1>;
+
+	/delete-node/ panel@0;
+	mmc@0 {
+		compatible = "mmc-spi-slot";
+		reg = <0>;
+		spi-max-frequency = <20000000>;
+		voltage-ranges = <3200 3400>;
+	};
+};
+
+/* Firmware/kernel remain in flash; no flash-rootfs partition in this profile. */
+&{/soc/flash@42000000/partitions} {
+	/delete-node/ partition@510000;
+};

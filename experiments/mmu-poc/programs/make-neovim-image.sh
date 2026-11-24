@@ -29,7 +29,7 @@ for file in "$image_dir/tree/bin/busybox" "$image_dir/tree/lib/"*.so*; do
 done
 "$host_dir/bin/mkcramfs" -X -q "$image_dir/tree" "$programs_out/rootfs-neovim.cramfs"
 size=$(wc -c < "$programs_out/rootfs-neovim.cramfs")
-echo "Image $image_dir: $size bytes, free $((0x780000-size))"
-test "$size" -le $((0x780000))
+echo "Image $image_dir: $size bytes, free $((0x6f0000-size))"
+test "$size" -le $((0x6f0000))
 "$host_dir/bin/cramfsck" "$programs_out/rootfs-neovim.cramfs"
 sha256sum "$programs_out/rootfs-neovim.cramfs"

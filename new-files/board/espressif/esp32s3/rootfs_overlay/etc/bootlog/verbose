@@ -1,0 +1,9 @@
+# This file is the switch, not a setting: /etc/init.d/S00bootlog only checks
+# whether it exists. Its presence raises the console to printk level 8 at boot,
+# which adds KERN_DEBUG to what the kernel was already printing.
+#
+# Shipped present because this image is meant to be read while it boots. The
+# kernel command line deliberately carries no `quiet` (patches 0049 and 0060),
+# so the boot streams live at CONFIG_CONSOLE_LOGLEVEL_DEFAULT=7 and nothing has
+# to be replayed. `bootlog quiet` removes this file and drops the console to
+# level 4. It survives reboots in the persistent /etc jffs2 partition.

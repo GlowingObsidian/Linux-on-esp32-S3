@@ -1,0 +1,143 @@
+Subject: [PATCH] esp32s3: quiet successful flash and Wi-Fi initialization
+
+diff --git a/drivers/net/wireless/espressif/esp32-ng/esp_blob_phy.c b/drivers/net/wireless/espressif/esp32-ng/esp_blob_phy.c
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob_phy.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob_phy.c
+@@ -222,7 +222,7 @@
+ 	va_start(args, format);
+ 	n = vscnprintf(buf, sizeof(buf), format, args);
+ 	va_end(args);
+-	pr_info("[phy] %s", buf);
++	pr_debug("[phy] %s", buf);
+ 	return n;
+ }
+ 
+@@ -235,7 +235,7 @@
+ 	va_start(args, format);
+ 	n = vscnprintf(buf, sizeof(buf), format, args);
+ 	va_end(args);
+-	pr_info("[rtc] %s", buf);
++	pr_debug("[rtc] %s", buf);
+ 	return n;
+ }
+ 
+@@ -261,7 +261,7 @@
+  * identical trampolines into a local clone, lib_printf$constprop$0, which
+  * formats into a 79-byte stack buffer and returns -- it never writes the
+  * buffer anywhere. coexist_printf there is format-and-discard. The body
+- * below goes to pr_info like its two neighbours, so the coexistence
++ * below goes to pr_debug like its two neighbours, so the coexistence
+  * layer's messages reach the kernel log instead of a dead stack buffer.
+  *
+  * The counter is here for the hang. coexist_printf is the coexistence
+@@ -281,7 +281,7 @@
+ 	va_start(args, format);
+ 	n = vscnprintf(buf, sizeof(buf), format, args);
+ 	va_end(args);
+-	pr_info("[coex %u] %s", ++coex_printf_calls, buf);
++	pr_debug("[coex %u] %s", ++coex_printf_calls, buf);
+ 	return n;
+ }
+ 
+@@ -315,7 +315,7 @@
+ 	phy_get_romfuncs_fn fn = (phy_get_romfuncs_fn)0x40005c58;
+ 	void *rom = fn();
+ 
+-	pr_info("ROM phy funcs at %p (phy_get_romfuncs=0x40005c58)\n", rom);
++	pr_debug("ROM phy funcs at %p (phy_get_romfuncs=0x40005c58)\n", rom);
+ 	if (!rom)
+ 		pr_err("ROM returned a NULL phy func table; the PHY cannot run\n");
+ }
+@@ -385,7 +385,7 @@
+ 			ret = -EIO;
+ 		if (!ret)
+ 			phy_calibrated = true;
+-		pr_info("full PHY initialization: ret=%d function_table=%s\n",
++		pr_debug("full PHY initialization: ret=%d function_table=%s\n",
+ 			ret, READ_ONCE(g_phyFuns) ? "ready" : "NULL");
+ 	}
+ 	mutex_unlock(&phy_init_lock);
+diff --git a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -4559,7 +4559,7 @@
+ 			       sram->start, resource_size(sram), -1);
+ 	if (ret)
+ 		return ret;
+-	dev_info(&pdev->dev, "internal SRAM pool: %zu bytes\n",
++	dev_dbg(&pdev->dev, "internal SRAM pool: %zu bytes\n",
+ 		 gen_pool_size(osi_internal_pool));
+ 
+ 	osi_timer_wq = alloc_workqueue("esp_wifi_timers", WQ_MEM_RECLAIM | WQ_PERCPU, 1);
+@@ -4621,7 +4621,7 @@
+ 		unregister_die_notifier(&osi_die_nb);
+ 		return -ENOMEM;
+ 	}
+-	dev_info(&pdev->dev, "OS interface slot at 0x%x -> %p\n",
++	dev_dbg(&pdev->dev, "OS interface slot at 0x%x -> %p\n",
+ 		 osi_addr, hw->osi_slot);
+ 
+ 	ret = esp32_wifi_phy_init();
+@@ -4649,7 +4649,7 @@
+ 		ret = -EIO;
+ 		goto err_probe_adapter;
+ 	}
+-	dev_info(&pdev->dev, "OS interface installed at 0x%x\n", osi_addr);
++	dev_dbg(&pdev->dev, "OS interface installed at 0x%x\n", osi_addr);
+ 
+ 	/*
+ 	 * xphyQueue is a ROM pointer slot at 0x3fcef904, not storage the blob
+@@ -4670,7 +4670,7 @@
+ 		ret = -ENOMEM;
+ 		goto err_probe_adapter;
+ 	}
+-	dev_info(&pdev->dev, "xphyQueue slot 0x3fcef904 = %08x\n",
++	dev_dbg(&pdev->dev, "xphyQueue slot 0x3fcef904 = %08x\n",
+ 		 readl(hw->xphy_slot));
+ 
+ 	/*
+@@ -4964,7 +4964,7 @@
+ 		goto err_blob_deinit;
+ 	}
+ 	hw->started = true;
+-	dev_info(hw->adapter.dev, "blob started; the radio is Linux's\n");
++	dev_dbg(hw->adapter.dev, "blob started; the radio is Linux's\n");
+ 
+ 	/*
+ 	 * The rx callback goes in last, and only here.
+@@ -5020,7 +5020,7 @@
+ 		dev_err(hw->adapter.dev, "esp_add_card: %d\n", ret);
+ 		goto err_blob_deinit;
+ 	}
+-	dev_info(hw->adapter.dev, "wlan0 registered\n");
++	dev_dbg(hw->adapter.dev, "wlan0 registered\n");
+ 
+ 	return 0;
+ 
+diff --git a/drivers/mtd/devices/esp32s3-flash-guard-main.c b/drivers/mtd/devices/esp32s3-flash-guard-main.c
+--- a/drivers/mtd/devices/esp32s3-flash-guard-main.c
++++ b/drivers/mtd/devices/esp32s3-flash-guard-main.c
+@@ -268,9 +268,9 @@
+ 	else if (ret)
+ 		dev_warn(dev, "non-writing guard mode %u failed: %d\n", value, ret);
+ 	else if (value != 1)
+-		dev_info(dev, "cache suspend/resume passed on both CPUs; PSRAM intact, no flash commands\n");
++		dev_dbg(dev, "cache suspend/resume passed on both CPUs; PSRAM intact, no flash commands\n");
+ 	else
+-		dev_info(dev, "internal-memory dry run passed on both CPUs; no flash/cache changes\n");
++		dev_dbg(dev, "internal-memory dry run passed on both CPUs; no flash/cache changes\n");
+ 	return ret ? ret : count;
+ }
+ static DEVICE_ATTR_WO(test);
+diff --git a/drivers/mtd/devices/esp32s3-flash-nor-main.inc b/drivers/mtd/devices/esp32s3-flash-nor-main.inc
+--- a/drivers/mtd/devices/esp32s3-flash-nor-main.inc
++++ b/drivers/mtd/devices/esp32s3-flash-nor-main.inc
+@@ -210,7 +210,7 @@
+ 	ret = fn_execute(fg, FN_IDENTIFY, 0, 0, NULL, NULL);
+ 	mutex_unlock(&fg->lock);
+ 	if (!ret)
+-		dev_info(dev, "SPI1 read-only identification: JEDEC=%06x supported=%u; writes locked=%u\n",
++		dev_dbg(dev, "SPI1 read-only identification: JEDEC=%06x supported=%u; writes locked=%u\n",
+ 			fg->nor_jedec, fg->nor_id_ok, !fg->nor_rw);
+ 	return ret ? ret : count;
+ }

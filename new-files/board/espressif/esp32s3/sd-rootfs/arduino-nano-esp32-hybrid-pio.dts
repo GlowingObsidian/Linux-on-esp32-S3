@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "arduino-nano-esp32-sd-pio.dts"
+
+&{/chosen} {
+	bootargs = "earlycon=esp32s3uart,mmio32,0x60000000,115200n8,40000000 console=ttyS0,115200n8 root=mtd:rootfs rootfstype=cramfs ro init=/sbin/hybrid-init panic=10 panic_console_replay";
+};
+
+&{/soc/flash@42000000/partitions} {
+	partition@510000 {
+		label = "rootfs";
+		reg = <0x510000 0x6f0000>;
+		read-only;
+	};
+};

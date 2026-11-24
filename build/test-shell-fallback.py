@@ -25,12 +25,20 @@ class ShellFallbackTests(unittest.TestCase):
         self.unrunnable = self.dir / 'cannot-exec'
         self.unrunnable.write_text('#!/bin/sh\ntrue\n')
         self.unrunnable.chmod(0o644)
+        # The hook reads MemAvailable from procfs, which macOS does not have: an
+        # empty read left the figure at 0, so every threshold looked low and the
+        # memory-is-fine case switched to dash. Point it at a fixture instead.
+        self.meminfo = self.dir / 'meminfo'
+        self.meminfo.write_text('MemTotal:           7852 kB\n'
+                                'MemFree:            1234 kB\n'
+                                'MemAvailable:       4096 kB\n')
 
     def run_shell(self, script, threshold, answer=''):
         # LC_ALL=C so the assertions below match bash's own messages rather
         # than whatever language the developer's host is set to.
         env = {**os.environ, 'LOWMEM_DASH': str(self.stub), 'LOWMEM_ENV': str(ENV_FILE),
                'LOWMEM_RESUME': str(self.resume), 'LOWMEM_THRESHOLD': str(threshold),
+               'LOWMEM_MEMINFO': str(self.meminfo),
                'LC_ALL': 'C', 'LANG': 'C'}
         return subprocess.run(['bash', '--rcfile', str(HOOK), '-i'], input=script + answer,
                               env=env, capture_output=True, text=True, timeout=30)

@@ -1,0 +1,4 @@
+{
+  "logo": { "type": "none" },
+  "modules": ["os", "host", "kernel", "uptime", "cpu", "memory", "swap", "disk", "localip"]
+}

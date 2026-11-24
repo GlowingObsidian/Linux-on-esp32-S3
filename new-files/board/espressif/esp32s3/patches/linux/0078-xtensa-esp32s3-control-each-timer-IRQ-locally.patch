@@ -1,0 +1,55 @@
+diff --git a/arch/xtensa/kernel/time.c b/arch/xtensa/kernel/time.c
+--- a/arch/xtensa/kernel/time.c
++++ b/arch/xtensa/kernel/time.c
+@@ -80,13 +80,39 @@
+  * calls are nested, we need to make sure that these calls are
+  * balanced.
+  */
++#ifdef CONFIG_XTENSA_SMP_ESP32
++/* The timer input is local to each core. IRQ descriptor depth is shared,
++ * so generic nested enable_irq/disable_irq calls cannot represent two
++ * independent clockevents entering and leaving idle. Preserve other inputs.
++ */
++static void esp32_ccount_irq_enable(bool enable)
++{
++	unsigned long flags;
++	u32 mask;
++
++	local_irq_save(flags);
++	mask = xtensa_get_sr(intenable);
++	if (enable)
++		mask |= BIT(LINUX_TIMER_INT);
++	else
++		mask &= ~BIT(LINUX_TIMER_INT);
++	xtensa_set_sr(mask, intenable);
++	asm volatile("rsync" ::: "memory");
++	local_irq_restore(flags);
++}
++#endif
++
+ static int ccount_timer_shutdown(struct clock_event_device *evt)
+ {
+ 	struct ccount_timer *timer =
+ 		container_of(evt, struct ccount_timer, evt);
+ 
+ 	if (timer->irq_enabled) {
++#ifdef CONFIG_XTENSA_SMP_ESP32
++		esp32_ccount_irq_enable(false);
++#else
+ 		disable_irq_nosync(evt->irq);
++#endif
+ 		timer->irq_enabled = 0;
+ 	}
+ 	return 0;
+@@ -98,7 +124,11 @@
+ 		container_of(evt, struct ccount_timer, evt);
+ 
+ 	if (!timer->irq_enabled) {
++#ifdef CONFIG_XTENSA_SMP_ESP32
++		esp32_ccount_irq_enable(true);
++#else
+ 		enable_irq(evt->irq);
++#endif
+ 		timer->irq_enabled = 1;
+ 	}
+ 	return 0;

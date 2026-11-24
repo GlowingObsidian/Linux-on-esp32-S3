@@ -1,0 +1,142 @@
+Subject: [PATCH] spi: esp32s3: clear FIFO error latches and enable SRAM bursts
+
+A failing hardware transfer reports SPI RAW bit 1 (DMA TX FIFO empty), not
+just a missing GDMA completion. Match IDF spi_hal_prepare_data FIFO error
+clears and NuttX burst-enabled SRAM configuration. Wake and fail on fresh
+SPI FIFO errors even if the stopped master never signals transaction done.
+Keep descriptor/RX checks and PIO recovery; do not accept corrupt transfers.
+Expose successful chunk/byte counts and error/recovery state in a read-only
+SPI-controller dma_status attribute. Include TX link/FIFO state on errors.
+These software defects are verified; hardware DMA success remains to test.
+
+--- a/drivers/spi/spi-esp32.c
++++ b/drivers/spi/spi-esp32.c
+@@ -80,6 +80,7 @@
+ #define SPI_DMA_INT_RAW_REG	0x3c
+ #define SPI_DMA_INT_ST_REG	0x40
+ #define SPI_TRANS_DONE_INT		BIT(12)
++#define SPI_DMA_FIFO_ERRORS		(BIT(0) | BIT(1))
+ 
+ #define ESP32_SPI_FIFO_SIZE	64
+ #define SPI_W0_REG		0x98
+@@ -108,6 +109,9 @@
+ #define GDMA_IN_LINK   0x020
+ #define GDMA_IN_PERI   0x048
+ #define GDMA_OUT_CONF0 0x060
++#define GDMA_IN_BURST  (BIT(2) | BIT(3))
++#define GDMA_OUT_BURST (BIT(4) | BIT(5))
++#define GDMA_OUT_STATUS 0x078
+ #define GDMA_OUT_RAW   0x068
+ #define GDMA_OUT_CLR   0x074
+ #define GDMA_OUT_LINK  0x080
+@@ -139,6 +143,7 @@
+ 	struct clk *dma_clk;
+ 	int irq;
+ 	bool dma_failed;
++	u32 dma_chunks, dma_bytes, dma_errors;
+ 	u32 speed_hz;			/* bus speed configured in SPI_CLOCK_REG */
+ 	struct completion done;		/* wake-up from interrupt */
+ };
+@@ -361,8 +366,9 @@
+ {
+ 	writel(BIT(0), spi->gdma + GDMA_IN_CONF0);
+ 	writel(BIT(0), spi->gdma + GDMA_OUT_CONF0);
+-	writel(0, spi->gdma + GDMA_IN_CONF0); /* no memory-to-memory mode */
+-	writel(BIT(2) | BIT(3), spi->gdma + GDMA_OUT_CONF0);
++	writel(GDMA_IN_BURST, spi->gdma + GDMA_IN_CONF0); /* no M2M */
++	writel(BIT(2) | BIT(3) | GDMA_OUT_BURST,
++	       spi->gdma + GDMA_OUT_CONF0);
+ 	writel(~0U, spi->gdma + GDMA_IN_CLR);
+ 	writel(~0U, spi->gdma + GDMA_OUT_CLR);
+ }
+@@ -413,8 +419,14 @@
+ 		/* Publish all data and descriptors before either channel can fetch. */
+ 		wmb();
+ 		reinit_completion(&spi->done);
+-		esp32_spi_write(spi, SPI_DMA_INT_CLR_REG, SPI_TRANS_DONE_INT);
+-		esp32_spi_write(spi, SPI_DMA_INT_ENA_REG, SPI_TRANS_DONE_INT);
++		/* IDF clears both FIFO error latches after resetting the FIFOs.
++		 * Clear stale PIO/previous-transfer status before starting GDMA.
++		 * Errors wake the waiter too; a stopped master may not finish.
++		 */
++		esp32_spi_write(spi, SPI_DMA_INT_CLR_REG,
++			SPI_TRANS_DONE_INT | SPI_DMA_FIFO_ERRORS);
++		esp32_spi_write(spi, SPI_DMA_INT_ENA_REG,
++			SPI_TRANS_DONE_INT | SPI_DMA_FIFO_ERRORS);
+ 		if (rx)
+ 			writel(((spi->dma_phys + GDMA_RX_DESC) & GDMA_LINK_ADDR) |
+ 			       GDMA_IN_START, spi->gdma + GDMA_IN_LINK);
+@@ -427,6 +439,10 @@
+ 		esp32_spi_write(spi, SPI_DMA_INT_ENA_REG, 0);
+ 		/* Do not let an in-flight handler complete a later transaction. */
+ 		synchronize_irq(spi->irq);
++		if (esp32_spi_read(spi, SPI_DMA_INT_RAW_REG) & SPI_DMA_FIFO_ERRORS) {
++			phase = "SPI FIFO error";
++			ret = -EIO;
++		}
+ 		if (ret)
+ 			goto abort;
+ 		phase = "SPI done";
+@@ -472,17 +488,21 @@
+ 		}
+ 		if (tx)
+ 			tx += len;
++		WRITE_ONCE(spi->dma_chunks, spi->dma_chunks + 1);
++		WRITE_ONCE(spi->dma_bytes, spi->dma_bytes + len);
+ 		remaining -= len;
+ 	}
+ 	goto out;
+ abort:
+ 	dev_err_ratelimited(spi->dev,
+-		"DMA %s: err=%d len=%u hz=%u SPI=%08x IN=%08x OUT=%08x RXdesc=%08x TXdesc=%08x\n",
++		"DMA %s: err=%d len=%u hz=%u SPI=%08x IN=%08x OUT=%08x RXdesc=%08x TXdesc=%08x TXlink=%08x TXfifo=%08x\n",
+ 		phase, ret, len, t->effective_speed_hz,
+ 		esp32_spi_read(spi, SPI_DMA_INT_RAW_REG),
+ 		readl(spi->gdma + GDMA_IN_RAW), readl(spi->gdma + GDMA_OUT_RAW),
+-		readl(spi->dma_sram + GDMA_RX_DESC), readl(spi->dma_sram + GDMA_TX_DESC));
+-	spi->dma_failed = true;
++		readl(spi->dma_sram + GDMA_RX_DESC), readl(spi->dma_sram + GDMA_TX_DESC),
++		readl(spi->gdma + GDMA_OUT_LINK), readl(spi->gdma + GDMA_OUT_STATUS));
++	WRITE_ONCE(spi->dma_errors, spi->dma_errors + 1);
++	WRITE_ONCE(spi->dma_failed, true);
+ 	dev_warn(spi->dev, "GDMA failed; subsequent requests use PIO until reboot\n");
+ 	/* The current transfer still fails: MMC must reissue its command, not
+ 	 * replay only a data phase after the card has already consumed it.
+@@ -623,6 +643,29 @@
+ 	return 0;
+ }
+ 
++/* Read-only counters: one writer (SPI controller queue), lockless snapshots.
++ * 32-bit counters intentionally wrap; compare nearby samples for I/O tests.
++ */
++static ssize_t dma_status_show(struct device *dev,
++			      struct device_attribute *attr, char *buf)
++{
++	struct spi_controller *host = container_of(dev, struct spi_controller, dev);
++	struct esp32_spi *spi = spi_controller_get_devdata(host);
++	const char *mode = !spi->gdma ? "pio" :
++		READ_ONCE(spi->dma_failed) ? "pio-recovery" : "dma";
++
++	return sysfs_emit(buf, "mode=%s chunks=%u bytes=%u errors=%u\n", mode,
++		READ_ONCE(spi->dma_chunks), READ_ONCE(spi->dma_bytes),
++		READ_ONCE(spi->dma_errors));
++}
++static DEVICE_ATTR_RO(dma_status);
++
++static struct attribute *esp32_spi_attrs[] = {
++	&dev_attr_dma_status.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(esp32_spi);
++
+ static int esp32_spi_probe(struct platform_device *pdev)
+ {
+ 	struct esp32_spi *spi;
+@@ -683,6 +726,7 @@
+ 
+ 	/* Define our host */
+ 	host->dev.of_node = np;
++	host->dev.groups = esp32_spi_groups;
+ 	host->max_speed_hz = clk_get_rate(spi->clk);
+ 	host->min_speed_hz = DIV_ROUND_UP(host->max_speed_hz, 1024);
+ 	host->use_gpio_descriptors = true;

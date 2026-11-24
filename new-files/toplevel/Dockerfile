@@ -18,7 +18,7 @@ RUN git clone https://github.com/jcmvbkbc/esp32-linux-build /work/esp32-linux-bu
     && patch -p1 < /work/local-changes/patches/00-esp32-linux-build.patch
 
 RUN cp /work/local-changes/new-files/toplevel/apply-local-changes.sh \
-       /work/local-changes/new-files/toplevel/devkit-c1-16m.conf \
+       /work/local-changes/new-files/toplevel/arduino-nano-esp32.conf \
        /work/esp32-linux-build/ \
     && ln -s /work/local-changes /work/esp32-linux-build/local-changes
 
@@ -28,4 +28,4 @@ RUN useradd -m builder && chown -R builder:builder /work
 USER builder
 
 ENTRYPOINT ["./rebuild-esp32s3-linux-wifi.sh"]
-CMD ["-c", "devkit-c1-16m.conf"]
+CMD ["-c", "arduino-nano-esp32.conf"]

@@ -97,11 +97,11 @@ git clone https://github.com/jcmvbkbc/esp32-linux-build
 cd esp32-linux-build
 patch -p1 < ../Linux-on-esp32-S3/patches/00-esp32-linux-build.patch
 cp ../Linux-on-esp32-S3/new-files/toplevel/apply-local-changes.sh \
-   ../Linux-on-esp32-S3/new-files/toplevel/devkit-c1-16m.conf .
-./rebuild-esp32s3-linux-wifi.sh -c devkit-c1-16m.conf
+   ../Linux-on-esp32-S3/new-files/toplevel/arduino-nano-esp32.conf .
+./rebuild-esp32s3-linux-wifi.sh -c arduino-nano-esp32.conf
 ```
 
-Images land in `build/build-buildroot-esp32s3_devkit_c1_16m/images/` and in the
+Images land in `build/build-buildroot-arduino_nano_esp32/images/` and in the
 firmware's build directory. `flash.sh --parts` in this repo documents which
 image goes at which offset.
 
@@ -241,7 +241,7 @@ or above it that has both — so the checkout's directory name does not matter.
 
 The kernel patches are **not** applied by that script: they are wired into
 buildroot itself via `BR2_LINUX_KERNEL_PATCH` in
-`configs/esp32s3_devkit_c1_16m_defconfig`, pointing at
+`configs/arduino_nano_esp32_defconfig`, pointing at
 `board/espressif/esp32s3/patches/linux/`. Buildroot re-applies them after every
 kernel extraction, including ones triggered mid-session — see below for why
 that matters.
@@ -269,7 +269,7 @@ changes were silently missing, so the shipped kernel did not match the patch
 this repo carries.
 
 Fix (does not rely on "don't touch that folder"):
-`configs/esp32s3_devkit_c1_16m_defconfig` now has
+`configs/arduino_nano_esp32_defconfig` now has
 `BR2_LINUX_KERNEL_PATCH="board/espressif/esp32s3/patches/linux"`, buildroot's
 native option for kernel patches — it re-applies itself after **every** kernel
 extraction, no matter what triggers it. Verified with
@@ -342,7 +342,7 @@ that one directory match `new-files/` exactly.
    copies the configured buildroot tree into `experiments/mmu-poc/out/linux-fork`
    **only when that directory does not exist**, and the directory is gitignored,
    so it outlives `git checkout`, `git reset --hard` and branch switches alike.
-   A line added to `devkit_c1_16m_linux.config` therefore reaches buildroot's
+   A line added to `nano_esp32_linux.config` therefore reaches buildroot's
    kernel and never reaches the one that ships: the fork kernel rebuilds from
    the old `.config`, the compile succeeds, the size is measured, and the image
    goes out with the change missing. Nothing fails — that is the whole problem.
@@ -608,6 +608,58 @@ that one directory match `new-files/` exactly.
    `ForkSwitchMax` 13.8-14.3 ms in every round. It is the default now.
    `build/verification/2026-09-14-swap.md`.
 
+17. **Core 0, incident 17**: moving Linux from core 1 to core 0 broke every
+   interrupt, and the board still booted. Three faults, found one at a time,
+   each costing a build and a flash.
+
+   The first was the firmware's watchdogs. IDF arms MWDT1 in Timer Group 1
+   (the interrupt watchdog, `CONFIG_ESP_INT_WDT`) and MWDT0 in Timer Group 0
+   (the task watchdog, `CONFIG_ESP_TASK_WDT_INIT`), and feeds both from
+   FreeRTOS. Once FreeRTOS stops nothing feeds them, their stage 1 is
+   `WDT_STAGE_ACTION_RESET_SYSTEM`, and that fires whether or not the
+   interrupt is masked -- so the `rsil` before the jump does not help. The
+   board reset about ten seconds after reaching a login prompt, with
+   `rst:0x8 (TG1WDT_SYS_RST)`. Fixed by disabling both in
+   `map_flash_and_go()`, the same pair of `wdt_hal_disable` calls IDF makes
+   in `esp_restart_noos()`. NuttX never has this: `ESP32S3_MWDT0`, `MWDT1`
+   and `RWDT` are all `default n` in its Kconfig so nothing arms them, and
+   `esp32s3_start.c` calls `esp32s3_wdt_early_deinit()` to clear the RTC
+   watchdog the second-stage bootloader leaves on.
+
+   The second was the interrupt matrix. The S3 has two, `0x600c2000` for
+   core 0 and `0x600c2800` for core 1, and the ROM's `intr_matrix_set`
+   chooses on its `cpu_no` argument -- it loads `0x600c2000` and only
+   overwrites it with `0x600c2800` when `cpu_no` is non-zero. `&intc` named
+   core 1's, which was right while Linux ran on core 1. Every routed
+   peripheral was then delivered to a core held in `RUNSTALL`. What made
+   this hard to see is that the board still booted: the tick comes from the
+   core's own internal timer and bypasses the matrix entirely, and the
+   kernel console is polled, so the whole boot log appeared. What did not
+   work was the login prompt -- no input, no echo -- because a tty needs the
+   UART's RX and TX interrupts. `/proc/interrupts` was the proof: every
+   `esp32-intc` line at zero. Fixed by pointing `&intc` at `0x600c2000`.
+
+   The third was smaller and turned out to be harmless, but it is written
+   down because the reasoning is a trap. `trim-target.sh` wrote
+   `::respawn:/sbin/getty -L tty1 0 linux`, and an empty id in busybox's
+   inittab does not mean "no tty" -- `open_stdio_to_tty()` only opens a
+   device when the name is non-empty, so the child keeps init's stdio, which
+   is `/dev/console`, which is the *last* `console=` on the command line,
+   which is `ttyS0`. The intent was a getty on the panel; the reading is a
+   second reader on the serial port. It is `tty1::respawn:` now. The reason
+   it was harmless is the part worth keeping: busybox's `getty` opens the
+   tty it is *named after* (`open_tty()` does `xopen("/dev/tty1")`), not the
+   one init handed it, so it moved itself back to the panel regardless. The
+   bug was real; the symptom I predicted from it was not.
+
+   **The lesson, and the reason this is incident 17 rather than three
+   separate notes:** all three are the same shape -- a value that was correct
+   under the old core assignment and silently wrong under the new one, with
+   no error anywhere. The firmware's watchdog config, the DT's interrupt
+   matrix, and the inittab's getty id were each written when Linux ran on
+   core 1. Moving a core is not a one-line change; it is a search for
+   everything that assumed the old one.
+
 ## What's here
 
 - `patches/00-esp32-linux-build.patch` — changes to upstream's build driver
@@ -629,13 +681,15 @@ that one directory match `new-files/` exactly.
   copy is gone. There also used to be a fourth patch here,
   `01-kernel-esp32ng-ap-support.patch`, carrying the SoftAP; it is gone, and
   with it the only reason the esp32-ng driver diverged from upstream beyond
-  the BLE pipe. The remaining files keep their names so existing references
-  stay valid. Top-level `patches/` has its own gaps for the same reason: only
-  `00`, `02` and `03` remain.
+  the BLE pipe. The BLE pipe has since gone as well: the kernel patch that
+  carried `/dev/esp-ble` is deleted, and the firmware half is compiled out --
+  see the firmware patch below. The remaining files keep their names so
+  existing references stay valid. Top-level `patches/` has its own gaps for
+  the same reason: only `00`, `02` and `03` remain.
 - `new-files/board/espressif/esp32s3/package-patches/` is
   `BR2_GLOBAL_PATCH_DIR`: Buildroot applies `<package>/*.patch` on top of its
   own for that package. BusyBox gets private home directories and a separate
-  environment per cron job; dropbear gets `-n`, which turns public key logins
+  environment per shell; dropbear gets `-n`, which turns public key logins
   off for `remote-login auth password`, since dropbear has no switch for it.
   `linux/linux.hash` pins the kernel.org tarball.
 - `flash.sh` — flashes a bare board from `images/` with nothing but `esptool`
@@ -644,8 +698,12 @@ that one directory match `new-files/` exactly.
   firmware (`esp-hosted/esp_hosted_ng/esp/esp_driver/network_adapter/`): the
   SoftAP authenticator, the BLE provisioning link, and the handover of the RSA
   accelerator to Linux. Generated straight from the tree the shipped image was
-  built from, so it reproduces it byte for byte. Applied automatically by
-  `apply-local-changes.sh esp-hosted`.
+  built from, so it reproduces it byte for byte. The BLE provisioning link is
+  still in the patch but no longer built: `sdkconfig.defaults.esp32s3.16m8r`
+  sets `# CONFIG_BT_ENABLED is not set`, and the firmware's own BLE code is
+  wrapped in `#ifdef CONFIG_BT_ENABLED` throughout, so one setting compiles it
+  out rather than a set of edits that could drift apart. Applied automatically
+  by `apply-local-changes.sh esp-hosted`.
 - `patches/03-buildroot-tracked-changes.patch` — a single consolidated
   `git diff` of all tracked files modified under `build/buildroot/`
   (busybox.config, inetd.conf, wpa_supplicant.conf.example, both defconfigs).
@@ -654,9 +712,9 @@ that one directory match `new-files/` exactly.
   overlapped each other and are no longer maintained. Applied automatically by
   `apply-local-changes.sh buildroot`.
 - `kernel-driver-esp32-ng/` — a complete reference/human-readable copy of
-  `drivers/net/wireless/espressif/esp32-ng/` (pristine upstream plus the BLE
-  pipe; STA only, no AP code at all); the patch above is what is actually used
-  in the automated flow, this is a readable backup.
+  `drivers/net/wireless/espressif/esp32-ng/` (pristine upstream plus this
+  project's own fixes; STA only, no AP code at all); the patch above is what is
+  actually used in the automated flow, this is a readable backup.
 - `new-files/` — an exact mirror of what has to be copied: `board/` and
   `configs/` go over `build/buildroot/` (automatic via
   `apply-local-changes.sh buildroot`); `esp-hosted/network_adapter/*.16m8r`
@@ -665,7 +723,7 @@ that one directory match `new-files/` exactly.
   `build/esp-hosted/esp_hosted_ng/esp/esp_driver/network_adapter/` (automatic
   via `apply-local-changes.sh esp-hosted`); `toplevel/` holds the pieces that go
   next to upstream's build driver — `apply-local-changes.sh` and
-  `devkit-c1-16m.conf` (upstream only ships an 8MB profile) — plus the
+  `arduino-nano-esp32.conf` (upstream only ships an 8MB profile) — plus the
   `Dockerfile` and `.dockerignore`.
 
 ## Applying the changes by hand
@@ -694,7 +752,7 @@ git -c user.email="local@backup" -c user.name="local-backup" \
   commit -m "network_adapter: this project's firmware (local-only, never push)"
 cd ../../..
 
-cp "$REPO/new-files/toplevel/devkit-c1-16m.conf" .
+cp "$REPO/new-files/toplevel/arduino-nano-esp32.conf" .
 ```
 
 The kernel driver applies itself via `BR2_LINUX_KERNEL_PATCH` once the defconfig

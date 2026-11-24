@@ -1,0 +1,51 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -3514,10 +3514,10 @@
+ 
+ 			memcpy(ssid, c->ssid, 32);
+ 			ssid[32] = '\0';
+-			pr_info("event: station connected ssid=%s bssid=%pM ch=%u\n",
++			pr_debug("event: station connected ssid=%s bssid=%pM ch=%u\n",
+ 				ssid, c->bssid, c->channel);
+ 		} else {
+-			pr_info("event: station connected, no data\n");
++			pr_debug("event: station connected, no data\n");
+ 		}
+ 		break;
+ 	}
+@@ -3539,7 +3539,7 @@
+ 		memcpy(ev.bssid, d->bssid, 6);
+ 		ev.reason = d->reason;
+ 
+-		pr_info("event: station disconnected reason=%u\n", d->reason);
++		pr_debug("event: station disconnected reason=%u\n", d->reason);
+ 		blob_post_event(hw, &ev, sizeof(ev));
+ 		break;
+ 	}
+@@ -4692,7 +4692,7 @@
+ 			dev_warn(&pdev->dev, "cannot map ROM slot %s\n",
+ 				 osi_rom_slot_names[i]);
+ 	}
+-	osi_rom_slots_dump("probe");
++	/* Fault notifier retains ROM-slot diagnostics; normal boot stays quiet. */
+ 
+ 	/*
+ 	 * If the ROM left nothing there, give the blob a real queue. The
+@@ -4710,7 +4710,7 @@
+ 			goto err_probe_adapter;
+ 		}
+ 		writel((u32)(uintptr_t)q, hw->xphy_slot);
+-		dev_info(&pdev->dev, "xphyQueue populated with %p\n", q);
++		dev_dbg(&pdev->dev, "xphyQueue populated with %p\n", q);
+ 	}
+ 
+ 	/*
+@@ -4934,7 +4934,7 @@
+ 	 * only ever show what the ROM left; this shows what the blob did
+ 	 * with it.
+ 	 */
+-	osi_rom_slots_dump("after init_internal");
++	/* Dump ROM slots only on a fault. */
+ 
+ 	BUILD_BUG_ON(sizeof(blob_wifi_scan_config_t) != 32);
+ 	BUILD_BUG_ON(sizeof(struct blob_wpa_funcs) != 104);

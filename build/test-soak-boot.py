@@ -29,8 +29,8 @@ def load():
 
 soak = load()
 
-CLEAN = (b'ESP-ROM:esp32s3-20210327\nLinux version 6.11.0\nStarting cron: OK\n'
-         b'\nWelcome to Buildroot\nbuildroot login: ')
+CLEAN = (b'ESP-ROM:esp32s3-20210327\nLinux version 6.11.0\nStarting inetd: OK\n'
+         b'\nWelcome to Arduino Nano ESP32\narduino login: ')
 # A round that reached a login always reads the ring buffer and the taint
 # flags back; a quiet console says almost nothing without them.
 OK_PROBES = {'dmesg': 'Linux version 6.11.0\nRun /sbin/init as init process\n',
@@ -50,7 +50,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(classify(data, None, None, {})[0], 'INCONCLUSIVE')
 
     def test_login_without_the_marker_is_inconclusive(self):
-        data = b'ESP-ROM:esp32s3\nbuildroot login: '
+        data = b'ESP-ROM:esp32s3\narduino login: '
         self.assertEqual(classify(data, 30.0, None, {})[0], 'INCONCLUSIVE')
 
     def test_a_silent_reset_before_login_is_inconclusive(self):
@@ -82,6 +82,23 @@ class ClassifyTests(unittest.TestCase):
     def test_slab_debug_in_the_bootargs_is_not_a_fault(self):
         data = CLEAN + b'Kernel command line: rw panic=10 slab_nomerge slab_debug=FZPU\n'
         self.assertEqual(classify(data, 30.0, 12.0)[0], 'PASS')
+
+
+class LoginPromptTests(unittest.TestCase):
+    """busybox getty builds its prompt out of the hostname, so a pattern that
+    spelled out "buildroot" would quietly stop matching the moment the image
+    was named anything else -- and a soak run that never sees a login reports
+    INCONCLUSIVE, which reads like a faulty board rather than a stale test."""
+
+    def test_the_images_own_hostname_matches(self):
+        self.assertTrue(soak.LOGIN.search(
+            b'\nWelcome to Arduino Nano ESP32\narduino login: '))
+
+    def test_a_hostname_the_pattern_has_never_seen_matches(self):
+        self.assertTrue(soak.LOGIN.search(b'some-other-board login: '))
+
+    def test_the_stock_hostname_still_matches(self):
+        self.assertTrue(soak.LOGIN.search(b'buildroot login: '))
 
 
 class QuietConsoleTests(unittest.TestCase):

@@ -1,0 +1,15 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1537,6 +1537,12 @@
+     set_source_files_properties(${FF_SIXEL_SRC} PROPERTIES COMPILE_OPTIONS "-Wno-conversion")
+ endif()
+ 
++# WSL GPU detection is only called on x86_64/aarch64. uClibc on Xtensa
++# does not provide the UTF-16 API used by that unreferenced implementation.
++if(CMAKE_SYSTEM_PROCESSOR STREQUAL "xtensa")
++    list(REMOVE_ITEM LIBFASTFETCH_SRC src/detection/gpu/gpu_windows.c)
++endif()
++
+ add_library(libfastfetch OBJECT
+     ${LIBFASTFETCH_SRC}
+ )

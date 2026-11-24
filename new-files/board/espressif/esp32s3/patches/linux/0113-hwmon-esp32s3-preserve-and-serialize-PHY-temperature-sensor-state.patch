@@ -1,0 +1,192 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob_phy.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob_phy.c
+@@ -14,6 +14,7 @@
+ #include <linux/mutex.h>
+ #include <linux/smp.h>
+ #include <linux/preempt.h>
++#include <linux/export.h>
+ #include <linux/spinlock.h>
+ #include <linux/types.h>
+ 
+@@ -99,11 +100,15 @@
+ 	spin_unlock_irqrestore(&phy_lock, flags);
+ }
+ 
++uint32_t phy_enter_critical(void);
++void phy_exit_critical(uint32_t level);
++
+ void phy_set_tsens_power(bool en)
+ {
+ 	unsigned long flags;
+-	u32 v;
+-
++	u32 v, level;
++
++	level = phy_enter_critical();
+ 	spin_lock_irqsave(&phy_lock, flags);
+ 	tsens_on = en;
+ 	if (en)
+@@ -119,6 +124,7 @@
+ 		v |= 1U << SENS_TSENS_XPD_FORCE_SHIFT;
+ 	sens_write(SENS_SAR_TSENS_CTRL2_REG, v);
+ 	spin_unlock_irqrestore(&phy_lock, flags);
++	phy_exit_critical(level);
+ }
+ 
+ /*
+@@ -130,12 +136,13 @@
+  */
+ int16_t phy_get_tsens_value(void)
+ {
+-	u32 v;
++	u32 v, level;
+ 	int i;
+ 
+ 	if (!sens_base)
+ 		return 0;
+ 
++	level = phy_enter_critical();
+ 	sens_set_bits(SENS_SAR_TSENS_CTRL_REG, SENS_TSENS_DUMP_OUT);
+ 	for (i = 0; i < 100; i++) {
+ 		if (sens_read(SENS_SAR_TSENS_CTRL_REG) & SENS_TSENS_READY)
+@@ -145,6 +152,7 @@
+ 	v = sens_read(SENS_SAR_TSENS_CTRL_REG);
+ 	sens_clr_bits(SENS_SAR_TSENS_CTRL_REG, SENS_TSENS_DUMP_OUT);
+ 
++	phy_exit_critical(level);
+ 	if (i == 100)
+ 		pr_warn("temperature sensor never became ready\n");
+ 
+@@ -198,6 +206,8 @@
+ 	local_irq_restore((unsigned long)level);
+ 	preempt_enable();
+ }
++EXPORT_SYMBOL_GPL(phy_enter_critical);
++EXPORT_SYMBOL_GPL(phy_exit_critical);
+ 
+ /* ------------------------------------------------------------------ */
+ /* Logging. The PHY library's own printf.                              */
+--- a/drivers/hwmon/esp32s3-tsens.c
++++ b/drivers/hwmon/esp32s3-tsens.c
+@@ -191,60 +191,84 @@
+ 	writel(v, ts->sens + SENS_TSENS_CTRL2);
+ }
+ 
++/* The radio's PHY and hwmon share one physical converter and analog
++ * bus. On Linux-hosted Wi-Fi use the PHY's recursive CPU-owned lock;
++ * no sleeping operations are permitted while that lock is held.
++ */
++#if IS_REACHABLE(CONFIG_ESP32_WIFI_BLOB)
++extern uint32_t phy_enter_critical(void);
++extern void phy_exit_critical(uint32_t level);
++#else
++static inline uint32_t phy_enter_critical(void) { return 0; }
++static inline void phy_exit_critical(uint32_t level) { }
++#endif
++
+ static int esp32s3_tsens_measure(struct esp32s3_tsens *ts, int *raw)
+ {
+-	u32 v;
+-	int i, ret = 0;
+-
+-	/* Clock first: nothing below works with the gate shut. */
+-	writel(readl(ts->sens + SENS_PERI_CLK_GATE) | PERI_TSENS_CLK_EN |
+-	       PERI_RTC_I2C_CLK_EN, ts->sens + SENS_PERI_CLK_GATE);
+-
+-	v = readl(ts->sens + SENS_TSENS_CTRL) & ~TSENS_CLK_DIV;
++	u32 v, level, old_ctrl, old_ctrl2, old_clock, old_ana, old_ana2;
++	u8 old_dac;
++	bool dac_saved = false;
++	int i, ret, restore_ret;
++
++	level = phy_enter_critical();
++	old_ctrl = readl(ts->sens + SENS_TSENS_CTRL);
++	old_ctrl2 = readl(ts->sens + SENS_TSENS_CTRL2);
++	old_clock = readl(ts->sens + SENS_PERI_CLK_GATE);
++	old_ana = readl(ts->ana + ANA_CONFIG);
++	old_ana2 = readl(ts->ana + ANA_CONFIG2);
++
++	writel(old_clock | PERI_TSENS_CLK_EN | PERI_RTC_I2C_CLK_EN,
++	       ts->sens + SENS_PERI_CLK_GATE);
++	v = old_ctrl & ~TSENS_CLK_DIV;
+ 	writel(v | (TSENS_CLK_DIV_DEFAULT << 14), ts->sens + SENS_TSENS_CTRL);
+-
+ 	tsens_power(ts, true);
+-	usleep_range(TSENS_POWER_UP_US, TSENS_POWER_UP_US * 2);
+-
+-	/* Open the analog bus, set the range, sample, and put it all back. */
+-	writel(readl(ts->ana + ANA_CONFIG) & ~ANA_CONFIG_I2C_SAR,
+-	       ts->ana + ANA_CONFIG);
+-	writel(readl(ts->ana + ANA_CONFIG2) | ANA_CONFIG2_SAR,
+-	       ts->ana + ANA_CONFIG2);
+-
++	if (!(old_ctrl & TSENS_POWER_UP)) {
++		if (IS_REACHABLE(CONFIG_ESP32_WIFI_BLOB))
++			udelay(TSENS_POWER_UP_US);
++		else
++			usleep_range(TSENS_POWER_UP_US, TSENS_POWER_UP_US * 2);
++	}
++
++	writel(old_ana & ~ANA_CONFIG_I2C_SAR, ts->ana + ANA_CONFIG);
++	writel(old_ana2 | ANA_CONFIG2_SAR, ts->ana + ANA_CONFIG2);
++	ret = tsens_ana_read(ts, I2C_SAR_ADC, I2C_SARADC_TSENS_DAC, &old_dac);
++	if (ret)
++		goto out;
++	dac_saved = true;
+ 	ret = tsens_ana_write_bits(ts, I2C_SAR_ADC, I2C_SARADC_TSENS_DAC,
+-				   I2C_SARADC_TSENS_DAC_M, TSENS_RANGE_DAC);
++				 I2C_SARADC_TSENS_DAC_M, TSENS_RANGE_DAC);
+ 	if (ret)
+ 		goto out;
+ 
+ 	writel(readl(ts->sens + SENS_TSENS_CTRL) | TSENS_DUMP_OUT,
+ 	       ts->sens + SENS_TSENS_CTRL);
+-
+ 	for (i = 0; i < TSENS_POLL_TRIES; i++) {
+ 		if (readl(ts->sens + SENS_TSENS_CTRL) & TSENS_READY)
+ 			break;
+ 		udelay(TSENS_POLL_US);
+ 	}
+-
+ 	v = readl(ts->sens + SENS_TSENS_CTRL);
+-	if (!(v & TSENS_READY)) {
+-		ret = -ETIMEDOUT;
+-	} else {
++	ret = v & TSENS_READY ? 0 : -ETIMEDOUT;
++	if (!ret)
+ 		*raw = v & TSENS_OUT;
+-		ret = 0;
+-	}
+-
+-	writel(readl(ts->sens + SENS_TSENS_CTRL) & ~TSENS_DUMP_OUT,
+-	       ts->sens + SENS_TSENS_CTRL);
+-
+-out:
+-	writel(readl(ts->ana + ANA_CONFIG2) & ~ANA_CONFIG2_SAR,
+-	       ts->ana + ANA_CONFIG2);
+-	writel(readl(ts->ana + ANA_CONFIG) | ANA_CONFIG_I2C_SAR,
+-	       ts->ana + ANA_CONFIG);
+-	tsens_power(ts, false);
+-	writel(readl(ts->sens + SENS_PERI_CLK_GATE) & ~PERI_TSENS_CLK_EN,
+-	       ts->sens + SENS_PERI_CLK_GATE);
++ out:
++	/* Restore the owner's DAC, force/power, divider and clock state,
++	 * including every error path. Never shut down an active PHY's TSENS.
++	 */
++	if (dac_saved) {
++		restore_ret = tsens_ana_write(ts, I2C_SAR_ADC, I2C_SARADC_TSENS_DAC, old_dac);
++		if (!ret)
++			ret = restore_ret;
++	}
++	writel(old_ana2, ts->ana + ANA_CONFIG2);
++	writel(old_ana, ts->ana + ANA_CONFIG);
++	writel(old_ctrl2, ts->sens + SENS_TSENS_CTRL2);
++	writel(old_ctrl, ts->sens + SENS_TSENS_CTRL);
++	v = readl(ts->sens + SENS_PERI_CLK_GATE);
++	v &= ~(PERI_TSENS_CLK_EN | PERI_RTC_I2C_CLK_EN);
++	v |= old_clock & (PERI_TSENS_CLK_EN | PERI_RTC_I2C_CLK_EN);
++	writel(v, ts->sens + SENS_PERI_CLK_GATE);
++	phy_exit_critical(level);
+ 	return ret;
+ }
+ 

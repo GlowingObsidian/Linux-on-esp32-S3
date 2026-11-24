@@ -18,20 +18,21 @@ Signed-off-by: Max Filippov <jcmvbkbc@gmail.com>
  arch/xtensa/boot/Makefile                     |   1 +
  arch/xtensa/boot/dts/esp32-wrover-dev.dts     |  69 ++++
  arch/xtensa/boot/dts/esp32.dtsi               | 249 ++++++++++++++
- arch/xtensa/boot/dts/esp32s3-devkit-c1.dts    |  83 +++++
- arch/xtensa/boot/dts/esp32s3.dtsi             | 313 ++++++++++++++++++
+ arch/xtensa/boot/dts/arduino-nano-esp32.dts   |  86 +++++
+ arch/xtensa/boot/dts/esp32s3.dtsi             | 312 ++++++++++++++++++
  arch/xtensa/boot/dts/gpio-esp32.h             |  70 ++++
  .../xtensa/configs/esp32_wrover_dev_defconfig |  92 +++++
- .../configs/esp32s3_devkit_c1_defconfig       | 149 +++++++++
+ .../configs/arduino_nano_esp32_defconfig      | 149 +++++++++
  .../platforms/esp32/include/platform/serial.h |   8 +
- 11 files changed, 1047 insertions(+)
+ 11 files changed, 1049 insertions(+)
+
  create mode 100644 arch/xtensa/boot/dts/esp32-wrover-dev.dts
  create mode 100644 arch/xtensa/boot/dts/esp32.dtsi
- create mode 100644 arch/xtensa/boot/dts/esp32s3-devkit-c1.dts
+ create mode 100644 arch/xtensa/boot/dts/arduino-nano-esp32.dts
  create mode 100644 arch/xtensa/boot/dts/esp32s3.dtsi
  create mode 100644 arch/xtensa/boot/dts/gpio-esp32.h
  create mode 100644 arch/xtensa/configs/esp32_wrover_dev_defconfig
- create mode 100644 arch/xtensa/configs/esp32s3_devkit_c1_defconfig
+ create mode 100644 arch/xtensa/configs/arduino_nano_esp32_defconfig
  create mode 100644 arch/xtensa/platforms/esp32/include/platform/serial.h
 
 diff --git a/arch/xtensa/Kconfig b/arch/xtensa/Kconfig
@@ -411,12 +412,12 @@ index 0000000000000..04140cb788b80
 +		};
 +	};
 +};
-diff --git a/arch/xtensa/boot/dts/esp32s3-devkit-c1.dts b/arch/xtensa/boot/dts/esp32s3-devkit-c1.dts
+diff --git a/arch/xtensa/boot/dts/arduino-nano-esp32.dts b/arch/xtensa/boot/dts/arduino-nano-esp32.dts
 new file mode 100644
-index 0000000000000..d83dd32adf568
+index 0000000000000..974c37495e03a 100644
 --- /dev/null
-+++ b/arch/xtensa/boot/dts/esp32s3-devkit-c1.dts
-@@ -0,0 +1,83 @@
++++ b/arch/xtensa/boot/dts/arduino-nano-esp32.dts
+@@ -0,0 +1,86 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/dts-v1/;
 +#include <dt-bindings/gpio/gpio.h>
@@ -425,6 +426,9 @@ index 0000000000000..d83dd32adf568
 +#include "esp32s3.dtsi"
 +
 +/ {
++	model = "Arduino Nano ESP32";
++	compatible = "arduino,nano-esp32", "espressif,esp32s3";
++
 +	memory@0 {
 +		device_type = "memory";
 +		reg = <0x3d800000 0x00800000>;
@@ -502,15 +506,14 @@ index 0000000000000..d83dd32adf568
 +};
 diff --git a/arch/xtensa/boot/dts/esp32s3.dtsi b/arch/xtensa/boot/dts/esp32s3.dtsi
 new file mode 100644
-index 0000000000000..4ba15e78d9427
+index 0000000000000..bf1f86e0a6bba
 --- /dev/null
 +++ b/arch/xtensa/boot/dts/esp32s3.dtsi
-@@ -0,0 +1,313 @@
+@@ -0,0 +1,312 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/dts-v1/;
 +
 +/ {
-+	compatible = "esp32s3";
 +	#address-cells = <1>;
 +	#size-cells = <1>;
 +	interrupt-parent = <&pic>;
@@ -993,11 +996,11 @@ index 0000000000000..eb8f053f6e792
 +# CONFIG_LD_NO_RELAX is not set
 +# CONFIG_S32C1I_SELFTEST is not set
 +# CONFIG_RUNTIME_TESTING_MENU is not set
-diff --git a/arch/xtensa/configs/esp32s3_devkit_c1_defconfig b/arch/xtensa/configs/esp32s3_devkit_c1_defconfig
+diff --git a/arch/xtensa/configs/arduino_nano_esp32_defconfig b/arch/xtensa/configs/arduino_nano_esp32_defconfig
 new file mode 100644
 index 0000000000000..c42177f1ca63f
 --- /dev/null
-+++ b/arch/xtensa/configs/esp32s3_devkit_c1_defconfig
++++ b/arch/xtensa/configs/arduino_nano_esp32_defconfig
 @@ -0,0 +1,149 @@
 +CONFIG_NO_HZ_IDLE=y
 +CONFIG_HIGH_RES_TIMERS=y
@@ -1024,7 +1027,7 @@ index 0000000000000..c42177f1ca63f
 +CONFIG_USER_ABI_CALL0_ONLY=y
 +CONFIG_XTENSA_PLATFORM_ESP32=y
 +CONFIG_USE_OF=y
-+CONFIG_BUILTIN_DTB_NAME="esp32s3-devkit-c1"
++CONFIG_BUILTIN_DTB_NAME="arduino-nano-esp32"
 +CONFIG_MEMMAP_CACHEATTR=0xffff222f
 +CONFIG_KERNEL_LOAD_ADDRESS=0x42120000
 +CONFIG_VECTORS_ADDR=0x4037c000

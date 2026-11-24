@@ -22,7 +22,7 @@ Recover by rewriting the factory `/home`:
 ```sh
 esptool --chip esp32s3 --port YOUR_COM_ADAPTER \
     --before default_reset --after no_reset \
-    write_flash 0xcc0000 ARTIFACTS/home.jffs2
+    write_flash 0xb40000 ARTIFACTS/home.jffs2
 ```
 
 That erases whatever was in `/home`. Treat the partition as scratch space.
@@ -48,12 +48,13 @@ failure, the first `mkdir` stalled and login was not reached within four
 minutes. Repackaging with an empty formatted partition removed that stall;
 the subsequent clean build reached login in 19.08 seconds. This isolates the
 packaging condition but does not prove that every first allocation must erase
-all 52 blocks, or establish the exact interaction with execution from flash.
+every block of the partition, or establish the exact interaction with execution
+from flash.
 
 Check the image rather than the scripts:
 
 ```sh
-python3 -c "d=open('linux-esp32s3-native-full.bin','rb').read()[0xcc0000:0x1000000]
+python3 -c "d=open('linux-esp32s3-native-full.bin','rb').read()[0xb40000:0x1000000]
 print(d[:12].hex(), d.count(b'\xff'), len(d))"
 ```
 
@@ -69,12 +70,16 @@ has not been measured here.
 
 ### First boot reports `tar: invalid option -- z` and `/home/www` is missing
 
-An early experimental image used `tar -xzf`, but its BusyBox configuration
-did not enable gzip handling inside tar. The corrected `home-init` uses
-`gzip -dc` followed by plain `tar -xf`, checks decompression failure and
-cleans its temporary directory. Existing user-edited web files are preserved.
-The clean-image test checks the web seed before running migration helpers,
-so an already populated `/home` cannot hide this startup bug.
+This belongs to images up to 0.9.1, which seeded an editable web page into
+`/home`. An early experimental image used `tar -xzf`, but its BusyBox
+configuration did not enable gzip handling inside tar; the corrected
+`home-init` used `gzip -dc` followed by plain `tar -xf`, checked decompression
+failure and cleaned its temporary directory.
+
+There is nothing to unpack on the current branch. The web server is gone, so
+`home-init` no longer seeds `/home/www` and `/usr/share/esp32-home` no longer
+carries a `www.tar.gz`. If you are on an image that still prints this, either
+flash a current one or fix `/home` with `flash.sh --parts`.
 
 ### Boot stops after `mmc_spi`, no panic, no further output
 
@@ -108,7 +113,7 @@ compare them yourself:
 
 ```sh
 xtensa-esp32s3-elf-nm network_adapter.elf | grep space_for_vectors
-grep CONFIG_VECTORS_ADDR .../devkit_c1_16m_linux.config
+grep CONFIG_VECTORS_ADDR .../nano_esp32_linux.config
 ```
 
 ### Guru Meditation boot loop, before Linux prints anything
@@ -144,28 +149,71 @@ rewrite of the same image.
 
 ### The boot prints almost nothing
 
-That is `quiet` on the kernel command line, since 2026-09-12: the console
-carries KERN_ERR and worse, which saves about 0.7 s of a 13.7 s boot on a
-115200 line. Everything is still in the ring buffer -- `dmesg` shows it. To
-see it on the console at every boot, `bootlog verbose`; `bootlog quiet` puts
-it back. That cannot cover a fault before init runs, about 1.4 s in; for
-those, `panic_console_replay` dumps the buffer when the kernel panics, and a
-development image can drop `quiet` from
-`board/espressif/esp32s3/patches/linux/0049-esp32s3-dts-quiet-bootargs-cramfs-root-panic-10.patch`.
+`quiet` on the kernel command line holds the console at KERN_ERR and worse.
+This image does not set it: patches 0049 and 0060 leave the bootargs without
+`quiet`, so the console sits at `CONFIG_CONSOLE_LOGLEVEL_DEFAULT=7` and the
+boot streams live, down to KERN_INFO, as it happens. `/etc/bootlog/verbose`
+ships present, which raises it to 8 so KERN_DEBUG comes through too. An image
+that does print almost nothing is one still carrying `quiet`; it saves about
+0.7 s of a 13.7 s boot on a 115200 line, and everything is still in the ring
+buffer -- `dmesg` shows it, and `bootlog verbose` puts it back on the console
+at boot.
+
+`bootlog quiet` is not the way to get that back. It lowers the console level
+from the moment it runs, so it holds nothing back that has already been written
+and the boot you are on has usually finished printing. It leaves no marker, so
+the next boot starts from the kernel's own default again. A quiet boot is a
+command line with `quiet` on it, which means rebuilding the device tree, not a
+command on the board.
+
+Neither covers a fault before init runs, about 1.4 s in. For those,
+`panic_console_replay` dumps the buffer when the kernel panics.
 
 ### Opening the serial console resets the board
 
 On the CH34x adapter DTR and RTS are wired to EN and IO0, so most terminal
 programs reset the board when they open the port. That is a fresh boot and a
 fresh WiFi association: for a few seconds after any console session the
-board answers no ping and no telnet. It is not a fault. The project's
+board answers no ping and no SSH. It is not a fault. The project's
 `serial-probe.py` lowers both lines before opening to avoid it.
 
-### The USB port shows the boot log, then no login
+### The USB port shows nothing after the ROM's boot messages
 
-That is the default. The kernel mirrors its console to the chip's own USB
-port, but the getty there is off to save RAM. Run `usb-console on` once
-from the UART console; it stays on across reboots.
+That is expected. The chip has one USB PHY and this image gives it to the USB
+host controller once Linux starts, so the port is not a console: `ttyGS3` is
+not created, and `usb-console` no longer exists to offer a login on it. The
+console is UART0 on D0/D1, 115200 8N1. Flashing still uses the USB port,
+because the ROM takes the PHY back while the chip is in download mode.
+
+### Nothing happens when I plug something into the USB port
+
+The port is a host, and it powers nothing: no VBUS regulator is described in
+the device tree, so the device needs its own supply — a powered hub's input is
+what that is for. Given power, work outwards from the bus:
+
+- `ls /sys/bus/usb/devices/` — a `1-1` entry means it enumerated and took a
+  bus address. No entry at all is a wiring, power or PHY problem, not a driver
+  one.
+- `ls -l /sys/bus/usb/devices/1-1*/driver` — the symlink names the driver that
+  claimed it. `(none)` means it enumerated and nothing bound to it.
+- `cat /proc/bus/input/devices` — a keyboard or mouse appears here with
+  `Handlers=... eventN`. `cat /dev/input/event0 | hexdump -C` then prints a
+  record per keypress, 16 bytes each on this 32-bit kernel: time, type, code,
+  value.
+- `cat /proc/interrupts` — the USB line's count climbing while the device is
+  used rules out a stale enumeration.
+- `dmesg | grep -i usb` — `dwc2` prints the device it found, including its
+  vendor and product IDs.
+
+There is no serial class driver in this image, so a USB-serial adapter will
+enumerate and bind to nothing. A device that enumerates and then resets itself,
+or drops off under load, is usually a power problem rather than a driver one.
+
+A flash drive or card reader is the exception — it binds to `usb-storage` and
+becomes `/dev/sda`. If it enumerates but no `/dev/sda` appears, the class driver
+did not bind; if `/dev/sda` appears but `mount` says `unknown filesystem type`,
+the drive is exFAT or NTFS, which this build does not carry. Only FAT is
+understood.
 
 ### `scp: Connection closed` right after connecting
 
@@ -247,27 +295,8 @@ had the right time, still starts in 1970.
 
 `CURL_CA_BUNDLE` is not what decides this. The bundle path is compiled into
 libcurl with `--with-ca-bundle`, so curl finds it with the variable unset and
-in contexts a profile script never reaches — CGI, cron, inetd. If TLS is
+in contexts a profile script never reaches — inetd, a detached session. If TLS is
 failing, the clock is the thing to check.
-
-### The status page does not answer
-
-It is **off by default**, and being off looks exactly like being unreachable.
-Check and turn it on:
-
-```sh
-web-server status
-web-server on
-```
-
-That setting lives in `/etc/inetd.conf` on the writable `/etc` partition, so it
-survives a reboot — but *not* a reflash, which rewrites that partition.
-`web-server status` also says which port it is on: 80 unless
-`web-server port` moved it.
-
-If `web-server status` says enabled and the page still does not load, inetd is
-the thing to look at (`ps | grep inetd`); `web-server on` restarts it as part of
-its job, so running it again is a reasonable first move.
 
 ### `sh: bad number` after almost every command
 
@@ -296,32 +325,6 @@ message comes out of that path.
 It is confined to shells whose stderr is a terminal. Scripts are unaffected —
 the boot log and `/var/log/network.log` are clean, and the substituted values
 are always correct. Ignore it. If it bothers you, redirect: `cmd 2>/dev/null`.
-
-## Bluetooth
-
-### The board does not appear in a BLE scan
-
-- **Wait ~30 s after power-on.** The BLE stack advertises long before Linux has
-  finished booting, and that window is unreliable — core 0 is busy bringing up
-  WiFi. This is a known limitation, not a fault.
-- Make sure the app scans in **BLE** mode. The ESP32-S3 has no Bluetooth
-  Classic, so a Classic-only scan can never find it.
-- A phone that has already bonded may not show it in a fresh scan; look under
-  paired devices instead.
-- Some BLE terminal apps keep a stale connection after disconnecting. Force-quit
-  the app, or toggle Bluetooth, before blaming the board.
-
-### Connected, but nothing happens
-
-The dialog does not greet you on connect. **Send any character** and the menu
-appears. If it still does not, check the daemon is alive:
-
-```sh
-ls -l /dev/esp-ble          # must exist, or the firmware has no BLE
-ps | grep ble-wifi-setup
-```
-
-`/dev/esp-ble` allows a single reader; a second one gets `-EBUSY`.
 
 ## Native userspace
 
@@ -370,9 +373,103 @@ than keeping another shell alive. Functional program tests still run from
 Bash. See [the verification conditions](build/README.md#hardware-tests);
 passing these bounded tests does not imply arbitrary concurrency is safe.
 
+### `find` or `du` over `/sys` eats memory and never gives it back
+
+Walking a directory tree allocates a dentry and an inode per node, and on this
+kernel those are freed only by the superblock shrinker, which `SLUB_TINY`
+leaves with nothing reclaimable to work on. Measured on the board:
+
+```
+before:           Slab 2128 kB   MemAvailable 3112 kB
+find /sys -name 'fork_bank*' >/dev/null
+after:            Slab 3748 kB   MemAvailable 1428 kB
+find /home -name 'nosuchfile' >/dev/null
+after:            Slab 3748 kB   MemAvailable 1428 kB
+```
+
+1620 kB for the walk of `/sys`, and it does not come back until a reboot. A
+second `cat /proc/meminfo` reads the same number, so it is not drift.
+
+The cost scales with how many nodes the walk visits, and only a tree with
+thousands of nodes shows it. The same `find` over `/home` cost nothing at all
+— its dentries fit in slab pages that already exist. `/sys` is the tree on
+this board that is large enough to matter, so it is the one to avoid.
+
+If the board is short of memory and something walked `/sys`, that is the
+cause, not a fork leak and not the USB stack.
+
+There is no fix from userspace: the objects are kernel slab, and the
+allocator variant that would let the shrinker take them back is the one that
+costs 2 MB of slab at boot. Avoid the walk, or reboot.
+
 ## Build
 
 Build failures have their own issue template, which asks for what is actually
 needed to diagnose one. See also the incidents list in
 [DEVELOPMENT.md](DEVELOPMENT.md) — every entry there was a build that reported
 success and produced something wrong.
+
+### `lto1: internal compiler error: in return_token` linking a userspace program
+
+```
+during IPA pass: static-var
+lto1: internal compiler error: in return_token, at opts-common.cc:2158
+lto-wrapper: fatal error: .../xtensa-esp32s3-linux-uclibcfdpic-gcc returned 1 exit status
+ld: error: lto-wrapper failed
+make: *** [Makefile:595: bash] Error 1
+```
+
+A bug in the pinned crosstool-NG compiler (GCC 14.1.0), not in the package
+being built, and it is the **make jobserver** that triggers it. A bare `-flto`
+link of a large object set aborts inside the compiler while lto-wrapper runs
+its LTRANS jobs through the jobserver that `make -j` creates. A two-file
+program with the same flags links fine, so it looks source-specific and is not;
+it needs a large object set before it shows. `bash` and `make` have both hit
+it, and `socat` would.
+
+Every row below is the same object set, in
+`experiments/mmu-poc/out/programs/bash-5.2.37`:
+
+| link | result |
+|---|---|
+| `make -j6` | ICE |
+| `make -j1` | links — "using serial compilation of 16 LTRANS jobs" |
+| `make -j6`, `-flto=4` | ICE — jobserver mode wins over an explicit partition count |
+| `make -j6`, `-flto -flto-partition=none` | links |
+
+The fix is the last row. A single partition means lto-wrapper runs the one job
+itself and never asks the jobserver for slots. It costs nothing, and if
+anything helps: the link is slightly *smaller* than the serial LTO link
+(1,373,128 vs 1,399,196 bytes for bash). `build-bash.sh` and `build-socat.sh`
+carry the flag; `fork/real/build.sh`'s `lto` variant does not, so
+`build/container-build.sh` builds make with `OPT_VARIANT=oz` instead.
+
+Dropping `-flto` at the **link** does not help. Each object records its
+compile-time options in `.gnu.lto_.opts` and the linker's LTO plugin replays
+them, so the objects must be recompiled to actually leave LTO behind.
+
+`build-process-tools.sh` also passes `-flto`, and is fine: it invokes `$CC`
+directly rather than through make, so there is no jobserver.
+
+### A build log looks frozen for minutes at a time
+
+The on-disk copy of each stage log is written by
+`build/container-build.sh` as `tee >(head -c "$LOG_CAP_BYTES" > ...)`. GNU
+`head` buffers its output, so the file advances a 4096-byte block at a time
+rather than streaming, and `tail -f` on it lags the real build by up to one
+block. A log parked at a size divisible by 4096 — 196608, say — is at a buffer
+boundary, not stalled.
+
+Read the build's health from the container, not the file:
+
+```
+docker stats --no-stream esp32-reproduce-macos
+docker top esp32-reproduce-macos
+```
+
+Zero CPU with all processes in state `S` is expected while a toolchain
+downloads, which the `firmware` stage does for about ten minutes on every run:
+ESP-IDF installs its tools into `$HOME/.espressif`, which is inside the
+container and not in a Docker volume, so `idf_tools.py install --targets=all`
+re-fetches them each time.
+

@@ -1,0 +1,222 @@
+Subject: [PATCH] net wireless esp32 wake blocked producers and bound TX admission with completion progress
+
+diff --git a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -96,6 +96,8 @@
+ extern int esp_wifi_internal_reg_rxcb(int ifx, blob_wifi_rxcb_t fn);
+ extern void esp_wifi_internal_free_rx_buffer(void *eb);
+ extern int esp_wifi_internal_tx(void *netif, void *buf, u16 len);
++typedef void (*blob_wifi_tx_done_cb_t)(u8 ifidx, u8 *data, u16 *len, bool success);
++extern int esp_wifi_set_tx_done_cb(blob_wifi_tx_done_cb_t callback);
+ 
+ /*
+  * The blob's crypto table, from libnet80211.a (ieee80211_crypto.o, 116
+@@ -649,16 +651,21 @@
+ static atomic_t wifi_tx_no_mem = ATOMIC_INIT(0);
+ static atomic_t wifi_tx_accepted = ATOMIC_INIT(0);
+ static atomic_t wifi_tx_failed = ATOMIC_INIT(0);
++static atomic_t wifi_tx_done = ATOMIC_INIT(0);
++static atomic_t wifi_tx_done_failed = ATOMIC_INIT(0);
++static atomic_t wifi_tx_queue_full = ATOMIC_INIT(0);
+ 
+ static int wifi_stats_get(char *buffer, const struct kernel_param *kp)
+ {
+ 	(void)kp;
+ 	return scnprintf(buffer, PAGE_SIZE,
+-		"sram_total=%zu sram_free=%zu tx_calls=%d tx_no_mem=%d tx_accepted=%d tx_failed=%d tx_mode=static static_tx=16 cache_tx=32\n",
++		"sram_total=%zu sram_free=%zu tx_calls=%d tx_no_mem=%d tx_accepted=%d tx_failed=%d tx_done=%d tx_done_failed=%d tx_queue_full=%d tx_mode=static static_tx=16 cache_tx=32\n",
+ 		osi_internal_pool ? gen_pool_size(osi_internal_pool) : 0,
+ 		osi_internal_pool ? gen_pool_avail(osi_internal_pool) : 0,
+ 		atomic_read(&wifi_tx_calls), atomic_read(&wifi_tx_no_mem),
+-		atomic_read(&wifi_tx_accepted), atomic_read(&wifi_tx_failed));
++		atomic_read(&wifi_tx_accepted), atomic_read(&wifi_tx_failed),
++		atomic_read(&wifi_tx_done), atomic_read(&wifi_tx_done_failed),
++		atomic_read(&wifi_tx_queue_full));
+ }
+ 
+ static const struct kernel_param_ops wifi_stats_ops = {
+@@ -1463,6 +1470,8 @@
+ 			q->head = (q->head + 1) % q->len;
+ 			q->count--;
+ 			spin_unlock_irqrestore(&q->lock, flags);
++			/* Receiving creates space for blocked senders, too. */
++			wake_up(&q->wait);
+ 			return 1;	/* pdTRUE */
+ 		}
+ 		spin_unlock_irqrestore(&q->lock, flags);
+@@ -1924,6 +1933,9 @@
+ 	struct sk_buff_head rx_q[MAX_PRIORITY_QUEUES];
+ 	struct sk_buff_head tx_q;
+ 	struct work_struct tx_work;
++	wait_queue_head_t tx_wait;
++	unsigned int tx_data_pending; /* Includes the worker's current data skb. */
++	bool tx_paused;              /* Queue stop owned by this transport. */
+ 	bool tx_stopping;
+ 	void __iomem *osi_slot;
+ 	void __iomem *xphy_slot;	/* ROM pointer slot 0x3fcef904 */
+@@ -4261,6 +4273,53 @@
+ 	return true;
+ }
+ 
++/* Eight software data slots leave room for control commands in the
++ * sixteen-slot transport queue. A stalled data packet waits at most 250ms;
++ * the complete data backlog therefore cannot consume the five-second host
++ * command deadline. The vendor's own static/cache pools remain unchanged.
++ */
++#define BLOB_TX_QUEUE_LIMIT 16
++#define BLOB_TX_DATA_LIMIT 8
++#define BLOB_TX_DATA_LOW 4
++
++/* Called only with tx_q.lock held: admission and retirement cannot lose a
++ * wakeup. Never wake a queue stopped by interface teardown or port closure.
++ */
++static void blob_tx_flow_locked(struct esp_wifi_blob *hw)
++{
++	struct esp_wifi_device *priv = hw->adapter.priv[ESP_STA_NW_IF];
++
++	if (!priv || !priv->ndev)
++		return;
++	if (hw->tx_data_pending >= BLOB_TX_DATA_LIMIT && !hw->tx_paused &&
++	    netif_running(priv->ndev) && !netif_queue_stopped(priv->ndev)) {
++		hw->tx_paused = true;
++		netif_stop_queue(priv->ndev);
++	} else if (hw->tx_paused && hw->tx_data_pending <= BLOB_TX_DATA_LOW) {
++		hw->tx_paused = false;
++		if (!hw->tx_stopping && netif_running(priv->ndev) &&
++		    READ_ONCE(priv->port_open) && !READ_ONCE(priv->stop_data))
++			netif_wake_queue(priv->ndev);
++	}
++}
++
++/* The pinned callback executes before esf_buf_recycle, as verified in
++ * ppProcTxDone. Treat it as a progress notification, NOT a reusable-buffer
++ * credit. Never retain/dereference the vendor's frame or length pointers.
++ * A short timed fallback covers the subsequent recycle and non-data frees.
++ */
++static void blob_tx_done(u8 ifidx, u8 *data, u16 *len, bool success)
++{
++	struct esp_wifi_blob *hw = READ_ONCE(g_blob);
++
++	if (ifidx != 0 || !hw)
++		return;
++	atomic_inc(&wifi_tx_done);
++	if (!success)
++		atomic_inc(&wifi_tx_done_failed);
++	wake_up(&hw->tx_wait);
++}
++
+ /*
+  * write -- the driver has already built the payload header, so skb->data
+  * is the frame as it goes on the wire; the header is stripped back off
+@@ -4273,7 +4332,8 @@
+ 	u16 offset;
+ 	u16 len;
+ 	struct esp_wifi_blob *hw = READ_ONCE(g_blob);
+-	unsigned int retries = 0;
++	unsigned long deadline;
++	int sequence;
+ 	int ret;
+ 
+ 	if (!skb || !skb->data || skb->len < sizeof(*hdr)) {
+@@ -4334,18 +4394,23 @@
+ 		dev_kfree_skb(skb);
+ 		return -ENODEV;
+ 	}
++	deadline = jiffies + msecs_to_jiffies(250);
+ 	for (;;) {
+ 		if (READ_ONCE(hw->tx_stopping)) {
+ 			ret = -ESHUTDOWN;
+ 			break;
+ 		}
++		sequence = atomic_read(&wifi_tx_done);
+ 		atomic_inc(&wifi_tx_calls);
+ 		ret = esp_wifi_internal_tx(NULL, skb->data, skb->len);
+ 		if (ret == 0x101)
+ 			atomic_inc(&wifi_tx_no_mem);
+-		if (ret != 0x101 || retries++ == 16)
++		if (ret != 0x101 || time_after_eq(jiffies, deadline))
+ 			break;
+-		usleep_range(1000, 2000);
++		wait_event_timeout(hw->tx_wait,
++			READ_ONCE(hw->tx_stopping) ||
++			atomic_read(&wifi_tx_done) != sequence,
++			msecs_to_jiffies(2));
+ 	}
+ 	if (ret)
+ 		atomic_inc(&wifi_tx_failed);
+@@ -4361,16 +4426,24 @@
+  * retain its transport ownership contract; only this worker calls them.
+  * Reuse the existing skb queue and system workqueue, not a new kthread.
+  */
+-#define BLOB_TX_QUEUE_LIMIT 16
+-
+ static void blob_tx_work(struct work_struct *work)
+ {
+ 	struct esp_wifi_blob *hw = container_of(work, struct esp_wifi_blob, tx_work);
+ 	struct sk_buff *skb;
++	unsigned long flags;
++	bool data;
+ 	int ret;
+ 
+ 	while ((skb = skb_dequeue(&hw->tx_q))) {
++		data = ((struct esp_payload_header *)skb->data)->packet_type !=
++			PACKET_TYPE_COMMAND_REQUEST;
+ 		ret = blob_process_packet(&hw->adapter, skb);
++		if (data) {
++			spin_lock_irqsave(&hw->tx_q.lock, flags);
++			hw->tx_data_pending--;
++			blob_tx_flow_locked(hw);
++			spin_unlock_irqrestore(&hw->tx_q.lock, flags);
++		}
+ 		if (ret)
+ 			pr_warn_ratelimited("radio TX/command failed: %d\n", ret);
+ 	}
+@@ -4407,10 +4480,17 @@
+ 	spin_lock_irqsave(&hw->tx_q.lock, flags);
+ 	if (hw->tx_stopping)
+ 		ret = -ESHUTDOWN;
+-	else if (skb_queue_len(&hw->tx_q) >= BLOB_TX_QUEUE_LIMIT)
++	else if (skb_queue_len(&hw->tx_q) >= BLOB_TX_QUEUE_LIMIT ||
++		 (header->packet_type != PACKET_TYPE_COMMAND_REQUEST &&
++		  hw->tx_data_pending >= BLOB_TX_DATA_LIMIT)) {
++		atomic_inc(&wifi_tx_queue_full);
+ 		ret = -ENOBUFS;
+-	else {
++	} else {
+ 		__skb_queue_tail(&hw->tx_q, skb);
++		if (header->packet_type != PACKET_TYPE_COMMAND_REQUEST) {
++			hw->tx_data_pending++;
++			blob_tx_flow_locked(hw);
++		}
+ 		/* Queue under the same lock as shutdown so flush cannot miss
+ 		 * a packet accepted immediately before stopping was set.
+ 		 */
+@@ -4432,6 +4512,7 @@
+ 	spin_lock_irqsave(&hw->tx_q.lock, flags);
+ 	hw->tx_stopping = true;
+ 	spin_unlock_irqrestore(&hw->tx_q.lock, flags);
++	wake_up(&hw->tx_wait);
+ 	flush_work(&hw->tx_work);
+ 	skb_queue_purge(&hw->tx_q);
+ }
+@@ -4646,6 +4727,7 @@
+ 	for (i = 0; i < MAX_PRIORITY_QUEUES; i++)
+ 		skb_queue_head_init(&hw->rx_q[i]);
+ 	skb_queue_head_init(&hw->tx_q);
++	init_waitqueue_head(&hw->tx_wait);
+ 	INIT_WORK(&hw->tx_work, blob_tx_work);
+ 	ret = devm_add_action_or_reset(&pdev->dev, blob_tx_shutdown, hw);
+ 	if (ret) {
+@@ -5021,6 +5103,11 @@
+ 		goto err_blob_deinit;
+ 	}
+ 	hw->started = true;
++	ret = esp_wifi_set_tx_done_cb(blob_tx_done);
++	if (ret) {
++		dev_err(hw->adapter.dev, "register TX completion: %d\n", ret);
++		goto err_blob_deinit;
++	}
+ 	dev_dbg(hw->adapter.dev, "blob started; the radio is Linux's\n");
+ 
+ 	/*

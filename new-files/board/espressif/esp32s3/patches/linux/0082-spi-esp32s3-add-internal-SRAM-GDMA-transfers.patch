@@ -1,0 +1,258 @@
+From: Shreyan Dey <shreyan@example.com>
+Subject: [PATCH] spi: esp32s3: add exclusive internal-SRAM GDMA transfers
+
+--- a/drivers/spi/spi-esp32.c
++++ b/drivers/spi/spi-esp32.c
+@@ -4,6 +4,7 @@
+ #include <linux/bits.h>
+ #include <linux/clk.h>
+ #include <linux/interrupt.h>
++#include <linux/iopoll.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+@@ -92,9 +93,45 @@
+ #define SPI_MST_CLK_SEL			BIT(2)
+ 
+ 
++/* S3 GDMA pair 0, exclusively assigned by the SD profile. OUT is TX, IN RX.
++ * Bounce buffers and descriptors stay in uncached internal SRAM; Linux RAM
++ * (PSRAM) is never exposed directly to this DMA master.
++ */
++#define GDMA_IN_CONF0  0x000
++#define GDMA_IN_RAW    0x008
++#define GDMA_IN_CLR    0x014
++#define GDMA_IN_LINK   0x020
++#define GDMA_IN_PERI   0x048
++#define GDMA_OUT_CONF0 0x060
++#define GDMA_OUT_RAW   0x068
++#define GDMA_OUT_CLR   0x074
++#define GDMA_OUT_LINK  0x080
++#define GDMA_OUT_PERI  0x0a8
++#define GDMA_LINK_ADDR GENMASK(19, 0)
++#define GDMA_IN_START  BIT(22)
++#define GDMA_OUT_START BIT(21)
++#define GDMA_RX_EOF    BIT(1)
++#define GDMA_TX_EOF    BIT(3)
++#define GDMA_IN_ERROR  (BIT(3) | BIT(4) | GENMASK(9, 6))
++#define GDMA_OUT_ERROR (BIT(2) | GENMASK(7, 4))
++#define GDMA_OWNER     BIT(31)
++#define GDMA_DESC_EOF  BIT(30)
++#define GDMA_SIZE      GENMASK(11, 0)
++#define GDMA_LENGTH    GENMASK(23, 12)
++#define GDMA_MAX_BYTES 4092
++#define GDMA_TX_DESC   0x00
++#define GDMA_RX_DESC   0x10
++#define GDMA_TX_BUF    0x40
++#define GDMA_RX_BUF    0x1040
++#define GDMA_SRAM_SIZE 0x2040
++
+ struct esp32_spi {
+ 	void __iomem *regs;		/* virt. address of control registers */
+ 	struct clk *clk;		/* bus clock */
++	void __iomem *gdma, *dma_sram;
++	u32 dma_phys;
++	struct clk *dma_clk;
++	int irq;
+ 	u32 speed_hz;			/* bus speed configured in SPI_CLOCK_REG */
+ 	struct completion done;		/* wake-up from interrupt */
+ };
+@@ -124,7 +161,8 @@
+ 	esp32_spi_write(spi, SPI_USER2_REG, 0);
+ 	esp32_spi_write(spi, SPI_DMA_CONF_REG,
+ 			SPI_RX_AFIFO_RST |
+-			SPI_BUF_AFIFO_RST);
++			SPI_BUF_AFIFO_RST | SPI_DMA_AFIFO_RST);
++	esp32_spi_write(spi, SPI_DMA_CONF_REG, 0);
+ }
+ 
+ static int
+@@ -312,6 +350,158 @@
+ 	return 0;
+ }
+ 
++static void esp32_spi_dma_reset(struct esp32_spi *spi)
++{
++	writel(BIT(0), spi->gdma + GDMA_IN_CONF0);
++	writel(BIT(0), spi->gdma + GDMA_OUT_CONF0);
++	writel(0, spi->gdma + GDMA_IN_CONF0); /* no memory-to-memory mode */
++	writel(BIT(2) | BIT(3), spi->gdma + GDMA_OUT_CONF0);
++	writel(~0U, spi->gdma + GDMA_IN_CLR);
++	writel(~0U, spi->gdma + GDMA_OUT_CLR);
++}
++
++static void esp32_spi_dma_desc(struct esp32_spi *spi, u32 offset,
++			       u32 buffer, u32 len, bool tx)
++{
++	u32 control = GDMA_OWNER | FIELD_PREP(GDMA_SIZE, len);
++
++	if (tx)
++		control |= GDMA_DESC_EOF | FIELD_PREP(GDMA_LENGTH, len);
++	writel(control, spi->dma_sram + offset);
++	writel(spi->dma_phys + buffer, spi->dma_sram + offset + 4);
++	writel(0, spi->dma_sram + offset + 8);
++}
++
++static int esp32_spi_dma_transfer(struct esp32_spi *spi,
++				 struct spi_device *device,
++				 struct spi_transfer *t)
++{
++	const u8 *tx = t->tx_buf;
++	u8 *rx = t->rx_buf;
++	u32 remaining = t->len;
++	int ret = 0;
++
++	while (remaining) {
++		u32 len = min_t(u32, remaining, GDMA_MAX_BYTES);
++		u32 in_raw, out_raw;
++
++		ret = esp32_spi_prepare_transfer(spi, device, t, len);
++		if (ret)
++			return ret;
++		esp32_spi_dma_reset(spi);
++		esp32_spi_write(spi, SPI_DMA_CONF_REG,
++			SPI_RX_AFIFO_RST | SPI_BUF_AFIFO_RST | SPI_DMA_AFIFO_RST);
++		esp32_spi_write(spi, SPI_DMA_CONF_REG,
++			SPI_DMA_TX_ENA | (rx ? SPI_DMA_RX_ENA : 0));
++		if (tx)
++			memcpy_toio(spi->dma_sram + GDMA_TX_BUF, tx, len);
++		else
++			memset_io(spi->dma_sram + GDMA_TX_BUF, 0xff, len);
++		esp32_spi_dma_desc(spi, GDMA_TX_DESC, GDMA_TX_BUF, len, true);
++		if (rx)
++			esp32_spi_dma_desc(spi, GDMA_RX_DESC, GDMA_RX_BUF, len, false);
++		/* Publish all data and descriptors before either channel can fetch. */
++		wmb();
++		reinit_completion(&spi->done);
++		esp32_spi_write(spi, SPI_DMA_INT_CLR_REG, SPI_TRANS_DONE_INT);
++		esp32_spi_write(spi, SPI_DMA_INT_ENA_REG, SPI_TRANS_DONE_INT);
++		if (rx)
++			writel(((spi->dma_phys + GDMA_RX_DESC) & GDMA_LINK_ADDR) |
++			       GDMA_IN_START, spi->gdma + GDMA_IN_LINK);
++		writel(((spi->dma_phys + GDMA_TX_DESC) & GDMA_LINK_ADDR) |
++		       GDMA_OUT_START, spi->gdma + GDMA_OUT_LINK);
++		ret = esp32_spi_start_transfer(spi);
++		if (!ret && !wait_for_completion_timeout(&spi->done, HZ))
++			ret = -ETIMEDOUT;
++		esp32_spi_write(spi, SPI_DMA_INT_ENA_REG, 0);
++		/* Do not let an in-flight handler complete a later transaction. */
++		synchronize_irq(spi->irq);
++		if (ret)
++			goto abort;
++		ret = esp32_spi_wait(spi);
++		if (ret)
++			goto abort;
++		ret = readl_poll_timeout(spi->gdma + GDMA_OUT_RAW, out_raw,
++			out_raw & (GDMA_TX_EOF | GDMA_OUT_ERROR), 1, 1000);
++		if (ret || (out_raw & GDMA_OUT_ERROR)) {
++			ret = ret ? ret : -EIO;
++			goto abort;
++		}
++		if (rx) {
++			ret = readl_poll_timeout(spi->gdma + GDMA_IN_RAW, in_raw,
++				in_raw & (GDMA_RX_EOF | GDMA_IN_ERROR), 1, 1000);
++			if (ret || (in_raw & GDMA_IN_ERROR)) {
++				ret = ret ? ret : -EIO;
++				goto abort;
++			}
++			rmb();
++			in_raw = readl(spi->dma_sram + GDMA_RX_DESC);
++			if ((in_raw & GDMA_OWNER) || FIELD_GET(GDMA_LENGTH, in_raw) != len) {
++				ret = -EIO;
++				goto abort;
++			}
++			memcpy_fromio(rx, spi->dma_sram + GDMA_RX_BUF, len);
++			rx += len;
++		}
++		if (tx)
++			tx += len;
++		remaining -= len;
++	}
++	goto out;
++abort:
++	/* Stop SPI before reclaiming its DMA buffers following an error. */
++	esp32_spi_init(spi);
++	spi->speed_hz = 0;
++out:
++	esp32_spi_dma_reset(spi);
++	esp32_spi_write(spi, SPI_DMA_CONF_REG, 0);
++	return ret;
++}
++
++/* Optional S3-only resources. Without these, the existing PIO path remains. */
++static int esp32_spi_dma_probe(struct platform_device *pdev, struct esp32_spi *spi)
++{
++	struct resource *res;
++	struct reset_control *rst;
++	int ret;
++
++	if (!platform_get_resource_byname(pdev, IORESOURCE_MEM, "gdma"))
++		return 0;
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res || res->start != 0x60024000)
++		return -EINVAL; /* This optional backend routes SPI2 only. */
++	if (IS_ENABLED(CONFIG_ESP32_GDMA))
++		return dev_err_probe(&pdev->dev, -EBUSY,
++			"disable experimental ESP32_GDMA before assigning SPI DMA\n");
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "dma-sram");
++	if (!res || resource_size(res) < GDMA_SRAM_SIZE ||
++	    res->start < 0x3fc88000 || res->end >= 0x3fce0000 ||
++	    !IS_ALIGNED(res->start, 4))
++		return -EINVAL;
++	spi->dma_phys = res->start;
++	spi->dma_sram = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(spi->dma_sram))
++		return PTR_ERR(spi->dma_sram);
++	spi->gdma = devm_platform_ioremap_resource_byname(pdev, "gdma");
++	if (IS_ERR(spi->gdma))
++		return PTR_ERR(spi->gdma);
++	spi->dma_clk = devm_clk_get_enabled(&pdev->dev, "dma");
++	if (IS_ERR(spi->dma_clk))
++		return PTR_ERR(spi->dma_clk);
++	rst = devm_reset_control_get_exclusive(&pdev->dev, "dma");
++	if (IS_ERR(rst))
++		return PTR_ERR(rst);
++	ret = reset_control_deassert(rst);
++	if (ret)
++		return ret;
++	/* SPI2 peripheral selector. The whole GDMA resource is exclusively held. */
++	esp32_spi_dma_reset(spi);
++	writel(0, spi->gdma + GDMA_OUT_PERI);
++	writel(0, spi->gdma + GDMA_IN_PERI);
++	dev_info(&pdev->dev, "SPI2 GDMA pair 0, internal SRAM bounce buffers\n");
++	return 0;
++}
++
+ static int esp32_spi_transfer_one(struct spi_controller *host,
+ 				  struct spi_device *device,
+ 				  struct spi_transfer *t)
+@@ -323,6 +513,9 @@
+ 	unsigned int remaining_words = t->len;
+ 	int ret;
+ 
++	if (spi->gdma && t->len >= ESP32_SPI_FIFO_SIZE && !(t->len & 3))
++		return esp32_spi_dma_transfer(spi, device, t);
++
+ 	memset(idle, 0xff, sizeof(idle));
+ 
+ 	while (remaining_words) {
+@@ -415,6 +608,8 @@
+ 		ret = irq;
+ 		goto put_host;
+ 	}
++
++	spi->irq = irq;
+ 
+ 	/* Spin up the bus clock before hitting registers */
+ 	ret = clk_prepare_enable(spi->clk);
+@@ -451,6 +646,10 @@
+ 		goto disable_clk;
+ 	}
+ 
++	ret = esp32_spi_dma_probe(pdev, spi);
++	if (ret)
++		goto disable_clk;
++
+ 	ret = devm_spi_register_controller(&pdev->dev, host);
+ 	if (ret < 0) {
+ 		dev_err(&pdev->dev, "spi_register_host failed\n");

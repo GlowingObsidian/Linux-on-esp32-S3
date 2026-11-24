@@ -21,8 +21,8 @@ install -m 644 "$programs_out/micropython/LICENSE" "$image_dir/tree/usr/share/li
 python3 "$programs_dir/strip-rootfs.py" "$image_dir/tree" --strip "$prefix-strip"
 "$host_dir/bin/mkcramfs" -X -q "$image_dir/tree" "$image_dir/rootfs.cramfs"
 size=$(wc -c < "$image_dir/rootfs.cramfs")
-test "$size" -le $((0x780000))
+test "$size" -le $((0x6f0000))
 "$host_dir/bin/cramfsck" "$image_dir/rootfs.cramfs"
 cp "$image_dir/rootfs.cramfs" "$output"
 sha256sum "$output"
-echo "Image $image_dir: $size bytes, free $((0x780000-size)); not flashed."
+echo "Image $image_dir: $size bytes, free $((0x6f0000-size)); not flashed."

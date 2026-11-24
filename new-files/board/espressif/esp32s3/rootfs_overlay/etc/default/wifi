@@ -1,0 +1,3 @@
+# Remembered radio state. Enabled Wi-Fi joins saved credentials at boot.
+# wifi off persists 0; wifi on (or wifi) persists 1.
+WIFI_RADIO_ENABLE=1

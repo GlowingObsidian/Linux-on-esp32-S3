@@ -24,3 +24,8 @@ cc -std=c99 -Wall -Wextra -Werror -O2 "$task_dir/fork-test.c" -o "$task_dir/../o
     -o "$task_dir/../out/fork-test-dynamic.debug"
 "$prefix-strip" -o "$task_dir/../out/fork-test-dynamic" "$task_dir/../out/fork-test-dynamic.debug"
 "$prefix-readelf" -d "$task_dir/../out/fork-test-dynamic" | sed -n '/NEEDED/p'
+"$prefix-gcc" -std=c99 -Os -g -mfdpic -mauto-litpools -fPIC \
+    -Wall -Wextra -Werror -Wl,-z,stack-size=32768 \
+    "$task_dir/smp-test.c" -L"$task_dir/../out" -l:libfork.so.0 \
+    -o "$task_dir/../out/fork-smp-test.debug"
+"$prefix-strip" -o "$task_dir/../out/fork-smp-test" "$task_dir/../out/fork-smp-test.debug"

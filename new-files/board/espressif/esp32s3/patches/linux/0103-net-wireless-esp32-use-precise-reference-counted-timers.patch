@@ -1,0 +1,321 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -42,6 +42,8 @@
+ #include <linux/kthread.h>
+ #include <linux/mm.h>
+ #include <linux/timer.h>
++#include <linux/hrtimer.h>
++#include <linux/refcount.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+@@ -2277,23 +2279,26 @@
+ /* treated as an opaque key and is never dereferenced or written.      */
+ /* ------------------------------------------------------------------ */
+ 
++/* Opaque blob timer keys, hrtimer deadlines, serialized CPU0 callbacks.
++ * Registry and queued/running work each hold a reference. Disarm never
++ * waits for its own callback, and done can safely be called by a callback.
++ */
+ struct osi_timer {
+ 	struct list_head node;
+-	void *key;		/* the blob's esp_timer pointer */
+-	struct timer_list timer;
++	void *key;
++	struct hrtimer timer;
+ 	struct work_struct work;
++	refcount_t refs;
+ 	void (*fn)(void *);
+ 	void *arg;
++	ktime_t period;
++	bool active;
+ 	bool repeat;
+-	u32 period_ms;
+ };
+-
+ static LIST_HEAD(osi_timers);
+ static DEFINE_SPINLOCK(osi_timers_lock);
+-
+-/* Callers are the blob's coex and Wi-Fi paths, which can arm a timer
+- * from a softirq or with interrupts off, so this is GFP_ATOMIC and the
+- * lookup is under a spinlock rather than a mutex. */
++static struct workqueue_struct *osi_timer_wq;
++
+ static struct osi_timer *osi_timer_find(void *key)
+ {
+ 	struct osi_timer *ot;
+@@ -2304,137 +2309,174 @@
+ 	return NULL;
+ }
+ 
+-/*
+- * The blob's timer callback runs on a workqueue, not in the timer softirq.
+- *
+- * osi_timer_cb() is invoked by the timer wheel, i.e. in softirq context,
+- * and the blob's callback is not written for that: it takes mutexes
+- * through osi_mutex_lock() and waits on queues through osi_queue_recv(),
+- * both of which sleep. Sleeping in a softirq is the same defect the
+- * threaded IRQ in osi_isr_thunk() fixes for the interrupt path, and it
+- * has the same symptom -- a wild rt_mutex waiter and a fault inside
+- * try_to_take_rt_mutex.
+- *
+- * So the timer only schedules work; the callback itself runs on a
+- * kworker, in process context, where every call the blob makes is legal.
+- * The timer stays armed for the repeat case, and re-arming happens from
+- * the callback's own context.
+- *
+- * The work item is embedded in the timer object and the object is only
+- * freed by osi_timer_done(), which cancels the timer first -- so the work
+- * cannot outlive the thing it points at.
+- */
+-/* Runs on a kworker, in process context. This is where the blob's
+- * callback is actually invoked; osi_timer_cb() only schedules it. */
++static void osi_timer_put(struct osi_timer *ot)
++{
++	if (refcount_dec_and_test(&ot->refs))
++		kfree(ot);
++}
++
+ static void osi_timer_work(struct work_struct *w)
+ {
+ 	struct osi_timer *ot = container_of(w, struct osi_timer, work);
+-
+-	if (ot->fn)
+-		ot->fn(ot->arg);
+-	if (ot->repeat && ot->period_ms)
+-		mod_timer(&ot->timer, jiffies + msecs_to_jiffies(ot->period_ms));
+-}
+-
+-static void osi_timer_cb(struct timer_list *t)
+-{
+-	struct osi_timer *ot = container_of(t, struct osi_timer, timer);
+-
+-	schedule_work(&ot->work);
+-}
+-
+-static void osi_timer_setfn(void *ptimer, void *pfunction, void *parg)
++	void (*fn)(void *) = NULL;
++	void *arg = NULL;
++	unsigned long flags;
++
++	spin_lock_irqsave(&osi_timers_lock, flags);
++	if (ot->active) {
++		fn = ot->fn;
++		arg = ot->arg;
++		if (!ot->repeat)
++			ot->active = false;
++	}
++	spin_unlock_irqrestore(&osi_timers_lock, flags);
++	if (fn)
++		fn(arg);
++	osi_timer_put(ot); /* work reference; callback may have deleted key */
++}
++
++static enum hrtimer_restart osi_timer_cb(struct hrtimer *timer)
++{
++	struct osi_timer *ot = container_of(timer, struct osi_timer, timer);
++	unsigned long flags;
++	bool repeat = false;
++
++	spin_lock_irqsave(&osi_timers_lock, flags);
++	if (ot->active && ot->fn) {
++		refcount_inc(&ot->refs);
++		if (!queue_work_on(0, osi_timer_wq, &ot->work))
++			osi_timer_put(ot); /* already queued: coalesce overdue firing */
++		if (ot->repeat) {
++			hrtimer_forward_now(timer, ot->period);
++			repeat = true;
++		}
++	}
++	spin_unlock_irqrestore(&osi_timers_lock, flags);
++	return repeat ? HRTIMER_RESTART : HRTIMER_NORESTART;
++}
++
++static void osi_timer_setfn(void *key, void *fn, void *arg)
+ {
+ 	struct osi_timer *ot;
+ 	unsigned long flags;
+ 
+-	if (!ptimer)
++	if (!key || !osi_timer_wq)
+ 		return;
+-
+ 	spin_lock_irqsave(&osi_timers_lock, flags);
+-	ot = osi_timer_find(ptimer);
++	ot = osi_timer_find(key);
+ 	if (!ot) {
+ 		ot = kzalloc(sizeof(*ot), GFP_ATOMIC);
+ 		if (ot) {
+-			ot->key = ptimer;
+-			timer_setup(&ot->timer, osi_timer_cb, 0);
++			ot->key = key;
++			refcount_set(&ot->refs, 1); /* registry */
++			hrtimer_setup(&ot->timer, osi_timer_cb, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 			INIT_WORK(&ot->work, osi_timer_work);
+ 			list_add(&ot->node, &osi_timers);
+ 		}
+ 	}
+ 	if (ot) {
+-		ot->fn = pfunction;
+-		ot->arg = parg;
++		ot->fn = fn;
++		ot->arg = arg;
+ 	}
+ 	spin_unlock_irqrestore(&osi_timers_lock, flags);
+-
+ 	if (!ot)
+-		pr_err("osi: _timer_setfn: no memory for timer %p\n", ptimer);
+-}
+-
+-static void osi_timer_arm(void *timer, uint32_t tmout, bool repeat)
++		pr_err("cannot allocate Wi-Fi timer\n");
++}
++
++static void osi_timer_arm_ns(void *key, u64 ns, bool repeat)
+ {
+ 	struct osi_timer *ot;
+ 	unsigned long flags;
+ 
+-	if (!timer)
+-		return;
+-
+ 	spin_lock_irqsave(&osi_timers_lock, flags);
+-	ot = osi_timer_find(timer);
++	ot = osi_timer_find(key);
+ 	if (ot && ot->fn) {
++		ot->period = ns_to_ktime(ns ? ns : 1000);
+ 		ot->repeat = repeat;
+-		ot->period_ms = tmout;
+-		mod_timer(&ot->timer, jiffies + msecs_to_jiffies(tmout));
++		ot->active = true;
++		hrtimer_start(&ot->timer, ot->period, HRTIMER_MODE_REL);
+ 	}
+ 	spin_unlock_irqrestore(&osi_timers_lock, flags);
+ }
+ 
+-static void osi_timer_arm_us(void *ptimer, uint32_t us, bool repeat)
+-{
+-	osi_timer_arm(ptimer, DIV_ROUND_UP(us, 1000), repeat);
+-}
+-
+-static void osi_timer_disarm(void *timer)
++static void osi_timer_arm(void *key, uint32_t ms, bool repeat)
++{
++	osi_timer_arm_ns(key, (u64)ms * NSEC_PER_MSEC, repeat);
++}
++
++static void osi_timer_arm_us(void *key, uint32_t us, bool repeat)
++{
++	osi_timer_arm_ns(key, (u64)us * NSEC_PER_USEC, repeat);
++}
++
++static void osi_timer_disarm(void *key)
+ {
+ 	struct osi_timer *ot;
+ 	unsigned long flags;
+ 
+-	if (!timer)
++	spin_lock_irqsave(&osi_timers_lock, flags);
++	ot = osi_timer_find(key);
++	if (ot) {
++		refcount_inc(&ot->refs);
++		ot->active = false;
++	}
++	spin_unlock_irqrestore(&osi_timers_lock, flags);
++	if (!ot)
+ 		return;
+-
+-	spin_lock_irqsave(&osi_timers_lock, flags);
+-	ot = osi_timer_find(timer);
+-	spin_unlock_irqrestore(&osi_timers_lock, flags);
+-
+-	if (ot) {
+-		timer_delete_sync(&ot->timer);
+-		cancel_work_sync(&ot->work);
+-	}
+-}
+-
+-/* The blob frees its own esp_timer after this returns, so the entry
+- * goes with it. Only our object is freed here; the blob's pointer is
+- * never kfree'd by this layer. */
+-static void osi_timer_done(void *ptimer)
++	/* Safe with IRQs disabled and from the callback itself. An already
++	 * running expiry can only queue work which sees active=false.
++	 */
++	hrtimer_try_to_cancel(&ot->timer);
++	if (cancel_work(&ot->work))
++		osi_timer_put(ot); /* canceled queued work reference */
++	osi_timer_put(ot); /* lookup reference */
++}
++
++static void osi_timer_done(void *key)
+ {
+ 	struct osi_timer *ot;
+ 	unsigned long flags;
+ 
+-	if (!ptimer)
+-		return;
+-
+ 	spin_lock_irqsave(&osi_timers_lock, flags);
+-	ot = osi_timer_find(ptimer);
+-	if (ot)
++	ot = osi_timer_find(key);
++	if (ot) {
+ 		list_del(&ot->node);
++		ot->active = false;
++	}
+ 	spin_unlock_irqrestore(&osi_timers_lock, flags);
+-
+ 	if (!ot)
+ 		return;
+-	timer_delete_sync(&ot->timer);
+-	cancel_work_sync(&ot->work);
+-	kfree(ot);
++	/* The hrtimer callback does not call the blob; it only queues work.
++	 * Synchronize expiry before releasing the registry reference.
++	 */
++	hrtimer_cancel(&ot->timer);
++	if (cancel_work(&ot->work))
++		osi_timer_put(ot);
++	osi_timer_put(ot); /* registry; running work retains its own reference */
++}
++
++static void osi_timers_shutdown(void *unused)
++{
++	struct osi_timer *ot;
++	unsigned long flags;
++
++	for (;;) {
++		spin_lock_irqsave(&osi_timers_lock, flags);
++		ot = list_first_entry_or_null(&osi_timers, struct osi_timer, node);
++		if (!ot) {
++			spin_unlock_irqrestore(&osi_timers_lock, flags);
++			break;
++		}
++		list_del(&ot->node);
++		ot->active = false;
++		spin_unlock_irqrestore(&osi_timers_lock, flags);
++		hrtimer_cancel(&ot->timer);
++		if (cancel_work(&ot->work))
++			osi_timer_put(ot);
++		osi_timer_put(ot);
++	}
++	destroy_workqueue(osi_timer_wq);
++	osi_timer_wq = NULL;
+ }
+ 
+ static int64_t osi_esp_timer_get_time(void)
+@@ -3871,6 +3913,13 @@
+ 	dev_info(&pdev->dev, "internal SRAM pool: %zu bytes\n",
+ 		 gen_pool_size(osi_internal_pool));
+ 
++	osi_timer_wq = alloc_workqueue("esp_wifi_timers", WQ_MEM_RECLAIM, 1);
++	if (!osi_timer_wq)
++		return -ENOMEM;
++	ret = devm_add_action_or_reset(&pdev->dev, osi_timers_shutdown, NULL);
++	if (ret)
++		return ret;
++
+ 	/*
+ 	 * The fault dump goes in first, before a single blob instruction
+ 	 * runs. It was registered at the end of probe on the reasoning that

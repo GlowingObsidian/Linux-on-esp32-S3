@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: paulneja <207793167+paulneja@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 12:00:00 -0300
+Subject: [PATCH 67/67] esp32s3: the panel becomes a console
+
+The panel has been a framebuffer since patch 0063 and nothing more: a
+program could open /dev/fb0 and draw, but the kernel had no way to put text
+on it, so `echo` and `cat` went to the serial port and the screen stayed
+blank. This adds console=tty1 to the command line, which is the half of that
+the device tree owns.
+
+The other half is the kernel config -- VT, VT_CONSOLE, FRAMEBUFFER_CONSOLE,
+FONTS and FONT_6x8 -- and it is not in this patch because it lives in
+nano_esp32_linux.config, where the rest of this board's config lives.
+
+The serial console is not replaced, and the order of the two arguments is
+what keeps it that way. `console` is a kernel alias for the *last* console=
+on the command line, and /dev/console is routed to the same one. Putting
+tty1 after ttyS0 would silently re-point both at the panel: the kernel's own
+`/dev/console` would become the screen, and buildroot's inittab line --
+`console::respawn:/sbin/getty -L console 0 vt100`, which names the alias
+rather than a device -- would move the serial getty onto tty1 with it. The
+board then had two gettys on the panel and none on the serial port, so the
+serial console took no input at all. ttyS0 is written last so the alias
+still means the serial port, which is the default this image is built
+around: the panel is an addition to the console, never a replacement for it.
+
+The kernel prints to every console it is given regardless of order, so the
+boot log still comes out of UART0 while the same text appears on the panel.
+
+tty1 rather than tty0 because tty0 is an alias for whichever virtual
+terminal is currently active, and there is exactly one here. Naming it
+directly means the console does not follow a VT switch that nothing on this
+board can perform anyway.
+
+The panel's own console binding needs no argument. fbcon maps every virtual
+terminal to the first registered framebuffer in fbcon_init, and on xtensa
+video_is_primary_device() is the asm-generic stub that returns false, so the
+mapping comes from con2fb_map_boot[] being zero-initialised rather than from
+the primary-device path. fbcon=map:0 would set the same thing explicitly and
+is deliberately not written down: it is a second place to keep true.
+
+One thing to watch on the board: fbtft drives the panel over SPI with
+deferred IO, and fbcon writes a dirty rectangle per character cell. A 4x6
+cell is 8 bytes of RGB565, so the per-write overhead is large relative to
+the payload and the console may scroll visibly slowly. That is a property of
+this driver and this panel, not of the console, and no amount of config
+changes it.
+
+diff --git a/arch/xtensa/boot/dts/esp32s3.dtsi b/arch/xtensa/boot/dts/esp32s3.dtsi
+index a1f9639aa7ec1..b6c1d0e4f2a55 100644
+--- a/arch/xtensa/boot/dts/esp32s3.dtsi
++++ b/arch/xtensa/boot/dts/esp32s3.dtsi
+@@ -7,7 +7,7 @@ / {
+ 	interrupt-parent = <&pic>;
+
+ 	chosen {
+-		bootargs = "earlycon=esp32s3uart,mmio32,0x60000000,115200n8,40000000 console=ttyS0,115200n8 rw root=mtd:rootfs rootfstype=cramfs panic=10 panic_console_replay ";
++		bootargs = "earlycon=esp32s3uart,mmio32,0x60000000,115200n8,40000000 console=tty1 console=ttyS0,115200n8 fbcon=font:ProFont6x11 rw root=mtd:rootfs rootfstype=cramfs panic=10 panic_console_replay no_hash_pointers memmap=64K$0x3fccc700 ";
+ 	};
+
+ 	aliases {
+--
+2.55.0

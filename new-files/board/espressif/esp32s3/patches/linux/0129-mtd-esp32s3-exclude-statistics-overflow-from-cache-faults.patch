@@ -1,0 +1,87 @@
+diff --git a/drivers/mtd/devices/esp32s3-flash-guard-main.c b/drivers/mtd/devices/esp32s3-flash-guard-main.c
+--- a/drivers/mtd/devices/esp32s3-flash-guard-main.c
++++ b/drivers/mtd/devices/esp32s3-flash-guard-main.c
+@@ -244,8 +244,9 @@
+ 		for (i = 0; i < 3; i++) {
+ 			u32 allowed = value == 3 && i == 1 ? readl(&c->acknowledged) : 0;
+ 
+-			if (!ret && ((readl(&c->errors_before[i]) & ~allowed) ||
+-			    readl(&c->errors_after[i]) || readl(&c->errors_ack[i])))
++			if (!ret && (fg_cache_fault_status(i, readl(&c->errors_before[i]) & ~allowed) ||
++			    fg_cache_fault_status(i, readl(&c->errors_after[i])) ||
++			    fg_cache_fault_status(i, readl(&c->errors_ack[i]))))
+ 				ret = -EIO;
+ 		}
+ 		if (!ret && readl(&c->acknowledged) &&
+diff --git a/drivers/mtd/devices/esp32s3-flash-guard-cache.S b/drivers/mtd/devices/esp32s3-flash-guard-cache.S
+--- a/drivers/mtd/devices/esp32s3-flash-guard-cache.S
++++ b/drivers/mtd/devices/esp32s3-flash-guard-cache.S
+@@ -35,6 +35,13 @@
+     beqz \reg, .Lzero_\@
+     j \target
+ .Lzero_\@:
++    .endm
++    .macro FG_FAULT_STATUS reg, scratch
++    /* Mask only the five documented counter-overflow bits. Raw snapshots
++     * retain them; real/unknown faults and per-CPU status stay fail-closed. */
++    extui \scratch, \reg, 7, 5
++    slli \scratch, \scratch, 7
++    xor \reg, \reg, \scratch
+     .endm
+     .macro FG_POLL off, shift, bits, value, fail
+     rsr a10, ccount
+@@ -258,6 +265,7 @@
+     movi a6, 1
+     s32i a6, a2, FGC_SNAPSHOTS
+     l32i a7, a2, FGC_ERRORS_BEFORE
++    FG_FAULT_STATUS a7, a8
+     FG_BNEZ a7, .Lprecondition
+     l32i a7, a2, (FGC_ERRORS_BEFORE + 8)
+     FG_BNEZ a7, .Lprecondition
+@@ -280,6 +288,7 @@
+     FG_WRITE a8, 0xec
+     FG_ERRORS FGC_ERRORS_ACK
+     l32i a7, a2, FGC_ERRORS_ACK
++    FG_FAULT_STATUS a7, a8
+     l32i a8, a2, (FGC_ERRORS_ACK + 4)
+     or a7, a7, a8
+     l32i a8, a2, (FGC_ERRORS_ACK + 8)
+diff --git a/drivers/mtd/devices/esp32s3-flash-guard-layout.h b/drivers/mtd/devices/esp32s3-flash-guard-layout.h
+--- a/drivers/mtd/devices/esp32s3-flash-guard-layout.h
++++ b/drivers/mtd/devices/esp32s3-flash-guard-layout.h
+@@ -14,6 +14,9 @@
+ #define FG_POLL_CYCLES 245760
+ #define FG_HOLD_CYCLES 4800
+ #define FG_IRQ_SOURCES 99
++
++/* EXTMEM +0xe4 bits 7..11 report access/miss counter overflow, not faults. */
++#define FG_CACHE_COUNTER_STATUS_MASK 0x00000f80
+ 
+ /* First eleven words retain the hardware-tested dry-run ABI. */
+ #define FGC_READY 0
+@@ -48,6 +51,12 @@
+ #define FGC_BYTES 248
+ 
+ #ifndef __ASSEMBLER__
++static inline u32 fg_cache_fault_status(unsigned int word, u32 status)
++{
++	/* Keep real faults, unknown bits and both CPUs' access-error words. */
++	return word ? status : status & ~FG_CACHE_COUNTER_STATUS_MASK;
++}
++
+ struct fg_control {
+ 	u32 ready[2], release, result[2], sp[2], pc[2], elapsed[2];
+ 	u32 abort_request, attempt, stage, mutated, hold_cycles;
+diff --git a/drivers/mtd/devices/esp32s3-flash-nor-main.inc b/drivers/mtd/devices/esp32s3-flash-nor-main.inc
+--- a/drivers/mtd/devices/esp32s3-flash-nor-main.inc
++++ b/drivers/mtd/devices/esp32s3-flash-nor-main.inc
+@@ -79,7 +79,8 @@
+ 	    readl(&c->irq_off[1]) || readl(&c->nmi[0]) || readl(&c->nmi[1])))
+ 		ret = -EIO;
+ 	for (i = 0; i < 3; i++)
+-		if (!ret && (readl(&c->errors_before[i]) || readl(&c->errors_after[i])))
++		if (!ret && (fg_cache_fault_status(i, readl(&c->errors_before[i])) ||
++		    fg_cache_fault_status(i, readl(&c->errors_after[i]))))
+ 			ret = -EIO;
+ 	if (!ret)
+ 		ret = fn_error(readl(&t->result));

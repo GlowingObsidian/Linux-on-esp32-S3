@@ -4,6 +4,320 @@ Releases carry one flashable `.bin` for a 16 MB / 8 MB-PSRAM ESP32-S3. Full
 notes and the binaries are on the
 [releases page](https://github.com/paulneja/Linux-on-esp32-S3/releases).
 
+## Unreleased — the buses move to the Nano's pins, plus a panel and a temperature sensor
+
+**In the tree, not yet built or flashed.** Everything below is design and code;
+the release is cut once a build and a board run back it. No version number is
+claimed for it yet, so the packaging step still stamps images `0.10.0` until
+this heading gets one.
+
+- **I2C is on A4/A5 and SPI on D10-D13**, which is where a Nano's own pinout
+  puts them. I2C was bit-banged on GPIO6/7 (D3/D4) and SPI2 was on GPIO10-13
+  (D7/A4/A5/A6), so a shield plugged into the header was wired wrong. I2C was a
+  two-property move in `i2c-gpio`, which is pin-agnostic. SPI was not: the S3's
+  FSPI IO-MUX function is 4 and reaches only GPIO9-14, so the four pads go into
+  their plain GPIO function and the FSPI signals are routed to them through the
+  GPIO matrix — a pad's `OUT_SEL_CFG` takes the *signal* index for an output,
+  while a signal's `IN_SEL_CFG` takes the *GPIO number* for an input.
+- **An ST7789 240x240 panel on SPI2, as a framebuffer and a console.**
+  `fb_st7789v.c` is already in the pinned kernel, so the driver side is a
+  device-tree node and the `FB`/`FB_TFT`/`FB_TFT_ST7789V` Kconfig behind it.
+  On top of that the panel carries a console: `CONFIG_VT` and
+  `CONFIG_FRAMEBUFFER_CONSOLE` are on, the font is `FONT_6x8` (40 columns by
+  30 rows), and `console=tty1` joins `console=ttyS0` on the kernel command line
+  so the boot log comes out of both. The serial console is not replaced and the
+  panel is still a canvas — `/dev/fb0` stays open to any program that wants to
+  draw. The cost is about 69 KB of `xipImage`, paid for by moving 64K from
+  `rootfs` to `linux` in the partition table; `linux`'s offset does not move,
+  so `CONFIG_KERNEL_LOAD_ADDRESS` is unchanged.
+
+  The panel was a 128x160 ST7735R when this entry was first written, and the
+  driver changed with the glass. `FB_TFT_ST7735R` is off rather than left on:
+  nothing in the fbtft Kconfig makes the two exclusive, so it would be dead
+  code in `xipImage` and a second `compatible` string that could bind the wrong
+  panel. Three properties on the node are new with it. `width = <240>` and
+  `height = <240>` are required because `fb_st7789v.c`'s own display struct
+  says 240x320 — 320 is the controller's column count, not this module's — and
+  the names are bare, not `fbtft,width`, because `fbtft_properties_read()` reads
+  them with `device_property_read_u32(dev, "width", …)`. And `spi-cpol` with
+  `spi-cpha` put the bus in SPI mode 3, which is what the panel needs: mode 0
+  leaves it blank, latching on the wrong clock edge so every command byte
+  arrives shifted.
+
+  The module is broken out as `SCL SDA RES DC` plus power — no backlight pad
+  and no chip select pad — so the node carries neither `led-gpios` nor
+  `cs-gpios`. The backlight is tied to VCC on the board and is on whenever the
+  module is powered; a `led-gpios` line would register a backlight device that
+  controls nothing. CS is tied low, so the panel is selected permanently, which
+  is fine on a bus with one device; `reg = <0>` is still what tells the SPI
+  core which chip select to claim.
+- **The SoC's own temperature sensor, as hwmon.** A new
+  `drivers/hwmon/esp32s3-tsens.c` reads the SENS block and offers
+  `temp1_input` in millidegrees. The range/offset DAC is in an *analog*
+  register behind the internal I2C master, which has no driver in this kernel;
+  that sequence is taken from the ROM routine the S3 shares with the ESP32 and
+  ESP32-S2, and `probe()` writes the DAC and reads it back so a wrong guess
+  fails loudly instead of reporting a plausible wrong number.
+  `espctl system info` prints the reading, and omits the line when the device
+  is not there.
+- **`mmc_spi@0` is gone from `&spi2`.** It claimed chip select 0, which the
+  panel needs, and it could not bind with `CONFIG_MMC` off. An SD card is still
+  possible — chip selects 1 and up are free, and D5/A6/A7 are unused — but it
+  needs the block layer back, which this image deliberately does not carry.
+- **The USB port becomes a host, and the Serial/JTAG console goes with it.**
+  A new `drivers/phy/phy-esp32s3-usb.c` drives the SoC's one USB PHY out of the
+  reset state that gives it to USB-Serial/JTAG, so `usb@60080000` can probe.
+  The port is host-only (`CONFIG_USB_DWC2_HOST`), with no gadget or serial class
+  driver: a keyboard or mouse becomes `/dev/input/eventN`, but a USB-serial
+  adapter will enumerate and bind to nothing. The
+  controller runs in PIO instead of DMA, because Linux's RAM is the 8 MB of
+  octal PSRAM at `0x3d800000` and the USB DMA master is understood to reach
+  internal SRAM only — the one line to revisit if that turns out wrong. The
+  driver writes registers rather than eFuses, so the board stays flashable
+  over the chip's own USB port. The cost is the console: the `acm` node is
+  disabled, `ttyGS3` no longer exists, `usb-console` and `S47usbconsole` are
+  retired, and the console is UART0 on D0/D1, which is where the earlycon and
+  getty already were. The port powers nothing itself, so the peripheral needs
+  its own supply.
+- **The Wi-Fi blob runs inside Linux, and the kernel grew a partition to hold
+  it.** The blob is linked into `xipImage` and executes as Linux code on core 0,
+  which is what frees core 1 to become a second Linux CPU. Two things come with
+  it and neither fits the old layout. The blob itself is 552 KiB. KALLSYMS is
+  on for the duration of the port, because a panic that prints bare addresses
+  has to be resolved by hand against `System.map` from a matching build, and
+  that is silently wrong the moment the build and the flashed image differ.
+  Measured: `xipImage` is 3459432 B with neither, 3905864 B with KALLSYMS, and
+  4077928 B with KALLSYMS_ALL on top of it — so the names cost 446432 B and the
+  data symbols another 172064 B, and only the function names are worth having.
+  `linux` therefore grows from `0x390000` to `0x3d0000` (3.8125 MiB), taking
+  256 KiB from `home`, which is 5 MiB of padding around an empty jffs2. `rootfs`
+  moves to `0x510000` and `home` to `0xb40000`; `linux`'s own offset does not
+  move, so `CONFIG_KERNEL_LOAD_ADDRESS` stays `0x42140000`. **This is a
+  whole-image reflash** — `flash.sh --parts` and `run.sh --recover` write
+  `etc.jffs2` and `home.jffs2` at offsets read from the CSV, so they follow, but
+  a board still carrying the old table looks for `rootfs` where it no longer is.
+  Both KALLSYMS options come back off once the port boots.
+- **A FAT32 USB drive mounts on that port, by hand.** The block layer, SCSI,
+  `usb-storage` and the FAT filesystem come back — the same four the 0.10.0
+  release cut to shrink the kernel, and they come back for the one device that
+  now has somewhere to plug into. A flash drive or a card reader binds to
+  `usb-storage`, becomes a SCSI disk, and appears as `/dev/sda` with its
+  partitions beside it: `mount /dev/sda1 /mnt/usb`. Nothing watches the port,
+  so a drive is mounted when it is asked for and not before — no hotplug rule,
+  no auto-mount, no daemon. Only FAT is understood; a drive formatted exFAT or
+  NTFS enumerates and then fails to mount, which is a missing filesystem rather
+  than a missing driver. The cost is the `linux` partition's headroom: the
+  kernel is built in rather than modular, so there is no `/lib/modules` and the
+  rootfs does not change at all.
+- **The RGB LED still comes up dark, and its pins are now handed back.**
+  `S04led` drives the three lines dark and then releases them, because on this
+  SoC freeing a line does not undo its level: the GPIO driver installs no
+  `.free` hook, so the kernel's release path clears its own bookkeeping and
+  writes nothing to the pad, and the latch keeps the pin high. So the LED stays
+  dark with nothing holding the lines, and `espctl gpio set LED_BLUE 1` works
+  straight after boot where it used to be refused `busy` until
+  `/etc/init.d/S04led stop` was run by hand. The operation that does light the
+  LED is clearing the output enable by making the line an input, which is what
+  `S04led stop` now does.
+- **Two ways a reused build directory could ship a stale kernel are closed.**
+  Both come from the macOS wrapper keeping its work directory between runs,
+  which the Linux `reproduce.sh` never did — it built into a fresh `mktemp -d`
+  every time. Buildroot stamps a package as *patched* without hashing the patch
+  files, so a patch added under `patches/linux` was skipped and the kernel
+  linked from the previous series; and `build-kernel.sh` makes its copy of
+  buildroot's kernel tree at `experiments/mmu-poc/out/linux-fork` only when
+  that copy is absent, so a changed board config or patch series left it
+  building the *previous* kernel — the copy being what its own config check
+  compares against. Each step is now guarded by a fingerprint of what it
+  inherits, compared before it runs and discarding the stale artifact when that
+  moves. Both were found by failing loudly rather than silently, the second
+  through `check-kernel-config.py`.
+- **No first-boot question.** A fresh board used to ask, on the first console
+  login, whether it should answer SSH, Telnet or neither, and wrote the answer
+  to `/etc/remote-login`. The question is gone: the board now comes up
+  console-only and stays that way until someone deliberately runs
+  `remote-login ssh` or `remote-login telnet`. `remote-login` is unchanged
+  otherwise, and `remote-login off` closes the network again.
+- **Cron is gone.** Nothing on the board installed a job, no service depended
+  on it, and it cost `crond` and `crontab` in BusyBox, an init script, two
+  helper scripts and a patch. `S50crond` was the last init script, so the soak
+  test's boot-completion marker moves to `Starting inetd: OK`, which is started
+  by a Buildroot script sorting after `S40network` and stays in the image
+  because SSH is reached through it. `CONFIG_FEATURE_PIDFILE` stays on: it is a
+  generic BusyBox option and `S50crond` was only its last user here.
+- **Telnet is gone, both halves.** The `telnetd` server sent the password in
+  clear text and the `telnet` client was the only way to reach it, so
+  `CONFIG_TELNET` and `CONFIG_TELNETD` both go. `CONFIG_INETD` stays — SSH goes
+  through it. `remote-login` loses `TELNET_PORT`, the `telnet` subcommand and
+  `check_ports()`, which existed only because the two protocols shared a port
+  namespace. Its `apply()` still strips a `/usr/sbin/telnetd` line from
+  `/etc/inetd.conf`, because `/etc` is jffs2 and outlives a flash: a board
+  updated from an image that had telnet still names it, and inetd would fork a
+  program that no longer exists.
+- **Walking `/sys` costs slab, and it does not come back.** Measured on the
+  board: `find /sys -name 'fork_bank*'` takes `Slab` from 2128 kB to 3748 kB
+  and `MemAvailable` from 3112 kB to 1428 kB, and a second `cat /proc/meminfo`
+  reads the same number. The same `find` over `/home` cost nothing, so the
+  cost scales with the number of nodes visited and only a tree with thousands
+  of them shows it. The cause is `SLUB_TINY`, which sets
+  `KMALLOC_RECLAIM = KMALLOC_NORMAL` (`include/linux/slab.h`), so there is no
+  reclaimable kmalloc cache and `SReclaimable` is 0. Dentry and inode objects
+  are freed only by the superblock shrinker, which runs from `shrink_slab()`
+  on kswapd or direct reclaim — rarely, on a board whose free memory sits in a
+  narrow band. This is not a new fault and nothing changed to cause it; it is
+  the trade `SLUB_TINY` was chosen for, since the same option took slab from
+  3692 kB to 1700 kB at boot. It is written down because that is the first
+  thing to suspect when the board is short and something ran `find` or `du`
+  over `/sys`. No kernel change.
+- **Linux runs on core 0, and the interrupt matrix had to move with it.** This
+  is the first image where the firmware hands core 0 to Linux instead of
+  keeping it for the radio: the IPC, the flash server and the transports are
+  gone, `/etc` and `/home` are in the read-only cramfs, and the flash driver is
+  read-only. Two things had to follow the core and did not, and both failed in
+  the same quiet way — the board booted, and then nothing worked.
+
+  The interrupt matrix. The S3 has two, at `0x600c2000` for core 0 and
+  `0x600c2800` for core 1, and the ROM's `intr_matrix_set` picks between them
+  on its `cpu_no` argument — the function loads `0x600c2000` and only
+  overwrites it with `0x600c2800` when `cpu_no` is non-zero. The device tree
+  named core 1's, which was correct while Linux ran on core 1 and wrong the
+  moment it did not. Every routed peripheral — UART0, GPIO, SPI2, SPI3, USB —
+  was then delivered to a core held in `RUNSTALL`, and the only interrupt that
+  still arrived was the core's own internal timer, which bypasses the matrix.
+  That is exactly enough to boot, because the timer drives the tick and the
+  kernel console is polled, and not enough to log in, because a tty needs the
+  UART's RX and TX interrupts. The symptom was a login prompt that accepted
+  nothing and echoed nothing, on a board whose boot log looked perfect.
+  `&intc` in `arduino-nano-esp32.dts` now names `0x600c2000`. Verified on the
+  board: `/proc/interrupts` lists `esp32-uart` with a rising count where it
+  previously could not have incremented at all.
+
+  The panel getty. `trim-target.sh` wrote `::respawn:/sbin/getty -L tty1 0
+  linux`, and an empty id in busybox's inittab is not "no tty" — it is
+  "inherit init's stdio", which is `/dev/console`, which is the last
+  `console=` on the command line, which is `ttyS0`. The intent was a getty on
+  the panel; the effect was a second reader on the serial port. It is
+  `tty1::respawn:` now, so init opens `/dev/tty1` and hands that to the getty.
+  This one turned out to be harmless in practice — busybox's `getty` opens the
+  tty it is named after regardless of what init handed it — but it was wrong,
+  and it is the kind of wrong that would have bitten later.
+- **The two Timer Group watchdogs are disabled before the jump to Linux.**
+  IDF arms MWDT1 in Timer Group 1 (the interrupt watchdog) and MWDT0 in Timer
+  Group 0 (the task watchdog), and feeds both from FreeRTOS. Once FreeRTOS
+  stops, nothing feeds them, and their stage 1 is
+  `WDT_STAGE_ACTION_RESET_SYSTEM` — which fires whether or not the interrupt is
+  masked, so the `rsil` before the jump does not save the kernel from them.
+  The board reset itself about ten seconds after reaching a login prompt, with
+  `rst:0x8 (TG1WDT_SYS_RST)`. `map_flash_and_go()` now disables both, with the
+  same pair of `wdt_hal_disable` calls IDF makes in `esp_restart_noos()`.
+  NuttX never has this problem: `ESP32S3_MWDT0`, `MWDT1` and `RWDT` are all
+  `default n` in its Kconfig, so nothing ever arms them, and it explicitly
+  clears the RTC watchdog the second-stage bootloader leaves on.
+
+## 0.10.0 — an Arduino Nano ESP32 image, and a bigger `/home` (2026-10-10)
+
+Rebrands the image for the Arduino Nano ESP32, removes the two services the
+board never used, and recuts the flash so the writable `/home` is 5.00 MiB
+instead of 3.25 MiB. The build runs on macOS as well as Linux.
+
+**The flash layout changed: reflash the whole combined image, not single
+partitions.** `linux` shrank from 4 MiB to 3 MiB, `rootfs` moved from
+`0x540000` to `0x440000`, and `/home` from `0xcc0000` to `0xb00000`. A board
+still carrying the previous partition table would look for each of them at
+the old offset, so `flash.sh --parts` and `run.sh --recover` — which write
+`etc.jffs2` and `home.jffs2` at fixed offsets — are only safe once the
+partition table on the board matches this release. The kernel's load address
+is unchanged (`0x42140000`): only the partitions after it moved.
+
+- **A bigger `/home`, paid for out of unused headroom.** The kernel and
+  rootfs both carried build-time slack that no image has ever used, so
+  `linux` gives up 1 MiB and `rootfs` 768 KiB, and `/home` grows by 1.75 MiB.
+  The slack that remains is deliberate: an image that outgrows its partition
+  fails the build rather than the board, and this project's own history is
+  two cases of a filesystem growing to meet a new package.
+- **The build runs on macOS.** `build/reproduce-macos.sh` ports
+  `build/reproduce.sh` to BSD `df`, snapshots the working tree rather than
+  `HEAD` so uncommitted edits are built, and keeps a persistent work
+  directory so completed stages resume instead of recompiling the toolchain
+  every run. `run.sh` gained portable disk, port and checksum helpers.
+- **The image identifies as an Arduino Nano ESP32.** `/etc/hostname` is
+  `arduino`, so the prompt reads `root@arduino` and follows the live hostname
+  rather than repeating it. The login banner prints the system line, the
+  licence notice and `Last login:`, with every field read at runtime and
+  omitted rather than faked when its source is missing.
+- **The panel carries a console and a boot logo.** The kernel draws the
+  Arduino mark on the panel before fbcon takes it over, from a 32x32
+  two-colour PPM that replaces the stock Tux logo in
+  `drivers/video/logo/logo_linux_clut224.ppm` — no new symbol, so `logo.c`'s
+  hardcoded `&logo_linux_clut224` picks it up unchanged. `CONFIG_LOGO` and
+  `CONFIG_LOGO_LINUX_CLUT224` are the only config lines. The logo is on screen
+  for about a second and then fbcon paints over it, which is what Raspbian
+  does.
+- **The prompt is coloured and knows how wide its terminal is.** `PS1` is
+  green, and it is two prompts: the panel's getty gets a bare `#` because 21
+  columns is not enough for `root@arduino:~#` plus a command, and the serial
+  getty gets the full form. The image has no bash and no dash — `/bin/sh` is
+  busybox hush, so the `BASH_VERSION` and dash branches the old prompt script
+  carried were both dead code and are gone.
+- **The login banner is the licence notice, not the art.** The ASCII art and
+  its tagline are removed (`etc/motd.art`, `etc/motd.tagline`): the boot logo
+  says which board this is now, so the banner prints the system line, the
+  Debian-shaped free-software notice and `Last login:`. The machine field
+  reads `xtensa-lx7` — `uname -m` prints only the family, and the model is a
+  compile-time macro the kernel cannot read back.
+- **`/etc/issue` says `Welcome to Arduino Nano ESP32`**, not `Welcome to
+  Buildroot`. It is `BR2_TARGET_GENERIC_ISSUE` in the defconfig.
+
+- **`espctl` speaks the Nano's pin names.** `D2`–`D13`, `A0`–`A7`,
+  `LED_RED`/`LED_GREEN`/`LED_BLUE` and `LED_BOARD` resolve to GPIOs, with
+  `espctl gpio list` printing the table and naming what it refuses rather
+  than failing silently. `D0`/`D1` are refused because they are UART0 and
+  this kernel keeps `console=ttyS0` on them. The `i2c scan` probe does a real
+  read now, so an empty bus no longer reports all 240 addresses as present.
+  `espctl` is compiled by the build from `espctl.c`; the checked-in Xtensa
+  binary is gone, so the source and the shipped program cannot drift.
+- **`espctl system info` reports the CPU clock**, read from the clock the
+  kernel registered at boot. It is a fixed rate — there is no cpufreq driver
+  and no governor — so the reading is constant for the life of a boot, which
+  is the honest answer to what the CPU is running at.
+- **No web server.** BusyBox `httpd`, its inetd line, the `/home/www`
+  document root and the `www-data` account are all removed, and the account's
+  absence is asserted at packaging time.
+- **No Bluetooth.** `CONFIG_BT_ENABLED` is off in the core-0 firmware, which
+  is what actually stops the board advertising; the provisioning dialog, its
+  init script and the `/dev/esp-ble` kernel pipe went with it.
+- **The whole boot log, as it happens.** `quiet` is gone from the device tree
+  (kernel patches 0049 and 0060), so the console runs at
+  `CONFIG_CONSOLE_LOGLEVEL_DEFAULT=7` and a boot prints live instead of
+  arriving in one burst when init replays the buffer. The shipped
+  `/etc/bootlog/verbose` raises it to 8 so `KERN_DEBUG` comes through too, and
+  `S00bootlog` re-applies that at every boot. `bootlog quiet` lowers the level
+  for the boot it is run on only, and now says so: it leaves no marker, the
+  kernel restores its own default at the next boot, and nothing running after
+  the kernel can silence a log already written. `S00bootlog` replays the buffer
+  only when `quiet` really is on the command line, so a verbose boot is not
+  printed twice. `build/test-board.py`'s three `bootlog` checks follow the
+  shipped default, which is verbose, and `build/test-bootlog.py` covers both
+  sides of the replay: replayed with `quiet` present, not replayed without it.
+- **`/bin/busybox` ships setuid again.** `package-final.py` staged its tree
+  under `$work`; Docker Desktop's macOS file sharing silently drops setuid and
+  setgid on a bind mount, so the `chmod 4755` there read back `0755` and the
+  packaged image carried a non-setuid BusyBox — the one thing
+  `test-home-users.py`, `test-home-users-board.py` and `test-home-reboot.py`
+  all assert against. The tree is staged in the container's own `/tmp` now,
+  and the mode is asserted immediately after the chmod.
+
+Measured on the images in `images/`: **35 board tests, 0 failed**, and 13 more
+beyond the suite (13/13), on the combined image
+`1feff1907a94e73296534b7057c32a1d1b3bf7a1747fe6725a0c1fec6718c644`. MemAvailable
+is 4312 kB at the start of the suite. The extra suite's `bootlog-across-reboots`
+check failed on its first run against these bytes and passed once the test was
+corrected: it was asserting that a userspace tool could quieten a boot, which
+is the one thing the section above says it cannot do. The 20-boot soak, the SSH,
+Telnet and network tests, and the factory first-login test were not run on this
+release — they need a configured network or a factory board, and 0.9.1 remains
+the last release they cover.
+
 ## 0.9.1 — a crash over SSH, and SSH on your own port (2026-10-05)
 
 Fixes the kernel crash some logins over SSH ended in, and lets SSH, Telnet

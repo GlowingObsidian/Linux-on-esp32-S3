@@ -1,0 +1,82 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -3700,7 +3700,7 @@
+ #define ESP_STA_IF_NUM		0
+ 
+ static int blob_post_cmd_resp(struct esp_wifi_blob *hw, u8 cmd_code,
+-			      const void *body, u16 body_len)
++			      const void *body, u16 body_len, u8 status)
+ {
+ 	struct sk_buff *skb;
+ 	struct esp_payload_header *hdr;
+@@ -3726,7 +3726,7 @@
+ 	cmd = skb_put(skb, sizeof(*cmd));
+ 	memset(cmd, 0, sizeof(*cmd));
+ 	cmd->cmd_code = cmd_code;
+-	cmd->cmd_status = CMD_RESPONSE_SUCCESS;
++	cmd->cmd_status = status;
+ 	cmd->len = cpu_to_le16(total);
+ 
+ 	if (body_len)
+@@ -3749,7 +3749,7 @@
+ 
+ 	switch (cmd_code) {
+ 	case CMD_INIT_INTERFACE:
+-		ret = blob_post_cmd_resp(hw, cmd_code, NULL, 0);
++		ret = blob_post_cmd_resp(hw, cmd_code, NULL, 0, CMD_RESPONSE_SUCCESS);
+ 		if (ret)
+ 			return false;
+ 		pr_info("cmd: init interface answered\n");
+@@ -3763,7 +3763,7 @@
+ 		}
+ 		memset(&resp, 0, sizeof(resp));
+ 		memcpy(resp.mac_addr, mac, MAC_ADDR_LEN);
+-		ret = blob_post_cmd_resp(hw, cmd_code, &resp, sizeof(resp));
++		ret = blob_post_cmd_resp(hw, cmd_code, &resp, sizeof(resp), CMD_RESPONSE_SUCCESS);
+ 		if (ret)
+ 			return false;
+ 		pr_info("cmd: get mac answered %pM\n", mac);
+@@ -3786,7 +3786,7 @@
+ 	u16 offset;
+ 	u16 len;
+ 
+-	if (!skb || !skb->data || !skb->len) {
++	if (!skb || !skb->data || skb->len < sizeof(*hdr)) {
+ 		if (skb)
+ 			dev_kfree_skb(skb);
+ 		return -EINVAL;
+@@ -3806,13 +3806,32 @@
+ 	 * on blob_post_cmd_resp above for why these two and not others.
+ 	 */
+ 	len = le16_to_cpu(hdr->len);
++	if (len > skb->len - offset) {
++		dev_kfree_skb(skb);
++		return -EINVAL;
++	}
+ 	if (hdr->packet_type == PACKET_TYPE_COMMAND_REQUEST &&
+ 	    len >= sizeof(*cmd) && offset + sizeof(*cmd) <= skb->len) {
+ 		cmd = (struct command_header *)(skb->data + offset);
+-		if (g_blob && blob_maybe_answer_cmd(g_blob, cmd->cmd_code)) {
++		if (!g_blob) {
+ 			dev_kfree_skb(skb);
+-			return 0;
++			return -ENODEV;
+ 		}
++		if (!blob_maybe_answer_cmd(g_blob, cmd->cmd_code)) {
++			/* Firmware control messages are not Ethernet frames. Until
++			 * this command has a native blob implementation, answer a
++			 * failure instead of passing its bytes to the radio TX API.
++			 */
++			pr_warn_ratelimited("unsupported radio command %u\n", cmd->cmd_code);
++			blob_post_cmd_resp(g_blob, cmd->cmd_code, NULL, 0, CMD_RESPONSE_FAIL);
++		}
++		dev_kfree_skb(skb);
++		return 0;
++	}
++
++	if (hdr->packet_type == PACKET_TYPE_COMMAND_REQUEST) {
++		dev_kfree_skb(skb);
++		return -EINVAL;
+ 	}
+ 
+ 	skb_pull(skb, offset);

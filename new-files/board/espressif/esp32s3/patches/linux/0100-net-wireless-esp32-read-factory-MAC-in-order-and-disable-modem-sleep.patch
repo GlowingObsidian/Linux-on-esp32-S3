@@ -1,0 +1,101 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -84,6 +84,7 @@
+ extern int esp_wifi_init_internal(const void *config);
+ extern int esp_wifi_deinit_internal(void);
+ extern int esp_wifi_start(void);
++extern int esp_wifi_set_ps(int type);
+ extern int esp_wifi_stop(void);
+ extern int esp_wifi_set_mode(int mode);
+ extern int esp_wifi_internal_reg_rxcb(void *netif, void *fn);
+@@ -2765,20 +2766,9 @@
+ 
+ static int osi_read_mac(uint8_t *mac, unsigned int type)
+ {
+-	/* The factory MAC lives in eFuse BLK1 bits 8..47, which the S3
+-	 * exposes as EFUSE_RD_MAC_SPI_SYS_0 (bits 31:0, MAC bytes 0..3) and
+-	 * EFUSE_RD_MAC_SPI_SYS_1 (bits 15:0, MAC bytes 4..5). IDF reads it
+-	 * through esp_efuse_read_field_blob(ESP_EFUSE_MAC_FACTORY), whose
+-	 * field descriptor is {EFUSE_BLK1, 40, 8} down to {EFUSE_BLK1, 0,
+-	 * 8} -- six one-byte fields, low byte first, so byte 0 of the MAC
+-	 * is BLK1 bit 0. There is no CRC gate on the S3; the CRC block in
+-	 * mac_addr.c is #ifdef CONFIG_IDF_TARGET_ESP32.
+-	 *
+-	 * The blob asks for more than one address here: ESP_MAC_WIFI_STA
+-	 * (0) for the station and ESP_MAC_WIFI_SOFTAP (1) for the AP. The
+-	 * AP address is the station address with the second byte's low bit
+-	 * set, which is what IDF's esp_read_mac does, so the two
+-	 * interfaces do not collide.
++	/* S3 eFuse descriptors read BLK1 bits 40,32,24,16,8,0, in that order.
++	 * Follow the pinned four-universal-address configuration: STA=base,
++	 * AP=base+1, BT=base+2, ETH=base+3 (last byte).
+ 	 */
+ 	unsigned int idx = type & 0xffff;
+ 	u32 mac0, mac1, lo, hi;
+@@ -2798,27 +2788,16 @@
+ 	lo = mac0;			/* bytes 3..0, little endian */
+ 	hi = mac1 & 0xffff;		/* bytes 5..4 */
+ 
+-	base[0] = lo & 0xff;
+-	base[1] = (lo >> 8) & 0xff;
+-	base[2] = (lo >> 16) & 0xff;
+-	base[3] = (lo >> 24) & 0xff;
+-	base[4] = hi & 0xff;
+-	base[5] = (hi >> 8) & 0xff;
+-
+-	/* An unprogrammed eFuse reads all-zero or all-ones. Neither is a
+-	 * usable address, so fall back to a locally-administered one rather
+-	 * than handing the blob a broadcast or a multicast MAC.
+-	 */
+-	if (!(base[0] | base[1] | base[2] | base[3] | base[4] | base[5]) ||
+-	    !(~base[0] | ~base[1] | ~base[2] | ~base[3] | ~base[4] | ~base[5])) {
+-		base[0] = 0x02;
+-		base[1] = 0x00;
+-		base[2] = 0x00;
+-		base[3] = 0x00;
+-		base[4] = 0x00;
+-		base[5] = 0x01;
+-		pr_warn("osi: eFuse MAC unprogrammed, using a local address\n");
+-	}
++	base[0] = (hi >> 8) & 0xff;
++	base[1] = hi & 0xff;
++	base[2] = (lo >> 24) & 0xff;
++	base[3] = (lo >> 16) & 0xff;
++	base[4] = (lo >> 8) & 0xff;
++	base[5] = lo & 0xff;
++
++	if ((base[0] & 1) ||
++	    !(base[0] | base[1] | base[2] | base[3] | base[4] | base[5]))
++		return -0x102;
+ 
+ 	switch (idx) {
+ 	case 0:				/* ESP_MAC_WIFI_STA */
+@@ -2827,11 +2806,8 @@
+ 	case 1:				/* ESP_MAC_WIFI_SOFTAP */
+ 	case 2:				/* ESP_MAC_BT */
+ 	case 3:				/* ESP_MAC_ETH */
+-		/* IDF's esp_read_mac derives these by setting bits in the
+-		 * second byte of the base address.
+-		 */
+ 		memcpy(mac, base, 6);
+-		mac[1] |= (u8)(1 << (idx - 1));
++		mac[5] += idx;
+ 		break;
+ 	case 5:				/* ESP_MAC_BASE */
+ 		memcpy(mac, base, 6);
+@@ -4241,6 +4217,15 @@
+ 	if (ret)
+ 		dev_warn(hw->adapter.dev, "esp_wifi_set_mode: %d\n", ret);
+ 
++	/* No Linux modem-sleep/cache-off integration exists yet. Keep the
++	 * radio awake rather than inheriting the blob's modem-sleep default.
++	 */
++	ret = esp_wifi_set_ps(0); /* WIFI_PS_NONE */
++	if (ret) {
++		dev_err(hw->adapter.dev, "disable modem sleep: %d\n", ret);
++		goto err_blob_deinit;
++	}
++
+ 	ret = esp_wifi_start();
+ 	if (ret) {
+ 		dev_err(hw->adapter.dev, "esp_wifi_start: %d\n", ret);

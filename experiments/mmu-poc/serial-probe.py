@@ -19,8 +19,9 @@ if os.name == 'posix':
     import termios
 
 
-FACTORY_PASSWORD = "changeme123"
-TEST_PASSWORD = "esp32s3-board-test"
+# The image's one password. There is no second one: nothing rotates it on the
+# board any more, so the suites and a person off the street type the same word.
+DEFAULT_PASSWORD = "arduino"
 
 
 class ConsoleSerial(serial.Serial):
@@ -81,35 +82,22 @@ class Console:
         self.port.write(b"\n")
         data, _ = self.until(rb"(?:login: ?|(?:~ )?# |MMU_SHELL> )")
         if b"login:" in data:
-            password = os.environ.get("MMU_BOARD_PASSWORD", TEST_PASSWORD)
-            for attempt in dict.fromkeys((password, FACTORY_PASSWORD)):
+            password = os.environ.get("MMU_BOARD_PASSWORD", DEFAULT_PASSWORD)
+            # The environment first, then the image default: a board mid-suite
+            # may be holding a password a test changed and has not yet put back.
+            for attempt in dict.fromkeys((password, DEFAULT_PASSWORD)):
                 self.port.write(b"root\n")
                 data, _ = self.until(rb"(?:Password: ?|(?:~ )?# )")
                 if b"Password:" not in data:
                     return
                 self.port.write(attempt.encode() + b"\n")
-                data, _ = self.until(rb"(?:# |Login incorrect|New password: ?|Pick 1[^:\n]*: ?)")
+                data, _ = self.until(rb"(?:# |Login incorrect)")
                 if b"Login incorrect" in data:
                     self.until(rb"login: ?$", 15)
                     continue
-                if b"# " not in data:
-                    if password == FACTORY_PASSWORD:
-                        password = TEST_PASSWORD
-                    self.first_login(data, password)
-                    attempt = password
                 os.environ["MMU_BOARD_PASSWORD"] = attempt
                 return
-            raise RuntimeError("Login failed with the test and the factory password")
-
-    def first_login(self, data, password):
-        while True:
-            if re.search(rb"(?:New|Retype) password: ?$", data):
-                self.port.write(password.encode() + b"\n")
-            elif re.search(rb"Pick 1[^:\n]*: ?$", data):
-                self.port.write(b"1\n")
-            elif re.search(rb"(?:~ )?# $", data):
-                return
-            data, _ = self.until(rb"(?:New password: ?|Retype password: ?|Pick 1[^:\n]*: ?|(?:~ )?# )$", 60)
+            raise RuntimeError("Login failed with the board's password and the image default")
 
     def command(self, text, seconds=30, check=True):
         token = "MMU_DONE_" + secrets.token_hex(12)

@@ -1,0 +1,26 @@
+--- a/drivers/mtd/devices/esp32s3-flash-guard-main.c
++++ b/drivers/mtd/devices/esp32s3-flash-guard-main.c
+@@ -141,16 +141,21 @@
+ {
+ 	struct fg_device *fg = dev_get_drvdata(dev);
+ 	u32 errors[3];
++	u32 mmu_content, mmu_vaddr;
+ 	ssize_t n;
+ 
+ 	mutex_lock(&fg->lock);
+ 	fg_read_errors(fg, errors);
+-	n = sysfs_emit(buf, "i_ctrl=%08x i_bus=%08x d_ctrl=%08x d_bus=%08x errors=%08x,%08x,%08x setup_before=%08x,%08x,%08x setup_after=%08x,%08x,%08x\n",
++	/* TRM/IDF: faulting MMU entry and virtual address, read without W1C. */
++	mmu_content = readl(fg->cache + 0x120);
++	mmu_vaddr = readl(fg->cache + 0x124);
++	n = sysfs_emit(buf, "i_ctrl=%08x i_bus=%08x d_ctrl=%08x d_bus=%08x errors=%08x,%08x,%08x setup_before=%08x,%08x,%08x setup_after=%08x,%08x,%08x mmu_fault_content=%08x mmu_fault_vaddr=%08x\n",
+ 		readl(fg->cache + 0x60), readl(fg->cache + 0x64),
+ 		readl(fg->cache), readl(fg->cache + 4),
+ 		errors[0], errors[1], errors[2],
+ 		fg->setup_before[0], fg->setup_before[1], fg->setup_before[2],
+-		fg->setup_after[0], fg->setup_after[1], fg->setup_after[2]);
++		fg->setup_after[0], fg->setup_after[1], fg->setup_after[2],
++		mmu_content, mmu_vaddr);
+ 	mutex_unlock(&fg->lock);
+ 	return n;
+ }

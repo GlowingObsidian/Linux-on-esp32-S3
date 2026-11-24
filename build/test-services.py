@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Small board scripts on the host: S01clock, 50-set-clock, use-shell, S46blewifi,
-ble-prov, usb-console and S47usbconsole. Absolute paths are pointed at a temp
-dir and kill at a fake, so nothing here touches the host."""
+"""Small board scripts on the host: S01clock, 50-set-clock and use-shell, plus
+the USB console this image retired. Absolute paths are pointed at a temp dir
+and kill at a fake, so nothing here touches the host."""
 import os
 from pathlib import Path
 import re
@@ -172,96 +172,39 @@ class UseShellTests(Base):
         self.assertEqual(self.use('zsh').returncode, 2)
 
 
-class BleTests(Base):
+class RetiredUsbConsoleTests(unittest.TestCase):
+    """The USB Serial/JTAG console is gone, and gone means gone.
+
+    The OTG controller owns this SoC's only USB PHY, so ttyGS3 is not a device
+    the kernel creates any more. A script that offers a login on it would ship
+    looking like a feature and fail on the board, which is the failure the
+    retired-paths list exists to prevent -- so the two paths are asserted
+    absent *and* asserted named there, because package-final.py only deletes
+    and checks what that file names."""
+
+    RETIRED = ['usr/sbin/usb-console', 'etc/init.d/S47usbconsole']
+
     def setUp(self):
-        super().setUp()
-        self.ble = self.dir / 'esp-ble'
-        self.ble.write_text('')
-        self.prov = self.dir / 'ble-prov.d'
-        self.wpa = self.dir / 'wpa_supplicant.conf'
-        self.fake('start-stop-daemon', f'echo "ssd $*" >> {self.log}; '
-                                       f'case "$*" in *-K*-t*) [ -e {self.dir}/running ] ;; esac')
-        self.fake('sleep', 'exit 0')
-        paths = [('/dev/esp-ble', self.ble), ('/etc/ble-prov', self.prov),
-                 ('/etc/wpa_supplicant.conf', self.wpa), ('/var/run/', f'{self.dir}/')]
-        self.init = self.install('etc/init.d/S46blewifi', paths)
-        self.cmd = self.install('usr/sbin/ble-prov', paths + [('/etc/init.d/S46blewifi', self.init)])
+        self.board = ROOT / 'new-files/board/espressif/esp32s3'
 
-    def started(self):
-        return 'ssd -S' in self.calls()
+    def test_the_paths_are_gone_from_the_overlay(self):
+        for rel in self.RETIRED:
+            self.assertFalse((OVERLAY / rel).exists(), rel)
 
-    def test_starts_only_until_wifi_is_configured(self):
-        r = self.run_script(self.init, 'start')
-        self.assertTrue(self.started())
-        self.log.write_text('')
-        self.wpa.write_text('network={}\n')
-        r = self.run_script(self.init, 'start')
-        self.assertIn('not started (wifi already configured', r.stdout)
-        self.assertFalse(self.started())
+    def test_the_paths_are_named_in_retired_paths(self):
+        listed = (self.board / 'retired-paths.txt').read_text().splitlines()
+        listed = [line.split('#', 1)[0].strip().strip('/') for line in listed]
+        for rel in self.RETIRED:
+            self.assertIn(rel, listed)
 
-    def test_no_ble_device_means_nothing(self):
-        self.ble.unlink()
-        r = self.run_script(self.init, 'start')
-        self.assertEqual((r.returncode, r.stdout), (0, ''))
-        self.assertFalse(self.started())
-
-    def test_on_off_auto_switch_the_files_and_the_service(self):
-        self.wpa.write_text('network={}\n')
-        r = self.run_script(self.cmd, 'on')
-        self.assertTrue((self.prov / 'always').exists())
-        self.assertTrue(self.started())
-        self.assertIn('setting: on', self.run_script(self.cmd, 'status').stdout)
-        self.log.write_text('')
-        self.run_script(self.cmd, 'off')
-        self.assertTrue((self.prov / 'never').exists())
-        self.assertFalse((self.prov / 'always').exists())
-        self.assertIn('ssd -K', self.calls())
-        self.log.write_text('')
-        r = self.run_script(self.init, 'start')
-        self.assertFalse(self.started())
-        self.assertIn('disabled (ble-prov on', self.run_script(self.init, 'status').stdout)
-        self.run_script(self.cmd, 'auto')
-        self.assertEqual(sorted(p.name for p in self.prov.iterdir()), [])
-        self.assertIn('setting: auto', self.run_script(self.cmd, 'status').stdout)
-
-    def test_status_says_running(self):
-        (self.dir / 'running').write_text('')
-        self.assertIn('BLE WiFi setup: running', self.run_script(self.init, 'status').stdout)
-
-    def test_bad_argument(self):
-        self.assertEqual(self.run_script(self.cmd, 'maybe').returncode, 1)
-
-
-class UsbConsoleTests(Base):
-    def setUp(self):
-        super().setUp()
-        self.tab = self.dir / 'inittab'
-        self.tab.write_text('::sysinit:/etc/init.d/rcS\nconsole::respawn:/sbin/getty -L console 0 vt100\n')
-        self.fake('pidof', 'exit 1')
-        self.fake('sleep', 'exit 0')
-        self.cmd = self.install('usr/sbin/usb-console', [('/etc/inittab', self.tab)])
-        self.init = self.install('etc/init.d/S47usbconsole', [('/etc/inittab', self.tab)])
-
-    def test_on_adds_one_getty_and_off_comments_it(self):
-        self.assertIn('kernel messages only', self.run_script(self.cmd, 'status').stdout)
-        self.assertEqual(self.run_script(self.cmd, 'on').returncode, 0)
-        self.assertEqual(self.tab.read_text().count('ttyGS3::respawn'), 1)
-        self.assertIn('kill -HUP 1', self.calls())
-        self.assertIn('already enabled', self.run_script(self.cmd, 'on').stdout)
-        self.assertEqual(self.tab.read_text().count('ttyGS3::'), 1)
-        self.run_script(self.cmd, 'off')
-        self.assertIn('#ttyGS3::respawn', self.tab.read_text())
-        self.run_script(self.cmd, 'on')
-        self.assertEqual(self.tab.read_text().count('ttyGS3::'), 1)
-        self.assertIn('login enabled', self.run_script(self.cmd, 'status').stdout)
-
-    def test_boot_only_pokes_init_when_enabled(self):
-        self.run_script(self.init, 'start')
-        self.assertEqual(self.calls(), '')
-        self.run_script(self.cmd, 'on')
-        self.log.write_text('')
-        self.assertEqual(self.run_script(self.init, 'start').returncode, 0)
-        self.assertIn('kill -HUP 1', self.calls())
+    def test_nothing_in_the_overlay_still_speaks_to_ttyGS3(self):
+        # A commented inittab line counts: it is what usb-console uncommented,
+        # and trim-target.sh deletes the whole line rather than leaving it.
+        for path in sorted(OVERLAY.rglob('*')):
+            if not path.is_file():
+                continue
+            self.assertNotIn('ttyGS3', path.read_text(errors='replace'),
+                             path.relative_to(OVERLAY))
 
 
 if __name__ == '__main__':

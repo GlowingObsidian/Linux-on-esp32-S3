@@ -1,0 +1,226 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: paulneja <207793167+paulneja@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 15:00:00 -0300
+Subject: [PATCH 66/66] esp32s3: the USB port becomes a host
+
+The two halves of the S3's single USB PHY cannot drive it at the same time,
+so giving the port to the OTG controller takes the Serial/JTAG tty away: the
+acm node goes off, and console=ttyGS3 goes out of the kernel command line
+with it. What is left is UART0 on D0/D1, which this image already carries an
+earlycon and a getty for. dr_mode is host because there is no gadget stack
+here to be a device with, which is also what makes USB_DWC2_HOST -- the
+default that Kconfig choice takes when USB_GADGET is off -- the only mode
+built.
+
+dr_mode, the phy's status and the acm node's status are one decision written
+in three places, so they are one patch.
+
+The dwc2 params setter is the part worth arguing about.
+dwc2_set_default_params() takes host_dma from the core's own capability, and
+on this core that capability is probably real. But the RAM Linux was given is
+the 8 MB of octal PSRAM at 0x3d800000, and the USB master's window is
+understood to cover internal SRAM only. A host_dma the core cannot actually
+reach does not fail loudly: the transfers go somewhere, and the symptom is
+corruption rather than an error, on a board where a checksum mismatch is
+easier to blame on the USB device than on the bus. PIO costs nothing here --
+the port is full speed and the CPU has 12 Mbit/s to spare -- so the setter
+forces it, and the comment records that this is the one line to revisit if
+the master's window turns out to include PSRAM.
+
+Two things to watch on the board, both named because a log will not show
+them:
+
+  - The FIFO sizes in the device tree (g-rx-fifo-size = <64> and the rest)
+    were written before anything used the port as a host, and dwc2 warns
+    rather than failing when they are short. If enumeration works and
+    transfers stall or truncate, that is the first thing to raise.
+  - This image drives no VBUS regulator -- nothing in the device tree
+    describes one and dwc2 has no vbus-supply to reach for -- so the port
+    powers nothing. The peripheral needs its own supply, which is what the
+    hub's USB-C input is for. A device that enumerates and then resets
+    itself is usually a power problem, not a driver.
+
+---
+ arch/xtensa/boot/dts/arduino-nano-esp32.dts | 18 +++++++++++++++++-
+ arch/xtensa/boot/dts/esp32s3.dtsi           |  2 +-
+ drivers/usb/dwc2/hcd.c                      | 17 +++++++++++++++++
+ drivers/usb/dwc2/params.c                   | 84 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 119 insertions(+), 2 deletions(-)
+
+diff --git a/arch/xtensa/boot/dts/arduino-nano-esp32.dts b/arch/xtensa/boot/dts/arduino-nano-esp32.dts
+index aaf3d758eb3c7..901246be297f1 100644
+--- a/arch/xtensa/boot/dts/arduino-nano-esp32.dts
++++ b/arch/xtensa/boot/dts/arduino-nano-esp32.dts
+@@ -135,10 +135,26 @@ panel@0 {
+ 	};
+ };
+ 
+-&acm {
++/* The S3 has one USB PHY and two peripherals that can drive it, so the
++ * two halves are mutually exclusive. Handing it to the OTG core here is
++ * what costs this image the Serial/JTAG tty: ttyGS3 exists only while
++ * the acm node is enabled, and the console is UART0 on D0/D1 instead.
++ * The switch is a register write, not an eFuse, so putting the board
++ * into download mode by hand still brings the port back to the ROM. */
++&usb_phy {
++	status = "ok";
++};
++
++&usb {
++	/* Host-only: this image has no gadget stack to be a device with. */
++	dr_mode = "host";
+ 	status = "ok";
+ };
+ 
++&acm {
++	status = "disabled";
++};
++
+ &ipc {
+ 	wifi@1 {
+ 		compatible = "esp,esp32-wifi-shmem";
+diff --git a/arch/xtensa/boot/dts/esp32s3.dtsi b/arch/xtensa/boot/dts/esp32s3.dtsi
+index 7e58a18c5d9a2..a1f9639aa7ec1 100644
+--- a/arch/xtensa/boot/dts/esp32s3.dtsi
++++ b/arch/xtensa/boot/dts/esp32s3.dtsi
+@@ -7,7 +7,7 @@ / {
+ 	interrupt-parent = <&pic>;
+ 
+ 	chosen {
+-		bootargs = "earlycon=esp32s3uart,mmio32,0x60000000,115200n8,40000000 console=ttyGS3 console=ttyS0,115200n8 rw root=mtd:rootfs rootfstype=cramfs panic=10 panic_console_replay ";
++		bootargs = "earlycon=esp32s3uart,mmio32,0x60000000,115200n8,40000000 console=ttyS0,115200n8 rw root=mtd:rootfs rootfstype=cramfs panic=10 panic_console_replay ";
+ 	};
+ 
+ 	aliases {
+diff --git a/drivers/usb/dwc2/params.c b/drivers/usb/dwc2/params.c
+index 091bfcfef7530..f3a0e3de5ffa9 100644
+--- a/drivers/usb/dwc2/params.c
++++ b/drivers/usb/dwc2/params.c
+@@ -303,6 +303,89 @@ static void dwc2_set_stm32mp15_hsotg_params(struct dwc2_hsotg *hsotg)
+ 	p->hird_threshold_en = false;
+ }
+ 
++/*
++ * The ESP32-S3's USB DMA does not reach the RAM this kernel runs from. Linux
++ * is given the 8 MB of octal PSRAM at 0x3d800000, outside the internal SRAM
++ * window the USB core's master can address, so a buffer the host driver hands
++ * to the core would be read from the wrong memory -- and the core reports no
++ * error for that, it returns whatever the bus gave it. Held to PIO, the same
++ * transfers run through the CPU and the FIFO, which at 12 Mbit/s full speed is
++ * far below what this core can copy.
++ *
++ * dwc2_set_default_params() takes host_dma from the core's own capability and
++ * runs before this, so the value set here is what stands. If the USB master's
++ * window turns out to include PSRAM, this is the one line to revisit.
++ *
++ * The FIFO sizes are the other half, and they are not a tuning choice: the
++ * core reports 200 words of FIFO in GHWCFG3.DFIFO_DEPTH, and
++ * dwc2_set_default_params() takes the host sizes from the registers without
++ * checking that they fit. dwc2_calculate_dynamic_fifo() then finds the sum
++ * over budget and falls back to Method 2, which wants 516 + host_channels +
++ * 256 + 768 = 1548 words -- more than the part has. (The 1024 in that formula
++ * is the spec's assumed maximum packet size for a periodic endpoint, not this
++ * core's FIFO depth.) It cannot allocate that either, so it prints
++ * "invalid fifo sizes" and leaves whatever the registers held. The receive
++ * FIFO is then too small to hold a control transfer's response, which is why
++ * a device is seen to attach and then times out on every descriptor read:
++ * the port detects the pull-up, issues SETUP, and loses the reply.
++ *
++ * The split below is ESP-IDF's, from its own host driver for this same core.
++ * components/usb/hcd_dwc.c carries three tables -- default, biased to RX and
++ * biased to periodic TX -- and the one taken here is the RX-biased one:
++ *
++ *	default		rx 104	nptx 48	ptx  48
++ *	bias_rx		rx 152	nptx 16	ptx  32		<- this one
++ *	bias_ptx	rx  34	nptx 16	ptx 150
++ *
++ * The vendor's own comment for it is the sizing rule: the RX FIFO wants
++ * ((LPS / 4) * 2) + 2 lines to hold two maximum-size packets at the largest
++ * packet size, the non-periodic TX FIFO wants (LPS / 4) * n for n packets of
++ * the largest size, and the periodic FIFO takes what is left. At full speed
++ * LPS is 64 bytes, so 16 words is one packet and 152 is nine -- far more than
++ * the two the rule asks for, which is the point of the RX bias: a host that
++ * reads descriptors and does bulk IN is almost always waiting on the receive
++ * side.
++ *
++ * Note what the vendor does not do: it does not spend the core's whole FIFO.
++ * usb_dwc_hal.h defines USB_DWC_HAL_FIFO_TOTAL_USABLE_LINES as 200 with the
++ * comment that although the core has 256 lines only 200 are usable, because
++ * EPINFO_CTL reserves the rest. Every one of the three tables sums to exactly
++ * 200. So the numbers below are deliberately small, and a larger split is not
++ * a free improvement -- it is a departure from the only sizing for this
++ * silicon that has been tested.
++ *
++ * dwc2 checks each of these against the corresponding register's own value
++ * and resets it to that value with a warning if it is larger, so the values
++ * printed below are the ones that stand. The three sum to 200.
++ */
++static void dwc2_set_esp32s3_params(struct dwc2_hsotg *hsotg)
++{
++	struct dwc2_core_params *p = &hsotg->params;
++
++	p->host_dma = false;
++
++	p->host_rx_fifo_size = 152;
++	p->host_nperio_tx_fifo_size = 16;
++	p->host_perio_tx_fifo_size = 32;
++
++	/*
++	 * The split that stands, and the core's own total for comparison.
++	 * These are params, not hw_params: hw_params is filled in by
++	 * dwc2_get_hwparams() before dwc2_init_params() calls this, so it
++	 * holds the core's ceiling (256/256/256 here) and never the numbers
++	 * just written. Reading it back is useless for the same reason --
++	 * the FIFO registers are not programmed until dwc2_config_fifos()
++	 * runs later in host init, which is where the read-back lives.
++	 */
++	dev_info(hsotg->dev,
++		 "fifo: total=%u host_channels=%u rx=%u nptx=%u ptx=%u\n",
++		 hsotg->hw_params.total_fifo_size,
++		 hsotg->hw_params.host_channels,
++		 p->host_rx_fifo_size,
++		 p->host_nperio_tx_fifo_size,
++		 p->host_perio_tx_fifo_size);
++}
++
+ const struct of_device_id dwc2_of_match_table[] = {
+ 	{ .compatible = "brcm,bcm2835-usb", .data = dwc2_set_bcm_params },
+ 	{ .compatible = "hisilicon,hi6220-usb", .data = dwc2_set_his_params },
+@@ -319,6 +402,7 @@ const struct of_device_id dwc2_of_match_table[] = {
+ 	{ .compatible = "lantiq,arx100-usb", .data = &dwc2_set_ltq_ase_params },
+ 	{ .compatible = "lantiq,xrx200-usb", .data = &dwc2_set_ltq_xrx200_params },
+ 	{ .compatible = "lantiq,xrx300-usb", .data = &dwc2_set_ltq_xrx200_params },
++	{ .compatible = "esp,esp32s3-usb", .data = dwc2_set_esp32s3_params },
+ 	{ .compatible = "snps,dwc2" },
+ 	{ .compatible = "samsung,s3c6400-hsotg",
+ 	  .data = dwc2_set_s3c6400_params },
+diff --git a/drivers/usb/dwc2/hcd.c b/drivers/usb/dwc2/hcd.c
+index 2414291aa9087..d67d7c4b5b325 100644
+--- a/drivers/usb/dwc2/hcd.c
++++ b/drivers/usb/dwc2/hcd.c
+@@ -295,6 +295,23 @@ static void dwc2_config_fifos(struct dwc2_hsotg *hsotg)
+ 	dev_dbg(hsotg->dev, "new hptxfsiz=%08x\n",
+ 		dwc2_readl(hsotg, HPTXFSIZ));
+ 
++	/*
++	 * Read the three registers back, because everything above this line
++	 * is a claim about what was written and this is the only place that
++	 * can show it landed. dwc2_calculate_dynamic_fifo() has already had
++	 * its say by now -- if the split did not fit it printed "invalid
++	 * fifo sizes" and left the registers alone, and the numbers here
++	 * then disagree with the ones dwc2_set_esp32s3_params() logged.
++	 * The start addresses are worth printing too: they are derived from
++	 * the depths, so a wrong start with a right depth means the layout
++	 * is wrong even though each size looks plausible on its own.
++	 */
++	dev_info(hsotg->dev,
++		 "fifo: grxfsiz=%08x gnptxfsiz=%08x hptxfsiz=%08x\n",
++		 dwc2_readl(hsotg, GRXFSIZ),
++		 dwc2_readl(hsotg, GNPTXFSIZ),
++		 dwc2_readl(hsotg, HPTXFSIZ));
++
+ 	if (hsotg->params.en_multiple_tx_fifo &&
+ 	    hsotg->hw_params.snpsid >= DWC2_CORE_REV_2_91a) {
+ 		/*
+-- 
+2.55.0

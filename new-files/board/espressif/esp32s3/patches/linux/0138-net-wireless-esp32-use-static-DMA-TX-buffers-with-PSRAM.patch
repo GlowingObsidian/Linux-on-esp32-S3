@@ -1,0 +1,77 @@
+Subject: [PATCH] net wireless esp32 use IDF PSRAM static TX buffers and expose backpressure statistics
+
+diff --git a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -642,6 +642,30 @@
+ 	return osi_internal_pool ? gen_pool_avail(osi_internal_pool) : 0;
+ }
+ 
++/* Read-only diagnostics: distinguish DMA-pool exhaustion from radio
++ * backpressure and verify that a rejected frame is retried, accepted or lost.
++ */
++static atomic_t wifi_tx_calls = ATOMIC_INIT(0);
++static atomic_t wifi_tx_no_mem = ATOMIC_INIT(0);
++static atomic_t wifi_tx_accepted = ATOMIC_INIT(0);
++static atomic_t wifi_tx_failed = ATOMIC_INIT(0);
++
++static int wifi_stats_get(char *buffer, const struct kernel_param *kp)
++{
++	(void)kp;
++	return scnprintf(buffer, PAGE_SIZE,
++		"sram_total=%zu sram_free=%zu tx_calls=%d tx_no_mem=%d tx_accepted=%d tx_failed=%d tx_mode=static static_tx=16 cache_tx=32\n",
++		osi_internal_pool ? gen_pool_size(osi_internal_pool) : 0,
++		osi_internal_pool ? gen_pool_avail(osi_internal_pool) : 0,
++		atomic_read(&wifi_tx_calls), atomic_read(&wifi_tx_no_mem),
++		atomic_read(&wifi_tx_accepted), atomic_read(&wifi_tx_failed));
++}
++
++static const struct kernel_param_ops wifi_stats_ops = {
++	.get = wifi_stats_get,
++};
++module_param_cb(stats, &wifi_stats_ops, NULL, 0444);
++
+ /* ------------------------------------------------------------------ */
+ /* Mutexes. The blob's mutexes are recursive, because the Wi-Fi code    */
+ /* takes the same lock from nested paths. Linux's are not, so a        */
+@@ -4315,11 +4339,18 @@
+ 			ret = -ESHUTDOWN;
+ 			break;
+ 		}
++		atomic_inc(&wifi_tx_calls);
+ 		ret = esp_wifi_internal_tx(NULL, skb->data, skb->len);
++		if (ret == 0x101)
++			atomic_inc(&wifi_tx_no_mem);
+ 		if (ret != 0x101 || retries++ == 16)
+ 			break;
+ 		usleep_range(1000, 2000);
+ 	}
++	if (ret)
++		atomic_inc(&wifi_tx_failed);
++	else
++		atomic_inc(&wifi_tx_accepted);
+ 	dev_kfree_skb(skb);
+ 	return ret;
+ }
+@@ -4855,13 +4886,15 @@
+ 	cfg.wpa_crypto_funcs.extra = 1;
+ 	cfg.static_rx_buf_num = 10;
+ 	cfg.dynamic_rx_buf_num = 32;
+-	cfg.tx_buf_type = 1;
+-	/* A 1650-byte frame consumes 1696 bytes with our allocator header.
+-	 * Thirty-two TX buffers alone need 54 KiB of the 64 KiB SRAM pool,
+-	 * before ten static RX buffers and control state. Bound TX occupancy
+-	 * while preserving the tested AMPDU and receive configuration.
++	/* Pinned IDF Kconfig excludes dynamic TX with a PSRAM-backed heap.
++	 * Static DMA buffers remain in internal SRAM; the separate cached-TX
++	 * queue absorbs upper-layer bursts using the ordinary PSRAM heap.
++	 * Match IDF's PSRAM defaults without changing RX/AMPDU configuration.
+ 	 */
+-	cfg.dynamic_tx_buf_num = 8;
++	cfg.tx_buf_type = 0;
++	cfg.static_tx_buf_num = 16;
++	cfg.dynamic_tx_buf_num = 0;
++	cfg.cache_tx_buf_num = 32;
+ 	cfg.ampdu_rx_enable = 1;
+ 	cfg.ampdu_tx_enable = 1;
+ 	cfg.rx_ba_win = 6;

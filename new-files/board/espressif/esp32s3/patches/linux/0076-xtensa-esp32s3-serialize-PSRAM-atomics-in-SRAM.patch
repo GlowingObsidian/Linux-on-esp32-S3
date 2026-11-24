@@ -1,0 +1,339 @@
+diff --git a/arch/xtensa/include/asm/atomic.h b/arch/xtensa/include/asm/atomic.h
+--- a/arch/xtensa/include/asm/atomic.h
++++ b/arch/xtensa/include/asm/atomic.h
+@@ -18,6 +18,9 @@
+ #include <asm/processor.h>
+ #include <asm/cmpxchg.h>
+ #include <asm/barrier.h>
++#ifdef CONFIG_XTENSA_SMP_ESP32
++#include <asm/esp32-atomic.h>
++#endif
+ 
+ /*
+  * This Xtensa implementation assumes that the right mechanism
+@@ -52,9 +55,26 @@
+  *
+  * Atomically sets the value of @v to @i.
+  */
+-#define arch_atomic_set(v,i)		WRITE_ONCE((v)->counter, (i))
+-
+-#if XCHAL_HAVE_EXCLUSIVE
++#ifdef CONFIG_XTENSA_SMP_ESP32
++#define arch_atomic_set(v,i) ((void)esp32_atomic_update(&(v)->counter, (i), 0, ESP32_ATOMIC_xchg, 4))
++#else
++#define arch_atomic_set(v,i) WRITE_ONCE((v)->counter, (i))
++#endif
++
++#if defined(CONFIG_XTENSA_SMP_ESP32)
++#define ATOMIC_OP(op) \
++static inline void arch_atomic_##op(int i, atomic_t *v) \
++{ esp32_atomic_update(&v->counter, i, 0, ESP32_ATOMIC_##op, 4); }
++#define ATOMIC_FETCH_OP(op) \
++static inline int arch_atomic_fetch_##op(int i, atomic_t *v) \
++{ return esp32_atomic_update(&v->counter, i, 0, ESP32_ATOMIC_##op, 4); }
++#define ESP32_RESULT_add(old, i) ((int)((unsigned int)(old) + (unsigned int)(i)))
++#define ESP32_RESULT_sub(old, i) ((int)((unsigned int)(old) - (unsigned int)(i)))
++#define ATOMIC_OP_RETURN(op) \
++static inline int arch_atomic_##op##_return(int i, atomic_t *v) \
++{ int old = esp32_atomic_update(&v->counter, i, 0, ESP32_ATOMIC_##op, 4); \
++  return ESP32_RESULT_##op(old, i); }
++#elif XCHAL_HAVE_EXCLUSIVE
+ #define ATOMIC_OP(op)							\
+ static inline void arch_atomic_##op(int i, atomic_t *v)			\
+ {									\
+diff --git a/arch/xtensa/include/asm/barrier.h b/arch/xtensa/include/asm/barrier.h
+--- a/arch/xtensa/include/asm/barrier.h
++++ b/arch/xtensa/include/asm/barrier.h
+@@ -26,6 +26,19 @@
+ #define __smp_mb__after_atomic()		barrier()
+ #endif
+ 
++#if defined(CONFIG_XTENSA_SMP_ESP32) && !defined(__ASSEMBLY__)
++#include <asm/esp32-atomic.h>
++#undef __smp_rmb
++#define __smp_rmb() __mb()
++/* Release stores sharing an atomic word must participate in its serialization. */
++#define __smp_store_release(p, v) do { \
++ typeof(*(p)) __esp32_value = (v); \
++ compiletime_assert_atomic_type(*(p)); \
++ if (sizeof(*(p)) <= 4) \
++  esp32_atomic_update((p), (unsigned long)__esp32_value, 0, ESP32_ATOMIC_xchg, sizeof(*(p))); \
++ else { __mb(); WRITE_ONCE(*(p), __esp32_value); } \
++} while (0)
++#endif
+ #include <asm-generic/barrier.h>
+ 
+ #endif /* _XTENSA_SYSTEM_H */
+diff --git a/arch/xtensa/include/asm/bitops.h b/arch/xtensa/include/asm/bitops.h
+--- a/arch/xtensa/include/asm/bitops.h
++++ b/arch/xtensa/include/asm/bitops.h
+@@ -96,7 +96,20 @@
+ 
+ #include <asm-generic/bitops/fls64.h>
+ 
+-#if XCHAL_HAVE_EXCLUSIVE
++#if defined(CONFIG_XTENSA_SMP_ESP32)
++#include <asm/esp32-atomic.h>
++#define ESP32_BIT_OP_set ESP32_ATOMIC_or
++#define ESP32_BIT_OP_clear ESP32_ATOMIC_and
++#define ESP32_BIT_OP_change ESP32_ATOMIC_xor
++#define BIT_OP(op, insn, inv) \
++static inline void arch_##op##_bit(unsigned int bit, volatile unsigned long *p) \
++{ unsigned long mask = 1UL << (bit & 31); \
++  esp32_atomic_update(p + (bit >> 5), inv mask, 0, ESP32_BIT_OP_##op, 4); }
++#define TEST_AND_BIT_OP(op, insn, inv) \
++static inline int arch_test_and_##op##_bit(unsigned int bit, volatile unsigned long *p) \
++{ unsigned long mask = 1UL << (bit & 31); \
++  return esp32_atomic_update(p + (bit >> 5), inv mask, 0, ESP32_BIT_OP_##op, 4) & mask; }
++#elif XCHAL_HAVE_EXCLUSIVE
+ 
+ #define BIT_OP(op, insn, inv)						\
+ static inline void arch_##op##_bit(unsigned int bit, volatile unsigned long *p)\
+diff --git a/arch/xtensa/include/asm/cmpxchg.h b/arch/xtensa/include/asm/cmpxchg.h
+--- a/arch/xtensa/include/asm/cmpxchg.h
++++ b/arch/xtensa/include/asm/cmpxchg.h
+@@ -16,6 +16,9 @@
+ #include <linux/bits.h>
+ #include <linux/stringify.h>
+ #include <linux/cmpxchg-emu.h>
++#ifdef CONFIG_XTENSA_SMP_ESP32
++#include <asm/esp32-atomic.h>
++#endif
+ 
+ /*
+  * cmpxchg
+@@ -24,7 +27,9 @@
+ static inline unsigned long
+ __cmpxchg_u32(volatile int *p, int old, int new)
+ {
+-#if XCHAL_HAVE_EXCLUSIVE
++#if defined(CONFIG_XTENSA_SMP_ESP32)
++ return esp32_atomic_update(p, new, old, ESP32_ATOMIC_cmpxchg, 4);
++#elif XCHAL_HAVE_EXCLUSIVE
+ 	unsigned long tmp, result;
+ 
+ 	__asm__ __volatile__(
+@@ -75,7 +80,12 @@
+ __cmpxchg(volatile void *ptr, unsigned long old, unsigned long new, int size)
+ {
+ 	switch (size) {
+-	case 1:  return cmpxchg_emu_u8(ptr, old, new);
++	case 1:
++#ifdef CONFIG_XTENSA_SMP_ESP32
++  return esp32_atomic_update(ptr, new, old, ESP32_ATOMIC_cmpxchg, 1);
++#else
++  return cmpxchg_emu_u8(ptr, old, new);
++#endif
+ 	case 4:  return __cmpxchg_u32(ptr, old, new);
+ 	default: __cmpxchg_called_with_bad_pointer();
+ 		 return old;
+@@ -127,7 +137,9 @@
+ 
+ static inline unsigned long xchg_u32(volatile int * m, unsigned long val)
+ {
+-#if XCHAL_HAVE_EXCLUSIVE
++#if defined(CONFIG_XTENSA_SMP_ESP32)
++ return esp32_atomic_update(m, val, 0, ESP32_ATOMIC_xchg, 4);
++#elif XCHAL_HAVE_EXCLUSIVE
+ 	unsigned long tmp, result;
+ 
+ 	__asm__ __volatile__(
+diff --git a/arch/xtensa/include/asm/esp32-atomic.h b/arch/xtensa/include/asm/esp32-atomic.h
+new file mode 100644
+--- /dev/null
++++ b/arch/xtensa/include/asm/esp32-atomic.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _XTENSA_ESP32_ATOMIC_H
++#define _XTENSA_ESP32_ATOMIC_H
++#ifndef __ASSEMBLY__
++#include <linux/types.h>
++enum esp32_atomic_op {
++ ESP32_ATOMIC_xchg, ESP32_ATOMIC_cmpxchg, ESP32_ATOMIC_add,
++ ESP32_ATOMIC_sub, ESP32_ATOMIC_and, ESP32_ATOMIC_or, ESP32_ATOMIC_xor
++};
++unsigned long esp32_atomic_update(volatile void *ptr, unsigned long arg,
++ unsigned long compare, enum esp32_atomic_op op, unsigned int size);
++#endif
++#endif
+diff --git a/arch/xtensa/include/asm/qrwlock.h b/arch/xtensa/include/asm/qrwlock.h
+new file mode 100644
+--- /dev/null
++++ b/arch/xtensa/include/asm/qrwlock.h
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _XTENSA_QRWLOCK_H
++#define _XTENSA_QRWLOCK_H
++#include <asm-generic/qrwlock.h>
++#ifdef CONFIG_XTENSA_SMP_ESP32
++/* Readers occupy low bits. A serialized writer sets the sign bit to
++ * exclude new readers, then waits for existing readers to drain. */
++static inline int esp32_read_trylock(struct qrwlock *lock)
++{
++ int old = atomic_read(&lock->cnts);
++ return old >= 0 && atomic_cmpxchg_acquire(&lock->cnts, old, old + 1) == old;
++}
++static inline void esp32_read_lock(struct qrwlock *lock)
++{
++ while (!esp32_read_trylock(lock)) cpu_relax();
++}
++static inline void esp32_read_unlock(struct qrwlock *lock)
++{
++ atomic_dec_return_release(&lock->cnts);
++}
++static inline int esp32_write_trylock(struct qrwlock *lock)
++{
++ if (!arch_spin_trylock(&lock->wait_lock)) return 0;
++ if (atomic_cmpxchg_acquire(&lock->cnts, 0, (int)0x80000000U) == 0) return 1;
++ arch_spin_unlock(&lock->wait_lock);
++ return 0;
++}
++static inline void esp32_write_lock(struct qrwlock *lock)
++{
++ arch_spin_lock(&lock->wait_lock);
++ atomic_or((int)0x80000000U, &lock->cnts);
++ while (atomic_read_acquire(&lock->cnts) != (int)0x80000000U) cpu_relax();
++}
++static inline void esp32_write_unlock(struct qrwlock *lock)
++{
++ atomic_set_release(&lock->cnts, 0);
++ arch_spin_unlock(&lock->wait_lock);
++}
++#undef arch_read_lock
++#undef arch_read_trylock
++#undef arch_read_unlock
++#undef arch_write_lock
++#undef arch_write_trylock
++#undef arch_write_unlock
++#define arch_read_lock(l) esp32_read_lock(l)
++#define arch_read_trylock(l) esp32_read_trylock(l)
++#define arch_read_unlock(l) esp32_read_unlock(l)
++#define arch_write_lock(l) esp32_write_lock(l)
++#define arch_write_trylock(l) esp32_write_trylock(l)
++#define arch_write_unlock(l) esp32_write_unlock(l)
++#endif
++#endif
+diff --git a/arch/xtensa/include/asm/qspinlock.h b/arch/xtensa/include/asm/qspinlock.h
+new file mode 100644
+--- /dev/null
++++ b/arch/xtensa/include/asm/qspinlock.h
+@@ -0,0 +1,25 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _XTENSA_QSPINLOCK_H
++#define _XTENSA_QSPINLOCK_H
++#ifdef CONFIG_XTENSA_SMP_ESP32
++#include <linux/atomic.h>
++#include <asm-generic/qspinlock_types.h>
++/* Queued locks modify byte/halfword aliases alongside 32-bit atomics.
++ * Use a full-word lock so software PSRAM atomics cannot overwrite an
++ * independently modified queue field. Keep the standard four-byte ABI.
++ */
++#define queued_spin_lock queued_spin_lock
++static __always_inline void queued_spin_lock(struct qspinlock *lock)
++{
++ while (atomic_cmpxchg_acquire(&lock->val, 0, _Q_LOCKED_VAL))
++  while (atomic_read(&lock->val))
++   cpu_relax();
++}
++#define queued_spin_unlock queued_spin_unlock
++static __always_inline void queued_spin_unlock(struct qspinlock *lock)
++{
++ atomic_set_release(&lock->val, 0);
++}
++#endif
++#include <asm-generic/qspinlock.h>
++#endif
+diff --git a/arch/xtensa/kernel/Makefile b/arch/xtensa/kernel/Makefile
+--- a/arch/xtensa/kernel/Makefile
++++ b/arch/xtensa/kernel/Makefile
+@@ -44,3 +44,5 @@
+ 
+ $(obj)/vmlinux.lds: $(src)/vmlinux.lds.S FORCE
+ 	$(call if_changed_dep,_cpp_lds_S)
++
++obj-$(CONFIG_XTENSA_SMP_ESP32) += esp32-atomic.o
+diff --git a/arch/xtensa/kernel/esp32-atomic.c b/arch/xtensa/kernel/esp32-atomic.c
+new file mode 100644
+--- /dev/null
++++ b/arch/xtensa/kernel/esp32-atomic.c
+@@ -0,0 +1,47 @@
++// SPDX-License-Identifier: GPL-2.0
++/* S32C1I cannot serialize external PSRAM accesses. Keep its sole guard in
++ * the data-bus alias of the firmware-reserved vector SRAM, and serialize
++ * software read/modify/write operations with local IRQs masked.
++ * Do not use Linux atomics/spinlocks here: they call this implementation.
++ */
++#include <linux/compiler.h>
++#include <asm/irqflags.h>
++#include <asm/esp32-atomic.h>
++
++static u32 esp32_atomic_guard __section(".esp32.atomic.lock") = 0;
++
++unsigned long notrace esp32_atomic_update(volatile void *ptr, unsigned long arg,
++ unsigned long compare, enum esp32_atomic_op op, unsigned int size)
++{
++ unsigned long flags;
++ u32 previous, desired, old, next;
++ flags = arch_local_irq_save();
++ do {
++  previous = 0;
++  desired = 1;
++  asm volatile("wsr %2, scompare1\n\ts32c1i %0, %1\n"
++   : "+a"(desired), "+m"(esp32_atomic_guard) : "a"(previous) : "memory");
++ } while (desired != 0);
++ asm volatile("memw" ::: "memory");
++ if (size == 1) old = *(volatile u8 *)ptr;
++ else if (size == 2) old = *(volatile u16 *)ptr;
++ else old = *(volatile u32 *)ptr;
++ next = old;
++ switch (op) {
++ case ESP32_ATOMIC_xchg: next = arg; break;
++ case ESP32_ATOMIC_cmpxchg: if (old == compare) next = arg; break;
++ case ESP32_ATOMIC_add: next = old + arg; break;
++ case ESP32_ATOMIC_sub: next = old - arg; break;
++ case ESP32_ATOMIC_and: next = old & arg; break;
++ case ESP32_ATOMIC_or: next = old | arg; break;
++ case ESP32_ATOMIC_xor: next = old ^ arg; break;
++ }
++ if (size == 1) *(volatile u8 *)ptr = next;
++ else if (size == 2) *(volatile u16 *)ptr = next;
++ else *(volatile u32 *)ptr = next;
++ asm volatile("memw" ::: "memory");
++ esp32_atomic_guard = 0;
++ asm volatile("memw" ::: "memory");
++ arch_local_irq_restore(flags);
++ return old;
++}
+diff --git a/arch/xtensa/kernel/vmlinux.lds.S b/arch/xtensa/kernel/vmlinux.lds.S
+--- a/arch/xtensa/kernel/vmlinux.lds.S
++++ b/arch/xtensa/kernel/vmlinux.lds.S
+@@ -386,6 +386,9 @@
+ 		   .DebugInterruptVector.text);
+     RELOCATE_ENTRY(_exception_text,
+ 		   .exception.text);
++#ifdef CONFIG_XTENSA_SMP_ESP32
++    RELOCATE_ENTRY(_esp32_atomic_guard, .esp32.atomic.lock);
++#endif
+ #ifdef CONFIG_XIP_KERNEL
+     RELOCATE_ENTRY(_xip_text, .xiptext);
+ #endif
+@@ -513,6 +516,19 @@
+ 		  LAST)
+ #undef LAST
+ #define LAST .xiptext
++#ifdef CONFIG_XTENSA_SMP_ESP32
++  /* TRM 4.3.2: SRAM1 instruction/data aliases differ by 0x6f0000.
++   * Use the last word of the firmware's 4-KiB vector reservation.
++   * It belongs to neither Linux PSRAM nor the independent GDMA SRAM window.
++   */
++  SECTION_VECTOR4 (_esp32_atomic_guard, .esp32.atomic.lock,
++                   (CONFIG_VECTORS_ADDR + 0xffc - 0x6f0000), LAST)
++  ASSERT(_exception_text_end <= CONFIG_VECTORS_ADDR + 0xffc,
++         "exception handlers overlap the internal atomic guard")
++  ASSERT(SIZEOF(.esp32.atomic.lock) == 4, "atomic guard must occupy one word")
++#undef LAST
++#define LAST .esp32.atomic.lock
++#endif
+ #endif
+   . = (LOADADDR(LAST) + SIZEOF(LAST) + 3) & ~ 3;
+ 

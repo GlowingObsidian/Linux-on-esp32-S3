@@ -1,0 +1,57 @@
+Subject: [PATCH] xtensa esp32s3 report the shared SoC caches from EXTMEM registers
+
+diff --git a/arch/xtensa/kernel/setup.c b/arch/xtensa/kernel/setup.c
+--- a/arch/xtensa/kernel/setup.c
++++ b/arch/xtensa/kernel/setup.c
+@@ -15,6 +15,7 @@
+  * Marc Gauthier<marc@tensilica.com> <marc@alumni.uwaterloo.ca>
+  */
+ 
++#include <linux/io.h>
+ #include <linux/errno.h>
+ #include <linux/init.h>
+ #include <linux/mm.h>
+@@ -660,6 +661,35 @@
+ 		     XCHAL_NUM_TIMERS,
+ 		     XCHAL_DEBUGLEVEL);
+ 
++	/* LX7 has no integrated cache. S3 places its shared cache controller
++	 * on the SoC data/instruction buses; keep the ISA constants unchanged.
++	 * Decode capacity and line size from the actual EXTMEM configuration.
++	 * Register fields follow IDF soc/esp32s3/register/soc/extmem_reg.h.
++	 */
++#if defined(CONFIG_XTENSA_SMP_ESP32) && defined(CONFIG_XTENSA_VARIANT_NAME)
++	if (!strcmp(CONFIG_XTENSA_VARIANT_NAME, "esp32s3")) {
++		u32 instruction = readl((void __iomem *)0x600c4060);
++		u32 data = readl((void __iomem *)0x600c4000);
++		u32 data_mode = (data >> 3) & 3;
++
++		seq_printf(f, "icache line size: %u\n"
++			      "icache ways\t: %u\n"
++			      "icache size\t: %u\n"
++			      "icache flags\t: shared %s\n"
++			      "dcache line size: %u\n"
++			      "dcache size\t: %u\n"
++			      "dcache flags\t: shared %s\n"
++			      "cache shared CPUs: 0,1\n",
++			      16u << ((instruction >> 3) & 1),
++			      4u << ((instruction >> 1) & 1),
++			      16384u << ((instruction >> 2) & 1),
++			      instruction & 1 ? "enabled" : "disabled",
++			      data_mode < 3 ? 16u << data_mode : 0,
++			      32768u << ((data >> 2) & 1),
++			      data & 1 ? "enabled" : "disabled");
++	} else
++#endif
++	{
+ 	/* Cache */
+ 	seq_printf(f,"icache line size: %d\n"
+ 		     "icache ways\t: %d\n"
+@@ -686,6 +716,7 @@
+ 		     XCHAL_DCACHE_LINESIZE,
+ 		     XCHAL_DCACHE_WAYS,
+ 		     XCHAL_DCACHE_SIZE);
++	}
+ 	seq_printf(f,
+ 		   "load/store exceptions\t: %d\n"
+ 		   "load/store clock count\t: %d\n",

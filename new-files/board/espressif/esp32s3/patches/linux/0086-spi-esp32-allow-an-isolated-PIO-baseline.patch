@@ -1,0 +1,33 @@
+From: Shreyan Dey <shreyan@example.com>
+Subject: [PATCH] spi: esp32: preserve legacy PIO without GDMA resources
+
+When DT omits GDMA resources, do not apply FIFO-transition resets introduced
+for the DMA backend. Report that the controller uses the isolated PIO path.
+
+--- a/drivers/spi/spi-esp32.c
++++ b/drivers/spi/spi-esp32.c
+@@ -504,8 +504,10 @@
+ 	struct reset_control *rst;
+ 	int ret;
+ 
+-	if (!platform_get_resource_byname(pdev, IORESOURCE_MEM, "gdma"))
++	if (!platform_get_resource_byname(pdev, IORESOURCE_MEM, "gdma")) {
++		dev_info(&pdev->dev, "PIO baseline: GDMA not initialized\n");
+ 		return 0;
++	}
+ 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	if (!res || res->start != 0x60024000)
+ 		return -EINVAL; /* This optional backend routes SPI2 only. */
+@@ -566,8 +568,10 @@
+ 		/* PIO and DMA have different FIFO completion policies. Explicitly
+ 		 * select CPU buffers and clear old FIFO state before loading W0.
+ 		 */
+-		esp32_spi_write(spi, SPI_DMA_CONF_REG, SPI_RX_AFIFO_RST | SPI_BUF_AFIFO_RST);
+-		esp32_spi_write(spi, SPI_DMA_CONF_REG, 0);
++		if (spi->gdma) {
++			esp32_spi_write(spi, SPI_DMA_CONF_REG, SPI_RX_AFIFO_RST | SPI_BUF_AFIFO_RST);
++			esp32_spi_write(spi, SPI_DMA_CONF_REG, 0);
++		}
+ 		ret = esp32_spi_prepare_transfer(spi, device, t, n_words);
+ 		if (ret)
+ 			return ret;

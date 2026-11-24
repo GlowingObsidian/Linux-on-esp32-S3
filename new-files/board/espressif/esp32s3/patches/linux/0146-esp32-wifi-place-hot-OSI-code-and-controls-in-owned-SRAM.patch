@@ -1,0 +1,354 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -482,6 +482,70 @@
+ struct osi_internal_header { size_t requested; size_t allocated; };
+ #define OSI_INTERNAL_HEADER_SIZE 32
+ 
++/* Control objects use the unused tail of the same owned IRAM resource,
++ * through its data-bus alias. Keep their pool separate from radio DMA buffers.
++ * IDF's FreeRTOS heap uses INTERNAL|8BIT for queues and synchronization objects.
++ */
++static struct gen_pool *osi_control_pool;
++
++static bool osi_is_control(const void *p)
++{
++	return p && osi_control_pool &&
++		gen_pool_has_addr(osi_control_pool, (unsigned long)p, 1);
++}
++
++static void *osi_control_zalloc(size_t size)
++{
++	struct osi_internal_header *h;
++	size_t total;
++	unsigned long addr;
++
++	/* Non-IRAM profiles retain the original allocator. IRAM probe must
++	 * establish the owned pool before any vendor task can start. */
++	if (!osi_control_pool)
++		return kzalloc(size, GFP_KERNEL);
++	if (check_add_overflow(size ? size : 1,
++			       (size_t)OSI_INTERNAL_HEADER_SIZE, &total))
++		return NULL;
++	addr = gen_pool_alloc(osi_control_pool, total);
++	if (!addr)
++		return NULL;
++	h = (void *)addr;
++	h->requested = size;
++	h->allocated = total;
++	memset((void *)(addr + OSI_INTERNAL_HEADER_SIZE), 0, size);
++	return (void *)(addr + OSI_INTERNAL_HEADER_SIZE);
++}
++
++static void *osi_control_calloc(size_t n, size_t size)
++{
++	size_t bytes;
++
++	if (check_mul_overflow(n, size, &bytes))
++		return NULL;
++	return osi_control_zalloc(bytes);
++}
++
++static void osi_control_free(void *p)
++{
++	struct osi_internal_header *h;
++
++	if (!p)
++		return;
++	if (!osi_is_control(p)) {
++		kfree(p);
++		return;
++	}
++	h = p - OSI_INTERNAL_HEADER_SIZE;
++	gen_pool_free(osi_control_pool, (unsigned long)h, h->allocated);
++}
++
++#ifdef CONFIG_ESP32_WIFI_IRAM
++#define WIFI_LINUX_IRAM __section(".iram1.wifi_linux")
++#else
++#define WIFI_LINUX_IRAM
++#endif
++
+ static bool osi_is_internal(const void *p)
+ {
+ 	return p && osi_internal_pool &&
+@@ -597,6 +661,10 @@
+ {
+ 	if (!p)
+ 		return;
++	if (osi_is_control(p)) {
++		osi_control_free(p);
++		return;
++	}
+ 	if (osi_is_internal(p)) {
+ 		osi_free_internal(p);
+ 		return;
+@@ -692,7 +760,7 @@
+ {
+ 	(void)kp;
+ 	return scnprintf(buffer, PAGE_SIZE,
+-		"sram_total=%zu sram_free=%zu tx_calls=%d tx_no_mem=%d tx_accepted=%d tx_failed=%d tx_done=%d tx_done_failed=%d tx_queue_full=%d tx_mode=static static_tx=%d cache_tx=%d cache_tx_enabled=%d iram_bytes=%u\n",
++		"sram_total=%zu sram_free=%zu tx_calls=%d tx_no_mem=%d tx_accepted=%d tx_failed=%d tx_done=%d tx_done_failed=%d tx_queue_full=%d tx_mode=static static_tx=%d cache_tx=%d cache_tx_enabled=%d iram_bytes=%u control_total=%zu control_free=%zu\n",
+ 		osi_internal_pool ? gen_pool_size(osi_internal_pool) : 0,
+ 		osi_internal_pool ? gen_pool_avail(osi_internal_pool) : 0,
+ 		atomic_read(&wifi_tx_calls), atomic_read(&wifi_tx_no_mem),
+@@ -701,7 +769,9 @@
+ 		atomic_read(&wifi_tx_queue_full),
+ 		config_get_wifi_static_tx_buffer_num(),
+ 		config_get_wifi_cache_tx_buffer_num(),
+-		config_is_cache_tx_buf_enabled(), READ_ONCE(wifi_iram_bytes));
++		config_is_cache_tx_buf_enabled(), READ_ONCE(wifi_iram_bytes),
++		osi_control_pool ? gen_pool_size(osi_control_pool) : 0,
++		osi_control_pool ? gen_pool_avail(osi_control_pool) : 0);
+ }
+ 
+ static const struct kernel_param_ops wifi_stats_ops = {
+@@ -967,7 +1037,7 @@
+ 
+ static void *osi_mutex_create(void)
+ {
+-	struct osi_mutex *m = kzalloc(sizeof(*m), GFP_KERNEL);
++	struct osi_mutex *m = osi_control_zalloc(sizeof(*m));
+ 
+ 	if (!m)
+ 		return NULL;
+@@ -1013,7 +1083,7 @@
+ 		       m, m->owner->comm, m->count);
+ 		return;
+ 	}
+-	kfree(m);
++	osi_control_free(m);
+ }
+ 
+ /* FreeRTOS's pdTRUE/pdFALSE, as in the semaphore block below: the     */
+@@ -1021,6 +1091,7 @@
+ /* locked and 0 means not. The macros are defined further down, in the */
+ /* semaphore section, and this block is above it, so the literals are  */
+ /* used here with the meaning spelled out.                             */
++WIFI_LINUX_IRAM
+ static int32_t osi_mutex_lock(void *mutex)
+ {
+ 	struct osi_mutex *m = mutex;
+@@ -1057,6 +1128,7 @@
+ 	return 1;			/* pdTRUE */
+ }
+ 
++WIFI_LINUX_IRAM
+ static int32_t osi_mutex_unlock(void *mutex)
+ {
+ 	struct osi_mutex *m = mutex;
+@@ -1144,7 +1216,7 @@
+ 
+ static void *osi_semphr_create(uint32_t max, uint32_t init)
+ {
+-	struct osi_sem *s = kzalloc(sizeof(*s), GFP_KERNEL);
++	struct osi_sem *s = osi_control_zalloc(sizeof(*s));
+ 
+ 	if (!s)
+ 		return NULL;
+@@ -1162,9 +1234,10 @@
+ 
+ static void osi_semphr_delete(void *semphr)
+ {
+-	kfree(semphr);
+-}
+-
++	osi_control_free(semphr);
++}
++
++WIFI_LINUX_IRAM
+ static int32_t osi_semphr_take(void *semphr, uint32_t ticks)
+ {
+ 	struct osi_sem *s = semphr;
+@@ -1282,6 +1355,7 @@
+ 								  : OSI_PD_TRUE;
+ }
+ 
++WIFI_LINUX_IRAM
+ static int32_t osi_semphr_give(void *semphr)
+ {
+ 	struct osi_sem *s = semphr;
+@@ -1399,12 +1473,12 @@
+ 
+ 	if (!queue_len || !item_size)
+ 		return NULL;
+-	q = kzalloc(sizeof(*q), GFP_KERNEL);
++	q = osi_control_zalloc(sizeof(*q));
+ 	if (!q)
+ 		return NULL;
+-	q->buf = kcalloc(queue_len, item_size, GFP_KERNEL);
++	q->buf = osi_control_calloc(queue_len, item_size);
+ 	if (!q->buf) {
+-		kfree(q);
++		osi_control_free(q);
+ 		return NULL;
+ 	}
+ 	q->item_size = item_size;
+@@ -1425,8 +1499,8 @@
+ 
+ 	if (!q)
+ 		return;
+-	kfree(q->buf);
+-	kfree(q);
++	osi_control_free(q->buf);
++	osi_control_free(q);
+ }
+ 
+ /* IDF wifi_static_queue_t ABI: libpp unwraps handle at offset zero.
+@@ -1443,12 +1517,12 @@
+ 
+ 	if (queue_len <= 0 || item_size <= 0)
+ 		return NULL;
+-	queue = kzalloc(sizeof(*queue), GFP_KERNEL);
++	queue = osi_control_zalloc(sizeof(*queue));
+ 	if (!queue)
+ 		return NULL;
+ 	queue->handle = osi_queue_create_common(queue_len, item_size);
+ 	if (!queue->handle) {
+-		kfree(queue);
++		osi_control_free(queue);
+ 		return NULL;
+ 	}
+ 	return queue;
+@@ -1461,9 +1535,10 @@
+ 	if (!queue)
+ 		return;
+ 	osi_queue_delete(queue->handle);
+-	kfree(queue);
+-}
+-
++	osi_control_free(queue);
++}
++
++WIFI_LINUX_IRAM
+ static int osi_queue_put(struct osi_queue *q, void *item, bool front)
+ {
+ 	unsigned long flags;
+@@ -1504,6 +1579,7 @@
+ /* has no signal path, so an ordinary signal must not turn a wait into  */
+ /* a failure. Only SIGKILL ends it early, and then the caller is dying  */
+ /* anyway. See the comment on osi_semphr_take.                          */
++WIFI_LINUX_IRAM
+ static int32_t osi_queue_send_wait(struct osi_queue *q, void *item,
+ 				   uint32_t ticks, bool front)
+ {
+@@ -1538,6 +1614,7 @@
+ 	}
+ }
+ 
++WIFI_LINUX_IRAM
+ static int32_t osi_queue_send(void *queue, void *item, uint32_t ticks)
+ {
+ 	if (!queue || osi_handle_bad(queue)) {
+@@ -1547,6 +1624,7 @@
+ 	return osi_queue_send_wait(queue, item, ticks, false);
+ }
+ 
++WIFI_LINUX_IRAM
+ static int32_t osi_queue_send_from_isr(void *queue, void *item, void *hptw)
+ {
+ 	/* *hptw is pxHigherPriorityTaskWoken and must be written, for the
+@@ -1578,6 +1656,7 @@
+ 	return osi_queue_send_wait(queue, item, ticks, true);
+ }
+ 
++WIFI_LINUX_IRAM
+ static int32_t osi_queue_recv(void *queue, void *item, uint32_t ticks)
+ {
+ 	struct osi_queue *q = queue;
+@@ -1645,6 +1724,7 @@
+ 	}
+ }
+ 
++WIFI_LINUX_IRAM
+ static uint32_t osi_queue_msg_waiting(void *queue)
+ {
+ 	struct osi_queue *q = queue;
+@@ -1674,7 +1754,7 @@
+ 
+ static void *osi_event_group_create(void)
+ {
+-	struct osi_evtgrp *g = kzalloc(sizeof(*g), GFP_KERNEL);
++	struct osi_evtgrp *g = osi_control_zalloc(sizeof(*g));
+ 
+ 	if (!g)
+ 		return NULL;
+@@ -1685,7 +1765,7 @@
+ 
+ static void osi_event_group_delete(void *event)
+ {
+-	kfree(event);
++	osi_control_free(event);
+ }
+ 
+ /* xEventGroupSetBits returns the value of the group AT THE TIME THE   */
+@@ -2143,6 +2223,7 @@
+  * takes mutexes on its timer path, that latency was never available to
+  * begin with -- the alternative was not "fast", it was "faults".
+  */
++WIFI_LINUX_IRAM
+ static irqreturn_t osi_isr_thunk(int irq, void *dev_id)
+ {
+ 	struct osi_isr_slot *s = dev_id;
+@@ -2415,7 +2496,7 @@
+  */
+ static void *osi_spin_lock_create(void)
+ {
+-	spinlock_t *l = kzalloc(sizeof(*l) ? sizeof(*l) : 1, GFP_KERNEL);
++	spinlock_t *l = osi_control_zalloc(sizeof(*l) ? sizeof(*l) : 1);
+ 
+ 	if (l)
+ 		spin_lock_init(l);
+@@ -2426,7 +2507,7 @@
+ 
+ static void osi_spin_lock_delete(void *lock)
+ {
+-	kfree(lock);
++	osi_control_free(lock);
+ }
+ 
+ /* IDF's pair is esp_coex_common_int_disable/restore_wrapper, which    */
+@@ -3510,6 +3591,7 @@
+  * where the interface type and number are stamped, and it is what makes
+  * get_priv_from_payload_header() find the station interface.
+  */
++WIFI_LINUX_IRAM
+ static int blob_queue_packet(struct esp_wifi_blob *hw, u8 type,
+ 			     const void *buf, u16 len)
+ {
+@@ -3539,6 +3621,7 @@
+  * frame we consume its eb exactly once and report successful ownership
+  * transfer; an allocation failure must not strand a hardware RX buffer.
+  */
++WIFI_LINUX_IRAM
+ static int blob_rx_cb(void *buf, u16 len, void *eb)
+ {
+ 	u64 started = wifi_time_start();
+@@ -4441,6 +4524,7 @@
+  * credit. Never retain/dereference the vendor's frame or length pointers.
+  * A short timed fallback covers the subsequent recycle and non-data frees.
+  */
++WIFI_LINUX_IRAM
+ static void blob_tx_done(u8 ifidx, u8 *data, u16 *len, bool success)
+ {
+ 	struct esp_wifi_blob *hw = READ_ONCE(g_blob);
+@@ -4838,6 +4922,20 @@
+ 			return -EIO;
+ 		}
+ 	}
++	/* Round beyond all verified code/literals; never allocate from them. */
++	i = ALIGN(size, 32);
++	if (i > resource_size(res) || resource_size(res) - i < 0x4000)
++		return -ENOSPC;
++	osi_control_pool = devm_gen_pool_create(&pdev->dev, 5, -1, "wifi-control");
++	if (IS_ERR(osi_control_pool)) {
++		int error = PTR_ERR(osi_control_pool);
++
++		osi_control_pool = NULL;
++		return error;
++	}
++	if (gen_pool_add_virt(osi_control_pool, res->start + i,
++			      res->start + i, resource_size(res) - i, -1))
++		return -ENOMEM;
+ 	WRITE_ONCE(wifi_iram_bytes, size);
+ 	dev_info(&pdev->dev, "verified %lu Wi-Fi hot-code bytes in internal IRAM\n", size);
+ 	return 0;

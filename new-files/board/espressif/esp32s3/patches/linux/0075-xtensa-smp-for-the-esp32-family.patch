@@ -1,0 +1,852 @@
+diff --git a/arch/xtensa/Kconfig b/arch/xtensa/Kconfig
+--- a/arch/xtensa/Kconfig
++++ b/arch/xtensa/Kconfig
+@@ -228,7 +228,16 @@
+ config HAVE_SMP
+ 	bool "System Supports SMP (MX)"
+ 	depends on XTENSA_VARIANT_CUSTOM
+-	select XTENSA_MX
++	# Not for the ESP32: its two cores have no MX interrupt distributor and
++	# no MX RunStall port. XCHAL_HAVE_MP_INTERRUPTS and
++	# XCHAL_HAVE_MP_RUNSTALL are both 0 in the esp32s3 core variant, so
++	# irq-xtensa-mx.c would write to registers that are not there, and
++	# arch/xtensa/kernel/smp.c would read a core count out of a SYSCFGID
++	# register that does not exist either. The ESP32 gets its SMP support
++	# from XTENSA_SMP_ESP32 below instead, which routes interrupts through
++	# the esp32 interrupt matrix and starts the second core through the RTC
++	# and SYSTEM_CORE_1_CONTROL registers.
++	select XTENSA_MX if !XTENSA_PLATFORM_ESP32
+ 	help
+ 	  This option is used to indicate that the system-on-a-chip (SOC)
+ 	  supports Multiprocessing. Multiprocessor support implemented above
+@@ -242,6 +251,22 @@
+ 	  like the open cores ethernet driver and the serial interface.
+ 
+ 	  You still have to select "Enable SMP" to enable SMP on this SOC.
++
++config XTENSA_SMP_ESP32
++	bool "ESP32 SMP (via the interrupt matrix, not MX)"
++	depends on XTENSA_PLATFORM_ESP32
++	select HAVE_SMP
++	help
++	  SMP on the ESP32 family: two Xtensa LX7 cores, no MX distributor.
++
++	  The second core is held stopped by the bootloader and by IDF's
++	  single-core startup path, and is released by writing the RTC stall
++	  registers and SYSTEM_CORE_1_CONTROL_0. Interrupts between the cores
++	  go through the ESP32 interrupt matrix's CPU_INTR_FROM_CPU_0 and _1
++	  rows rather than through MX MIPISET/MIPICAUSE.
++
++	  Selected by XTENSA_PLATFORM_ESP32 when SMP is wanted; it exists as
++	  its own symbol so that HAVE_SMP can be reached without XTENSA_MX.
+ 
+ config SMP
+ 	bool "Enable Symmetric multi-processing support"
+@@ -269,11 +294,16 @@
+ config SECONDARY_RESET_VECTOR
+ 	bool "Secondary cores use alternative reset vector"
+ 	default y
+-	depends on HAVE_SMP
++	depends on HAVE_SMP && !XTENSA_SMP_ESP32
+ 	help
+ 	  Secondary cores may be configured to use alternative reset vector,
+ 	  or all cores may use primary reset vector.
+ 	  Say Y here to supply handler for the alternative reset location.
++
++	  ESP32 cores start through mask ROM, which jumps to the entry address
++	  supplied by ets_set_appcpu_boot_addr(). Linux cannot install a reset
++	  handler in ROM. Placing a section there also moves the following
++	  exception handlers beyond the reach of the vectors in IRAM.
+ 
+ config FAST_SYSCALL_XTENSA
+ 	bool "Enable fast atomic syscalls"
+diff --git a/arch/xtensa/boot/dts/arduino-nano-esp32.dts b/arch/xtensa/boot/dts/arduino-nano-esp32.dts
+--- a/arch/xtensa/boot/dts/arduino-nano-esp32.dts
++++ b/arch/xtensa/boot/dts/arduino-nano-esp32.dts
+@@ -275,5 +275,6 @@
+  * cell of its interrupts property.
+  */
+ &intc {
+-	reg = <0x600c2000 0x800>;
+-};
++	reg = <0x600c2000 0x800>,	/* core 0's matrix */
++	      <0x600c2800 0x800>;	/* core 1's matrix */
++};
+diff --git a/arch/xtensa/boot/dts/esp32s3.dtsi b/arch/xtensa/boot/dts/esp32s3.dtsi
+--- a/arch/xtensa/boot/dts/esp32s3.dtsi
++++ b/arch/xtensa/boot/dts/esp32s3.dtsi
+@@ -23,6 +23,25 @@
+ 		cpu@0 {
+ 			compatible = "cdns,xtensa-cpu";
+ 			reg = <0>;
++			clocks = <&clk 1>;
++		};
++		/*
++		 * The second core, described so the device tree matches the
++		 * hardware rather than because the SMP code needs it: the
++		 * xtensa SMP path takes its core count from get_core_count()
++		 * in arch/xtensa/kernel/smp.c, not from this node, and
++		 * calibrate_ccount() takes the *first* cdns,xtensa-cpu node,
++		 * which is cpu@0 either way.
++		 *
++		 * It is here so that anything reading /cpus -- a person, a
++		 * script, cpu_dev_init -- sees two cores, and so that the
++		 * second core's existence is stated in the same place the
++		 * first one's is. The kernel releases it from
++		 * esp32_cpu_unstall().
++		 */
++		cpu@1 {
++			compatible = "cdns,xtensa-cpu";
++			reg = <1>;
+ 			clocks = <&clk 1>;
+ 		};
+ 	};
+diff --git a/arch/xtensa/include/asm/cacheflush.h b/arch/xtensa/include/asm/cacheflush.h
+--- a/arch/xtensa/include/asm/cacheflush.h
++++ b/arch/xtensa/include/asm/cacheflush.h
+@@ -91,9 +91,21 @@
+  * (see also Documentation/core-api/cachetlb.rst)
+  */
+ 
+-#if defined(CONFIG_MMU) && \
+-	((DCACHE_WAY_SIZE > PAGE_SIZE) || defined(CONFIG_SMP))
+-
++/*
++ * With SMP the four flush_* names are real functions, defined in
++ * arch/xtensa/kernel/smp.c, which run the local_ flush on every core. They
++ * are declared here and then #defined to themselves so that
++ * asm-generic/cacheflush.h -- included at the bottom of this file -- sees
++ * the names already defined and does not add its own empty static inlines.
++ *
++ * This block used to sit inside the CONFIG_MMU test below. That was wrong
++ * for the same reason the TLB stubs were: NOMMU is not a synonym for
++ * single-core. arch/xtensa/kernel/smp.c is built whenever CONFIG_SMP is on,
++ * whatever the MMU situation, and it DEFINES these four functions -- so
++ * under NOMMU+SMP the definitions collided with the generic inlines, and
++ * the `#define flush_icache_range local_flush_icache_range` in the NOMMU
++ * branch below turned the definition itself into a macro expansion.
++ */
+ #ifdef CONFIG_SMP
+ void flush_cache_all(void);
+ void flush_cache_range(struct vm_area_struct*, ulong, ulong);
+@@ -104,19 +116,34 @@
+ #define flush_cache_range flush_cache_range
+ #define flush_icache_range flush_icache_range
+ #define flush_cache_page flush_cache_page
+-#else
+-#define flush_cache_all local_flush_cache_all
+-#define flush_cache_range local_flush_cache_range
+-#define flush_icache_range local_flush_icache_range
+-#define flush_cache_page  local_flush_cache_page
+-#endif
+-
++#endif
++
++/*
++ * Flush the whole data cache and invalidate the whole instruction cache.
++ *
++ * Defined unconditionally: the __flush_invalidate_dcache_all() and
++ * __invalidate_icache_all() it calls exist for every configuration (see the
++ * top of this file), and on a part with no cache both are no-ops. It used to
++ * sit inside the CONFIG_MMU test below, which left it undefined for
++ * NOMMU -- and smp.c's flush_cache_all() calls it.
++ */
+ #define local_flush_cache_all()						\
+ 	do {								\
+ 		__flush_invalidate_dcache_all();			\
+ 		__invalidate_icache_all();				\
+ 	} while (0)
+ 
++#if defined(CONFIG_MMU) && \
++	((DCACHE_WAY_SIZE > PAGE_SIZE) || defined(CONFIG_SMP))
++
++#ifndef CONFIG_SMP
++#define flush_cache_all local_flush_cache_all
++#define flush_cache_range local_flush_cache_range
++#define flush_icache_range local_flush_icache_range
++#define flush_cache_page  local_flush_cache_page
++#endif
++
++
+ #define flush_cache_mm(mm)		flush_cache_all()
+ #define flush_cache_dup_mm(mm)		flush_cache_mm(mm)
+ 
+@@ -138,9 +165,37 @@
+ void local_flush_cache_page(struct vm_area_struct *vma,
+ 		unsigned long address, unsigned long pfn);
+ 
+-#else
+-
++#else /* !CONFIG_MMU */
++
++/*
++ * NOMMU: the two local_ flushes are empty.
++ *
++ * arch/xtensa/mm/cache.c does define real versions, but inside
++ * `#if (DCACHE_WAY_SIZE > PAGE_SIZE)`, and that file is itself in the
++ * MMU-only half of arch/xtensa/mm/Makefile. On the ESP32S3 the condition is
++ * false twice over -- XCHAL_DCACHE_SIZE is 0, so DCACHE_WAY_SIZE is 0 -- and
++ * the chip has no data cache for these to touch anyway. Declaring them as
++ * functions would leave smp.c's flush_cache_range() calling something that no
++ * object file defines.
++ *
++ * With SMP the cross-core flush_* wrappers in smp.c are the only callers, and
++ * they exist to keep other cores' caches coherent; there is nothing to keep
++ * coherent. This is the same shape as the TLB stubs above.
++ */
++static inline void local_flush_cache_range(struct vm_area_struct *vma,
++		unsigned long start, unsigned long end) { }
++static inline void local_flush_cache_page(struct vm_area_struct *vma,
++		unsigned long address, unsigned long pfn) { }
++
++/*
++ * NOMMU without SMP: there is no TLB and no cross-core flush, so the names
++ * alias the local ones directly. With SMP the block above has already
++ * declared and defined them as functions -- redefining here would turn
++ * smp.c's own definition of flush_icache_range into a macro expansion.
++ */
++#ifndef CONFIG_SMP
+ #define flush_icache_range local_flush_icache_range
++#endif
+ 
+ #endif
+ 
+diff --git a/arch/xtensa/include/asm/tlbflush.h b/arch/xtensa/include/asm/tlbflush.h
+--- a/arch/xtensa/include/asm/tlbflush.h
++++ b/arch/xtensa/include/asm/tlbflush.h
+@@ -29,6 +29,8 @@
+  *  - flush_tlb_page(vma, page) flushes a single page
+  *  - flush_tlb_range(vma, vmaddr, end) flushes a range of pages
+  */
++
++#ifdef CONFIG_MMU
+ 
+ void local_flush_tlb_all(void);
+ void local_flush_tlb_mm(struct mm_struct *mm);
+@@ -38,6 +40,28 @@
+ 		unsigned long start, unsigned long end);
+ void local_flush_tlb_kernel_range(unsigned long start, unsigned long end);
+ 
++#else /* !CONFIG_MMU */
++
++/*
++ * NOMMU has no TLB, so there is nothing to flush and nothing in
++ * arch/xtensa/mm/tlb.c -- that file is in the MMU-only half of the Makefile.
++ * The names still have to exist: with CONFIG_SMP, arch/xtensa/kernel/smp.c
++ * defines flush_tlb_all() and friends as on_each_cpu() wrappers around these
++ * local_ variants, and generic code calls flush_tlb_all() unconditionally.
++ * Empty inlines are what that costs -- the four other NOMMU architectures
++ * that also have SMP do the same thing.
++ */
++static inline void local_flush_tlb_all(void) { }
++static inline void local_flush_tlb_mm(struct mm_struct *mm) { }
++static inline void local_flush_tlb_page(struct vm_area_struct *vma,
++		unsigned long page) { }
++static inline void local_flush_tlb_range(struct vm_area_struct *vma,
++		unsigned long start, unsigned long end) { }
++static inline void local_flush_tlb_kernel_range(unsigned long start,
++		unsigned long end) { }
++
++#endif /* CONFIG_MMU */
++
+ #ifdef CONFIG_SMP
+ 
+ void flush_tlb_all(void);
+diff --git a/arch/xtensa/kernel/head.S b/arch/xtensa/kernel/head.S
+--- a/arch/xtensa/kernel/head.S
++++ b/arch/xtensa/kernel/head.S
+@@ -185,7 +185,15 @@
+ 
+ 	initialize_cacheattr
+ 
+-#ifdef CONFIG_HAVE_SMP
++#ifdef CONFIG_XTENSA_MX
++	/*
++	 * Turn on cache coherency through the MX distributor's CCON register.
++	 * This is MX hardware and only MX hardware: the ESP32 family has no
++	 * MX distributor, so XCHAL_HAVE_MP_INTERRUPTS is 0 there and a `wer`
++	 * to CCON would write a register that does not exist. Guarded on
++	 * XTENSA_MX rather than HAVE_SMP for that reason -- HAVE_SMP is true
++	 * on the ESP32 too, and this block is not.
++	 */
+ 	movi	a2, CCON	# MX External Register to Configure Cache
+ 	movi	a3, 1
+ 	wer	a3, a2
+@@ -208,6 +216,10 @@
+ 	 * supported by the cores.
+ 	 */
+ 	rsr	a2, prid
++#ifdef CONFIG_XTENSA_SMP_ESP32
++	/* PRID contains a core signature; only bit 13 is the S3 core number. */
++	extui	a2, a2, 13, 1
++#endif
+ 	bnez	a2, .Lboot_secondary
+ 
+ #endif  /* CONFIG_SMP */
+diff --git a/arch/xtensa/kernel/irq.c b/arch/xtensa/kernel/irq.c
+--- a/arch/xtensa/kernel/irq.c
++++ b/arch/xtensa/kernel/irq.c
+@@ -146,7 +146,7 @@
+ #ifdef CONFIG_USE_OF
+ 	irqchip_init();
+ #else
+-#ifdef CONFIG_HAVE_SMP
++#ifdef CONFIG_XTENSA_MX
+ 	xtensa_mx_init_legacy(NULL);
+ #else
+ 	xtensa_pic_init_legacy(NULL);
+diff --git a/arch/xtensa/kernel/smp.c b/arch/xtensa/kernel/smp.c
+--- a/arch/xtensa/kernel/smp.c
++++ b/arch/xtensa/kernel/smp.c
+@@ -29,12 +29,20 @@
+ #include <linux/seq_file.h>
+ #include <linux/smp.h>
+ #include <linux/thread_info.h>
++#ifdef CONFIG_XTENSA_SMP_ESP32
++#include <linux/io.h>
++#include <linux/of.h>
++#include <linux/of_irq.h>
++#include <linux/of_address.h>
++#endif
+ 
+ #include <asm/cacheflush.h>
+ #include <asm/coprocessor.h>
+ #include <asm/kdebug.h>
+ #include <asm/mmu_context.h>
++#ifndef CONFIG_XTENSA_SMP_ESP32
+ #include <asm/mxregs.h>
++#endif
+ #include <asm/platform.h>
+ #include <asm/tlbflush.h>
+ #include <asm/traps.h>
+@@ -52,9 +60,114 @@
+ 
+ /* IPI (Inter Process Interrupt) */
+ 
+-#define IPI_IRQ	0
++/* Input 1 belongs to UART0 in the board DT. Reserve level input 2 for IPIs. */
++#ifdef CONFIG_XTENSA_SMP_ESP32
++#define IPI_IRQ 2
++#else
++#define IPI_IRQ 1
++#endif
++
++#ifdef CONFIG_XTENSA_SMP_ESP32
++/*
++ * The ROM routine that sets the second core's boot address. It is at
++ * 0x40000720 in the ESP32-S3's mask ROM (IDF's esp32s3.rom.ld gives the same
++ * address). Calling it directly is what keeps the firmware out of this: the
++ * kernel needs no IDF, no FreeRTOS and no IPC to start its own second core.
++ */
++/*
++ * Register definitions. The kernel has no ESP32 system header -- the SoC's
++ * registers are reached through the esp32-regs driver (drivers/misc) or
++ * through device tree nodes, neither of which suits code this early. These
++ * are the same addresses IDF's soc/system_reg.h and soc/rtc_cntl_reg.h give,
++ * and the same ones NuttX's hardware/esp32s3_system.h gives.
++ *
++ * DR_REG_SYSTEM_BASE is 0x600c0000, so SYSTEM_CORE_1_CONTROL_0_REG is at
++ * offset 0 and the two inter-processor interrupt registers are at 0x30 and
++ * 0x34 -- which is what the boot log's "esp32-regs: window
++ * 0x600c0000-0x600c5000" covers.
++ */
++#define DR_REG_SYSTEM_BASE		0x600c0000
++#define SYSTEM_CORE_1_CONTROL_0_REG	(DR_REG_SYSTEM_BASE + 0x000)
++#define SYSTEM_CPU_INTR_FROM_CPU_0_REG	(DR_REG_SYSTEM_BASE + 0x030)
++#define SYSTEM_CPU_INTR_FROM_CPU_1_REG	(DR_REG_SYSTEM_BASE + 0x034)
++
++/* SYSTEM_CORE_1_CONTROL_0_REG bits, from IDF's soc/system_reg.h. */
++#define SYSTEM_CONTROL_CORE_1_RUNSTALL	BIT(0)
++#define SYSTEM_CONTROL_CORE_1_CLKGATE_EN	BIT(1)
++#define SYSTEM_CONTROL_CORE_1_RESETING	BIT(2)
++
++/*
++ * The RTC registers. These live at 0x3f408000 for the ESP32 and 0x60008000
++ * for the S3, and the two parts differ in which stall bits they use. Both
++ * are written here because the symbol is guarded by
++ * CONFIG_XTENSA_SMP_ESP32, which the ESP32 and ESP32-S3 platforms both
++ * select; the offsets below are the S3's, and the ESP32's are listed beside
++ * them so the difference is visible rather than assumed.
++ */
++#define ESP32_RTC_OPTIONS0		0x60008000	/* S3 */
++#define ESP32_RTC_SW_CPU_STALL		0x600080bc
++
++/*
++ * RTC_CNTL_SW_CPU_STALL_REG, RTC_CNTL_SW_STALL_APPCPU_C1: bitpos [25:20],
++ * so it is a 6-bit field at bit 20 and clearing bit 20 alone leaves the top
++ * five bits set. IDF's mask is 0x3f << 20.
++ */
++#define ESP32_RTC_SW_STALL_APPCPU_C1	(0x3f << 20)
++/* RTC_CNTL_OPTIONS0_REG, RTC_CNTL_SW_STALL_APPCPU_C0: bitpos [1:0]. */
++#define ESP32_RTC_SW_STALL_APPCPU_C0	(0x3 << 0)
++
++extern void ets_set_appcpu_boot_addr(uint32_t start);
++extern char _startup[];
++#endif
+ 
+ static irqreturn_t ipi_interrupt(int irq, void *dev_id);
++
++#ifdef CONFIG_XTENSA_SMP_ESP32
++
++/* Atomic payload words accompany the two hardware doorbells. */
++static DEFINE_PER_CPU(unsigned long, esp32_ipi_pending);
++
++/*
++ * init_IRQ runs before the esp32-intc platform driver is registered. Use the
++ * already available root PIC domain and route its reserved input directly.
++ * Both cores use the same Linux IRQ: their INTENABLE registers are local,
++ * so the flow handler must not mask an interrupt on behalf of the other CPU.
++ * The matrix driver preserves these routes when it initializes later.
++ */
++void __init ipi_init(void)
++{
++	struct device_node *intc_np;
++	unsigned int irq;
++	int cpu;
++
++	intc_np = of_find_compatible_node(NULL, NULL, "esp,esp32-intc");
++	if (!intc_np)
++		panic("ipi: no esp,esp32-intc node");
++
++	for_each_possible_cpu(cpu) {
++		void __iomem *matrix = of_iomap(intc_np, cpu);
++		unsigned int row = cpu ? 79 : 80;
++
++		if (!matrix)
++			panic("ipi: no interrupt matrix for CPU%d", cpu);
++		writel(IPI_IRQ, matrix + row * sizeof(u32));
++		iounmap(matrix);
++	}
++	of_node_put(intc_np);
++	writel(0, (void __iomem *)SYSTEM_CPU_INTR_FROM_CPU_0_REG);
++	writel(0, (void __iomem *)SYSTEM_CPU_INTR_FROM_CPU_1_REG);
++
++	irq = irq_create_mapping(NULL, IPI_IRQ);
++	if (!irq)
++		panic("ipi: cannot map root PIC input %u", IPI_IRQ);
++	irq_set_handler(irq, handle_percpu_irq);
++	irq_set_status_flags(irq, IRQ_PER_CPU);
++	if (request_irq(irq, ipi_interrupt, IRQF_PERCPU | IRQF_NOBALANCING,
++			"ipi", NULL))
++		panic("ipi: cannot request irq %u", irq);
++}
++
++#else /* !CONFIG_XTENSA_SMP_ESP32 */
+ 
+ void ipi_init(void)
+ {
+@@ -63,6 +176,41 @@
+ 		pr_err("Failed to request irq %u (ipi)\n", irq);
+ }
+ 
++#endif /* CONFIG_XTENSA_SMP_ESP32 */
++
++
++#ifdef CONFIG_XTENSA_SMP_ESP32
++
++/*
++ * The ESP32 family has no MX distributor, so there is no SYSCFGID to read a
++ * core count or a core id out of. Both come from somewhere else.
++ *
++ * The count is fixed: the ESP32, ESP32-S2 and ESP32-S3 have at most two
++ * Xtensa cores and the device tree is what says which are usable, so the
++ * number is taken from the DT's /cpus node by the generic code rather than
++ * asked of the hardware.
++ *
++ * The id comes from the PRID special register, which the esp32s3 core
++ * variant sets XCHAL_HAVE_PRID for. It is the same register head.S branches
++ * on to decide whether a core is the boot core or a secondary, so the two
++ * agree by construction.
++ */
++static inline unsigned int get_core_count(void)
++{
++	return 2;
++}
++
++static inline int get_core_id(void)
++{
++	unsigned int prid;
++
++	__asm__ __volatile__("rsr %0, prid" : "=a"(prid));
++	/* Match IDF xt_utils_get_core_id(): the CPU number is PRID bit 13. */
++	return (prid >> 13) & 1;
++}
++
++#else /* !CONFIG_XTENSA_SMP_ESP32 */
++
+ static inline unsigned int get_core_count(void)
+ {
+ 	/* Bits 18..21 of SYSCFGID contain the core count minus 1. */
+@@ -76,6 +224,8 @@
+ 	unsigned int core_id = get_er(SYSCFGID);
+ 	return core_id & 0x3fff;
+ }
++
++#endif /* CONFIG_XTENSA_SMP_ESP32 */
+ 
+ void __init smp_prepare_cpus(unsigned int max_cpus)
+ {
+@@ -107,7 +257,9 @@
+ {
+ 	unsigned int cpu = smp_processor_id();
+ 	BUG_ON(cpu != 0);
++#ifdef CONFIG_MMU
+ 	cpu_asid_cache(cpu) = ASID_USER_FIRST;
++#endif
+ }
+ 
+ void __init smp_cpus_done(unsigned int max_cpus)
+@@ -165,6 +317,120 @@
+ 	cpu_startup_entry(CPUHP_AP_ONLINE_IDLE);
+ }
+ 
++#ifdef CONFIG_XTENSA_SMP_ESP32
++
++/*
++ * Called on the second core, early in secondary_start_kernel.
++ *
++ * The xtensa pic is per-core: each core has its own INTENABLE special
++ * register, and a core that has just been released has whatever the
++ * bootloader left in it. Upstream defines this in irq-xtensa-mx.c, which
++ * this platform does not build -- it is the MX driver's job there because
++ * the MX distributor owns the external interrupt mask. Here the mask is the
++ * core's own, so the core sets it itself.
++ *
++ * Enable only the reserved IPI input here. local_timer_setup() enables this
++ * CPU's timer separately; peripheral drivers own their remaining inputs.
++ */
++void secondary_init_irq(void)
++{
++	xtensa_set_sr(BIT(IPI_IRQ), intenable);
++}
++
++/*
++ * The ESP32 family starts its second core through registers rather than
++ * through an MX RunStall port. This is the same sequence NuttX uses in
++ * up_cpu_start() and IDF uses in esp_cpu_unstall(): the core is held by two
++ * RTC stall bits and by RUNSTALL in SYSTEM_CORE_1_CONTROL_0, and it is
++ * released by clearing all three and pulsing the reset.
++ *
++ * Order matters. The RTC stall bits are cleared first so the core is not
++ * held by two mechanisms at once, then the clock gate is opened, then
++ * RUNSTALL is released, and only then is the reset pulsed -- a reset while
++ * RUNSTALL is still set leaves the core stalled at its reset vector.
++ *
++ * The two RTC stall fields are cleared without changing watchdog protection.
++ */
++
++static void esp32_cpu_unstall(void *p)
++{
++	unsigned cpu = (unsigned)p;
++	u32 v;
++
++	/*
++	 * The RTC stall bits come first, and they are written without
++	 * touching RTC_CNTL_WDTWPROTECT: that register guards the watchdog
++	 * block only, and the stall fields live in OPTIONS0 and SW_CPU_STALL,
++	 * outside it. NuttX does not unlock it here either. (The boot log
++	 * shows both fields already clear on this board, so these two writes
++	 * change nothing today -- they are here because NuttX has them and
++	 * because a board held by those bits instead of by RUNSTALL would
++	 * need them. Measured: RTC_CNTL_OPTIONS0_REG reads 0x1c008000, bits
++	 * 1:0 clear, and RTC_CNTL_SW_CPU_STALL_REG reads 0.)
++	 */
++	v = readl((void __iomem *)ESP32_RTC_SW_CPU_STALL);
++	v &= ~ESP32_RTC_SW_STALL_APPCPU_C1;
++	writel(v, (void __iomem *)ESP32_RTC_SW_CPU_STALL);
++
++	v = readl((void __iomem *)ESP32_RTC_OPTIONS0);
++	v &= ~ESP32_RTC_SW_STALL_APPCPU_C0;
++	writel(v, (void __iomem *)ESP32_RTC_OPTIONS0);
++
++	if (cpu != 1)
++		return;
++
++	/*
++	 * Only touch the clock gate and the reset when the gate is closed.
++	 *
++	 * This is NuttX's guard, and its reason is OpenOCD: a debugger can
++	 * have opened the gate and taken the core out of reset already, and
++	 * pulsing RESETING then would clear breakpoints the debugger had set.
++	 * On a cold boot the gate is closed -- measured on this board,
++	 * SYSTEM_CORE_1_CONTROL_0_REG reads 0x1 -- so the sequence runs.
++	 */
++	v = readl((void __iomem *)SYSTEM_CORE_1_CONTROL_0_REG);
++	if (v & SYSTEM_CONTROL_CORE_1_CLKGATE_EN)
++		return;
++
++	/* Open the clock gate, release RUNSTALL, then pulse the reset. */
++	v = readl((void __iomem *)SYSTEM_CORE_1_CONTROL_0_REG);
++	v |= SYSTEM_CONTROL_CORE_1_CLKGATE_EN;
++	writel(v, (void __iomem *)SYSTEM_CORE_1_CONTROL_0_REG);
++
++	v = readl((void __iomem *)SYSTEM_CORE_1_CONTROL_0_REG);
++	v &= ~SYSTEM_CONTROL_CORE_1_RUNSTALL;
++	writel(v, (void __iomem *)SYSTEM_CORE_1_CONTROL_0_REG);
++
++	/*
++	 * Pulse RESETING. NuttX uses two separate read-modify-writes here --
++	 * set, then clear -- and that is what makes it a pulse rather than a
++	 * level. Do not collapse them.
++	 */
++	v = readl((void __iomem *)SYSTEM_CORE_1_CONTROL_0_REG);
++	v |= SYSTEM_CONTROL_CORE_1_RESETING;
++	writel(v, (void __iomem *)SYSTEM_CORE_1_CONTROL_0_REG);
++
++	v = readl((void __iomem *)SYSTEM_CORE_1_CONTROL_0_REG);
++	v &= ~SYSTEM_CONTROL_CORE_1_RESETING;
++	writel(v, (void __iomem *)SYSTEM_CORE_1_CONTROL_0_REG);
++}
++
++static void esp32_cpu_stall(void *p)
++{
++	unsigned cpu = (unsigned)p;
++	u32 v;
++
++	if (cpu == 1) {
++		v = readl((void __iomem *)SYSTEM_CORE_1_CONTROL_0_REG);
++		v |= SYSTEM_CONTROL_CORE_1_RUNSTALL;
++		writel(v, (void __iomem *)SYSTEM_CORE_1_CONTROL_0_REG);
++	}
++}
++
++#endif /* CONFIG_XTENSA_SMP_ESP32 */
++
++#ifndef CONFIG_XTENSA_SMP_ESP32
++
+ static void mx_cpu_start(void *p)
+ {
+ 	unsigned cpu = (unsigned)p;
+@@ -185,6 +451,8 @@
+ 			__func__, cpu, run_stall_mask, get_er(MPSCORE));
+ }
+ 
++
++#endif /* !CONFIG_XTENSA_SMP_ESP32 */
+ #ifdef CONFIG_HOTPLUG_CPU
+ unsigned long cpu_start_id __cacheline_aligned;
+ #endif
+@@ -203,7 +471,27 @@
+ 	system_flush_invalidate_dcache_range((unsigned long)&cpu_start_id,
+ 					     sizeof(cpu_start_id));
+ #endif
++#ifdef CONFIG_XTENSA_SMP_ESP32
++	/*
++	 * The second core is released directly, not asked of core 0. There is
++	 * no MX RunStall port and no second core running anything that could
++	 * service a call -- core 1 is stalled at its reset vector with its
++	 * clock gated, which is the state this undoes.
++	 *
++	 * The boot address is set before the release, and it is the kernel's
++	 * own _startup. That is the whole trick: _startup's prologue sets the
++	 * stack from start_info and the PS, and then branches on PRID -- so a
++	 * core that is not core 0 falls through to .Lboot_secondary, which is
++	 * the handshake this function is about to wait on. Nothing new has to
++	 * be written in assembly for the ESP32; head.S already had the path.
++	 */
++	/* Let ROM wait for a fresh entry address while the core leaves reset. */
++	ets_set_appcpu_boot_addr(0);
++	esp32_cpu_unstall((void *)cpu);
++	ets_set_appcpu_boot_addr((uint32_t)_startup);
++#else
+ 	smp_call_function_single(0, mx_cpu_start, (void *)cpu, 1);
++#endif
+ 
+ 	for (i = 0; i < 2; ++i) {
+ 		do
+@@ -222,8 +510,12 @@
+ 		} while (ccount && time_before(jiffies, timeout));
+ 
+ 		if (ccount) {
++#ifdef CONFIG_XTENSA_SMP_ESP32
++			esp32_cpu_stall((void *)cpu);
++#else
+ 			smp_call_function_single(0, mx_cpu_stop,
+ 						 (void *)cpu, 1);
++#endif
+ 			WRITE_ONCE(cpu_start_ccount, 0);
+ 			return -EIO;
+ 		}
+@@ -235,8 +527,15 @@
+ {
+ 	int ret = 0;
+ 
++#ifdef CONFIG_MMU
++	/*
++	 * Each core has its own ASID cache, and a core that has never run a
++	 * user task has it at zero. NOMMU has neither ASIDs nor
++	 * cpu_asid_cache(), so there is nothing to seed.
++	 */
+ 	if (cpu_asid_cache(cpu) == 0)
+ 		cpu_asid_cache(cpu) = ASID_USER_FIRST;
++#endif
+ 
+ 	start_info.stack = (unsigned long)task_pt_regs(idle);
+ 	wmb();
+@@ -291,7 +590,9 @@
+ 	 */
+ 	local_flush_cache_all();
+ 	local_flush_tlb_all();
++#ifdef CONFIG_MMU
+ 	invalidate_page_directory();
++#endif
+ 
+ 	clear_tasks_mm_cpumask(cpu);
+ 
+@@ -300,7 +601,11 @@
+ 
+ static void platform_cpu_kill(unsigned int cpu)
+ {
++#ifdef CONFIG_XTENSA_SMP_ESP32
++	esp32_cpu_stall((void *)cpu);
++#else
+ 	smp_call_function_single(0, mx_cpu_stop, (void *)cpu, true);
++#endif
+ }
+ 
+ /*
+@@ -370,10 +675,52 @@
+ 
+ static DEFINE_PER_CPU(struct ipi_data, ipi_data);
+ 
++#ifdef CONFIG_XTENSA_SMP_ESP32
++
++/*
++ * The ESP32 has two inter-processor interrupt registers, one per direction,
++ * and neither carries a payload: writing any non-zero value to
++ * SYSTEM_CPU_INTR_FROM_CPU_0_REG raises CPU_INTR_FROM_CPU_0 on the other
++ * core, and _1_REG does the same the other way. There is no equivalent of
++ * MX's MIPISET, which takes a core mask and an interrupt cause in one write.
++ *
++ * That is not a limitation here. The MX version packs a mask and a message
++ * id into one register because it can target either core from either core;
++ * with two cores and one register per direction, the direction is the
++ * register and the message has to travel some other way. Linux already has
++ * a place for it: the per-CPU ipi_data, written by the sender before the
++ * interrupt and read by the handler. So the register is a doorbell and the
++ * payload is in memory, which is what NuttX does too -- its
++ * xtensa_intercpu_interrupt() writes the register and nothing else.
++ *
++ * The message id is still needed, so it goes in a per-CPU variable that the
++ * sender sets and the receiver reads and clears.
++ */
+ static void send_ipi_message(const struct cpumask *callmask,
+ 		enum ipi_msg_type msg_id)
+ {
+ 	int index;
++
++	for_each_cpu(index, callmask) {
++		unsigned long *pending = &per_cpu(esp32_ipi_pending, index);
++
++		/* Accumulate: two senders must not lose one another's bit. */
++		set_bit(msg_id, pending);
++		wmb();
++
++		if (index == 1)
++			writel(1, (void __iomem *)SYSTEM_CPU_INTR_FROM_CPU_0_REG);
++		else
++			writel(1, (void __iomem *)SYSTEM_CPU_INTR_FROM_CPU_1_REG);
++	}
++}
++
++#else /* !CONFIG_XTENSA_SMP_ESP32 */
++
++static void send_ipi_message(const struct cpumask *callmask,
++		enum ipi_msg_type msg_id)
++{
++	int index;
+ 	unsigned long mask = 0;
+ 
+ 	for_each_cpu(index, callmask)
+@@ -381,6 +728,9 @@
+ 
+ 	set_er(mask, MIPISET(msg_id));
+ }
++
++#endif /* CONFIG_XTENSA_SMP_ESP32 */
++
+ 
+ void arch_send_call_function_ipi_mask(const struct cpumask *mask)
+ {
+@@ -420,8 +770,23 @@
+ 	for (;;) {
+ 		unsigned int msg;
+ 
++#ifdef CONFIG_XTENSA_SMP_ESP32
++		/*
++		 * Ack the doorbell first, then take the payload. The register
++		 * is edge-triggered from the sender's side: leaving it set
++		 * would make the next write indistinguishable from this one.
++		 */
++		if (cpu == 0)
++			writel(0, (void __iomem *)SYSTEM_CPU_INTR_FROM_CPU_1_REG);
++		else
++			writel(0, (void __iomem *)SYSTEM_CPU_INTR_FROM_CPU_0_REG);
++
++		msg = xchg(&per_cpu(esp32_ipi_pending, cpu), 0);
++		mb();
++#else
+ 		msg = get_er(MIPICAUSE(cpu));
+ 		set_er(msg, MIPICAUSE(cpu));
++#endif
+ 
+ 		if (!msg)
+ 			break;
+diff --git a/arch/xtensa/kernel/vmlinux.lds.S b/arch/xtensa/kernel/vmlinux.lds.S
+--- a/arch/xtensa/kernel/vmlinux.lds.S
++++ b/arch/xtensa/kernel/vmlinux.lds.S
+@@ -131,6 +131,14 @@
+  * export. arch/xtensa does not link esp32s3.rom.ld, so without these
+  * the final link has no address to resolve them against.
+  */
++	/*
++	 * The ESP32-S3's ROM routine that sets the second core's boot
++	 * address. Same table as the rest of these: the address is from
++	 * IDF's esp32s3.rom.ld. It is used by arch/xtensa/kernel/smp.c to
++	 * point core 1 at _startup before releasing it.
++	 */
++	ets_set_appcpu_boot_addr = 0x40000720;
++
+ 	__divdf3 = 0x40002250;
+ 	__divdi3 = 0x4000225c;
+ 	__divsf3 = 0x40002274;
+@@ -283,8 +291,17 @@
+     SECTION_VECTOR2 (.KernelExceptionVector.text, KERNEL_VECTOR_VADDR)
+     SECTION_VECTOR2 (.UserExceptionVector.text, USER_VECTOR_VADDR)
+     SECTION_VECTOR2 (.DoubleExceptionVector.text, DOUBLEEXC_VECTOR_VADDR)
+-
+     *(.exception.text)
++#endif
++
++#if !MERGED_VECTORS
++    /*
++     * With the vectors placed separately at CONFIG_VECTORS_ADDR, .exception.text
++     * is copied to its IRAM address at boot from the table in .init.rodata, and
++     * is placed there by its own SECTION_VECTOR4 below. Catching it in .text
++     * here instead leaves it in flash, megabytes from the vectors that jump
++     * into it with the short 'j' instruction (range 128 KiB).
++     */
+     *(.xiptext)
+ #endif
+ 
+diff --git a/drivers/irqchip/irq-esp32-intc.c b/drivers/irqchip/irq-esp32-intc.c
+--- a/drivers/irqchip/irq-esp32-intc.c
++++ b/drivers/irqchip/irq-esp32-intc.c
+@@ -32,8 +32,16 @@
+ 	int cpu, irq;
+ 
+ 	for (cpu = 0; cpu < priv->n_cpus; ++cpu)
+-		for (irq = 0; irq < priv->n_irq; ++irq)
++		for (irq = 0; irq < priv->n_irq; ++irq) {
++#ifdef CONFIG_XTENSA_SMP_ESP32
++			/* Input 2 is the per-CPU IPI, installed before this driver. */
++			if (irq == (cpu ? 79 : 80)) {
++				esp32_intc_write(priv, cpu, irq, 2);
++				continue;
++			}
++#endif
+ 			esp32_intc_write(priv, cpu, irq, ESP32_INTC_DISCONNECTED);
++		}
+ }
+ 
+ static struct irq_chip esp32_intc_chip = {

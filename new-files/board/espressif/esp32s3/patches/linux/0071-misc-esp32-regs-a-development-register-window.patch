@@ -1,0 +1,594 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shreyan Dey <shreyandey@users.noreply.github.com>
+Date: Sat, 1 Nov 2026 02:00:00 +0530
+Subject: [PATCH 71/71] misc: esp32-regs, a development window onto the S3's
+ peripheral registers
+
+Bringing up a peripheral that has no driver yet means writing a handful of
+registers and reading back what happened. This kernel has no /dev/mem, and
+the reason is written down in the board config: on NOMMU there is no
+STRICT_DEVMEM to bound it, so an unrestricted physical window would also
+reach core 0's PSRAM. That is the right call for a shipped image and this
+patch does not revisit it.
+
+It does leave a gap, and the gap is expensive here. The alternative to a
+register window is a kernel patch per guess, and each one costs a full
+kernel rebuild plus a hand-entered download mode.
+
+So this is the narrow version of /dev/mem: one device, three windows.
+0x60000000-0x6009FFFF is where the S3 puts every peripheral (DR_REG_*_BASE
+in the SoC's own reg_base.h), 0x600C0000-0x600C0FFF is the system block
+that gates their clocks and holds their resets, and 0x3FC88000-0x3FCFFFFF
+is the internal SRAM window, which is handed out as an mmap rather than as
+register accesses. None can reach PSRAM. The bounds checks run before
+anything is mapped, so a bad address is refused rather than mapped.
+
+The interface is deliberately small:
+
+    read  <addr> [count]   read count 32-bit words (default 1), print hex
+    write <addr> <value>   write one 32-bit word
+
+Addresses may be written as 0x6003f000 or as 0x6003f000+0x40c. The offset
+form is there because the TRM is written in base+offset and translating by
+hand is where mistakes come from. Byte and halfword access are not
+supported: every register this is for is 32-bit, and a width parameter
+would be one more thing to get wrong.
+
+The mmap window exists for one reason: GDMA requires its descriptor list to
+live in internal RAM (TRM 3.4.1), and a descriptor list is memory a program
+has to write into, not something it can send through a register. This
+kernel is NOMMU, which changes what mmap means -- there is no page table to
+install a translation into, so the address a program gets IS the physical
+address. mm/nommu.c asks the driver where to site the mapping through
+get_unmapped_area(), takes the answer and makes it vma->vm_start
+(mm/nommu.c:1148); the driver's mmap hook is then only a check, because on
+NOMMU remap_pfn_range() verifies addr == pfn << PAGE_SHIFT and sets
+VM_IO|VM_PFNMAP without touching hardware (mm/nommu.c:1594).
+
+All three hooks are required and each fails differently if missing.
+mmap_capabilities is how the window is declared writable. Without
+get_unmapped_area, mm/nommu.c:755 clears NOMMU_MAP_DIRECT and a MAP_SHARED
+request fails with -ENODEV. Without mmap, vfs_mmap() dereferences NULL
+(include/linux/fs.h:2061). Userspace must pass MAP_SHARED: MAP_PRIVATE
+takes the copy path and would hand back a copy of the window rather than
+the window.
+
+This is a development tool. It is off by default, it is not built into the
+shipped image, and it hands userspace the ability to hang the board with
+one wrong write or one wrong store into the mmap window. That is the trade
+it makes, and it is stated in the Kconfig help, in the driver's own header
+and in the boot message.
+
+Signed-off-by: Shreyan Dey <shreyandey@users.noreply.github.com>
+---
+ drivers/misc/Kconfig      | 18 ++++++++++++++++++
+ drivers/misc/Makefile     |  1 +
+ drivers/misc/esp32-regs.c | 471 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 490 insertions(+)
+ create mode 100644 drivers/misc/esp32-regs.c
+
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -634,6 +634,24 @@
+ 	    - lan966x-miim (MDIO_MSCC_MIIM)
+ 	    - lan966x-switch (LAN966X_SWITCH)
+ 
++config ESP32_REGS
++	tristate "ESP32-S3 peripheral register window (development)"
++	depends on OF && HAS_IOMEM
++	help
++	  A character device that lets userspace read and write the ESP32-S3
++	  peripheral register block (0x60000000-0x6009FFFF) and the system
++	  clock/reset block (0x600C0000-0x600C0FFF), and mmap the internal
++	  SRAM window (0x3FC88000-0x3FCFFFFF).
++
++	  This exists because the kernel has no /dev/mem -- on NOMMU there is
++	  no STRICT_DEVMEM to bound it and it would reach core 0's PSRAM -- so
++	  there is otherwise no way to bring up a peripheral that has no
++	  driver yet. It is scoped to those three windows and cannot reach
++	  PSRAM.
++
++	  It is a development tool. A wrong write can hang the board. Say N
++	  unless you are bringing up a peripheral.
++
+ config ESP32_IPC
+ 	tristate "Espressif ESP32 firmware IPC support"
+ 	depends on OF && HAS_IOMEM
+
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -75,3 +75,4 @@
+ obj-y				+= amd-sbi/
+ obj-$(CONFIG_MISC_RP1)		+= rp1/
+ obj-$(CONFIG_ESP32_IPC)		+= esp32-ipc.o
++obj-$(CONFIG_ESP32_REGS)		+= esp32-regs.o
+
+--- /dev/null
++++ b/drivers/misc/esp32-regs.c
+@@ -0,0 +1,486 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * esp32-regs -- a development window onto the ESP32-S3's peripheral registers.
++ *
++ * Why this exists
++ * ---------------
++ * This kernel has no /dev/mem, and the reason is written down in the board
++ * config: on NOMMU there is no STRICT_DEVMEM to bound it, so an unrestricted
++ * physical window would also reach core 0's PSRAM. That is the right call for
++ * a shipped image and it is not being revisited here.
++ *
++ * It does leave a gap. Bringing up a peripheral that has no driver yet --
++ * GDMA, in this case -- means writing a handful of registers and reading back
++ * what happened, and without a driver there is no way to do that from
++ * userspace. The alternative is a kernel patch per guess, and each one costs a
++ * full rebuild plus a hand-entered download mode.
++ *
++ * So this is the narrow version of /dev/mem: one device, two windows, and
++ * both windows are register space only. 0x60000000-0x6009FFFF is where the
++ * S3 puts every peripheral (DR_REG_*_BASE in the SoC's own reg_base.h) and
++ * 0x600C0000-0x600C0FFF is the system block that gates their clocks and
++ * holds their resets. Neither can reach PSRAM, and neither can reach core
++ * 0's internal SRAM. The bounds check runs before ioremap, so a bad address
++ * is refused rather than mapped.
++ *
++ * This is a development tool. It is off by default (CONFIG_ESP32_REGS), it is
++ * not built into the shipped image, and it hands userspace the ability to hang
++ * the board with one wrong write. That is the trade: it makes the bring-up
++ * work a shell command instead of a rebuild.
++ *
++ * Interface
++ * ---------
++ * A command goes in through write(), and the answer comes back out through
++ * read(). They are separate calls because they are separate operations:
++ *
++ *   echo "read  <addr> [count]" > /dev/esp32-regs
++ *   cat  /dev/esp32-regs
++ *
++ *   echo "write <addr> <value>" > /dev/esp32-regs
++ *
++ * The first version of this returned the answer by copying it back into the
++ * caller's write() buffer. That cannot work: the shell opens the file
++ * write-only, so there is no read() for the answer to arrive on, and the
++ * buffer it wrote into is one the shell has already finished with. The
++ * answer has to come out of read().
++ *
++ * read() returns the result of the last command and then clears it, so a
++ * second cat returns nothing rather than repeating a stale value.
++ *
++ * Addresses are physical and may be given as 0x6003f000 or 0x6003f000+0x40c.
++ * The offset form is there because the datasheet is written in base+offset and
++ * translating by hand is where mistakes come from.
++ *
++ * Deliberately not supported: byte and halfword access. Every register this is
++ * for is 32-bit, and a width parameter would be one more thing to get wrong.
++ *
++ * mmap
++ * ----
++ * The device also hands out a third window, the internal SRAM at
++ * 0x3FC88000-0x3FCFFFFF, and it hands it out as a mapping rather than as
++ * register reads. That window is where the GDMA engine requires its
++ * descriptor list to live (TRM 3.4.1), and a descriptor list is something a
++ * program has to write into memory, not something it can send through a
++ * register. So the device has to be mmap-able.
++ *
++ * This kernel is NOMMU, and that changes what mmap means. There is no page
++ * table to install a translation into: the address a program gets IS the
++ * physical address. mm/nommu.c asks the driver where to site the mapping
++ * through get_unmapped_area(), takes the answer, and makes it vma->vm_start
++ * (mm/nommu.c:1148). The driver's mmap hook is then only a check -- on NOMMU
++ * remap_pfn_range() verifies that addr == pfn << PAGE_SHIFT and sets
++ * VM_IO|VM_PFNMAP (mm/nommu.c:1594), and touches no hardware.
++ *
++ * The three hooks are not optional and each has a distinct failure mode:
++ *
++ *   .mmap_capabilities  without it a chardev gets NOMMU_MAP_DIRECT by default,
++ *                       but naming it is how the window is declared writable.
++ *   .get_unmapped_area  without it mm/nommu.c:755 clears NOMMU_MAP_DIRECT and
++ *                       a MAP_SHARED request fails with -ENODEV.
++ *   .mmap               vfs_mmap() calls file->f_op->mmap with no NULL check
++ *                       (include/linux/fs.h:2061), so a device that reports
++ *                       NOMMU_MAP_DIRECT without one dereferences NULL.
++ *
++ * Userspace must ask for MAP_SHARED. MAP_PRIVATE takes the copy path in
++ * mm/nommu.c and would hand back a copy of the window rather than the window.
++ *
++ * The window is a mapping, so a program can hang the board with it just as
++ * easily as with a register write. That is the same trade as the rest of this
++ * device and it is why the device is off by default.
++ */
++
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/fs.h>
++#include <linux/mm.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++
++#define DRV_NAME	"esp32-regs"
++
++/*
++ * The whole peripheral register block. DR_REG_GDMA_BASE is 0x6003F000 and
++ * DR_REG_SYSTEM_BASE is 0x600C0000, both inside this span; the S3's highest
++ * peripheral base is below 0x600A0000.
++ */
++#define PERIPH_BASE	0x60000000
++#define PERIPH_END	0x600A0000
++
++/*
++ * The system block: peripheral clock gates and reset lines live here, and so
++ * does the external-memory cache controller at 0x600C4000.
++ *
++ * The cache block is not in the TRM's register map -- Table 4.3-3 lists
++ * 0x600C_4000-0x600C_BFFF as Reserved -- but the silicon has it and ESP-IDF
++ * drives it: components/soc/esp32s3/include/soc/reg_base.h defines
++ * DR_REG_EXTMEM_BASE as 0x600C4000, and components/esp_system/port/cpu_start.c
++ * calls Cache_Enable_DCache() at startup, on core 0, before this kernel runs.
++ * That is why the window reaches it: Linux inherits a live write-back L1
++ * data cache over PSRAM, and the only way to flush it from this side is
++ * EXTMEM_DCACHE_SYNC_CTRL_REG at 0x600C4028.
++ */
++#define SYS_BASE	0x600C0000
++#define SYS_END		0x600C5000
++
++/*
++ * The internal SRAM window, mmap-able. GDMA's descriptor list has to live in
++ * internal RAM (TRM 3.4.1), and this 416 KB span is the part of internal RAM
++ * that is not the ROM, not the RTC block and not the region the ROM loader
++ * uses. Linux's own memory is entirely external PSRAM (0x3d800000 for 8 MB),
++ * so nothing here is memory the kernel is using.
++ */
++#define SRAM_BASE	0x3FC88000
++#define SRAM_END	0x3FD00000
++
++#define MAX_WORDS	64
++#define LINE_MAX	160
++/*
++ * A read of MAX_WORDS words prints one line per word, and each line is
++ * "0x%08lx 0x%08x\n" -- 10 + 1 + 10 + 1 = 22 bytes. The first version of this
++ * sized the buffer at 16 bytes a line and silently dropped the last eight
++ * words of a 64-word read. 24 leaves room for a line that grows.
++ */
++#define LINE_OUT	24
++#define RESULT_MAX	(MAX_WORDS * LINE_OUT + 1)
++
++/*
++ * The answer to the last command, waiting to be read. One buffer, because
++ * one command is outstanding at a time; the mutex keeps a writer and a
++ * reader from interleaving and hands each a consistent view.
++ */
++static char esp32_regs_result[RESULT_MAX];
++static size_t esp32_regs_result_len;
++static DEFINE_MUTEX(esp32_regs_lock);
++
++static bool sram_allowed(unsigned long addr, size_t len);
++
++static bool addr_allowed(unsigned long addr, size_t len)
++{
++	if (addr >= PERIPH_BASE && addr + len <= PERIPH_END)
++		return true;
++	if (addr >= SYS_BASE && addr + len <= SYS_END)
++		return true;
++	return sram_allowed(addr, len);
++}
++
++/*
++ * The internal SRAM window. It is reachable two ways: handed to userspace
++ * whole through mmap, and -- since the GDMA bring-up -- read and written a
++ * word at a time through the register commands, so a descriptor the engine
++ * has just rejected can be read back and compared against what was written.
++ * Without that, a descriptor error is a dead end: the engine says it refused
++ * something and there is no way to look at the something.
++ *
++ * The overflow check is not decoration. addr + len wraps for a large enough
++ * addr, and a wrapped sum passes a naive upper-bound test.
++ */
++static bool sram_allowed(unsigned long addr, size_t len)
++{
++	if (len == 0)
++		return false;
++	if (addr < SRAM_BASE)
++		return false;
++	if (addr > SRAM_END || len > SRAM_END - addr)
++		return false;
++	return true;
++}
++
++/*
++ * Parse "0x6003f000" or "0x6003f000+0x40c". Returns 0 on success and leaves
++ * the resolved physical address in *out.
++ */
++static int parse_addr(const char *s, unsigned long *out)
++{
++	unsigned long base, off = 0;
++	char *end;
++
++	base = simple_strtoul(s, &end, 0);
++	if (end == s)
++		return -EINVAL;
++	if (*end == '+') {
++		const char *p = end + 1;
++
++		off = simple_strtoul(p, &end, 0);
++		if (end == p)
++			return -EINVAL;
++	}
++	if (*end != '\0' && *end != '\n')
++		return -EINVAL;
++	*out = base + off;
++	return 0;
++}
++
++static ssize_t esp32_regs_write(struct file *file, const char __user *ubuf,
++				size_t count, loff_t *ppos)
++{
++	char *buf;
++	char *cmd, *arg1, *arg2;
++	unsigned long addr, value;
++	void __iomem *map;
++	int ret;
++
++	if (count == 0 || count > LINE_MAX)
++		return -EINVAL;
++
++	buf = memdup_user_nul(ubuf, count);
++	if (IS_ERR(buf))
++		return PTR_ERR(buf);
++
++	/* Strip the trailing newline the shell always sends. */
++	buf[strcspn(buf, "\n")] = '\0';
++
++	cmd = strstrip(buf);
++	arg1 = strsep(&cmd, " \t");
++	arg2 = cmd ? strstrip(cmd) : NULL;
++
++	if (!arg1 || !*arg1) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if (!strcmp(arg1, "read")) {
++		unsigned long n = 1;
++		char *p;
++		u32 words[MAX_WORDS];
++		size_t i, pos = 0;
++
++		if (!arg2 || !*arg2) {
++			ret = -EINVAL;
++			goto out;
++		}
++		p = strsep(&arg2, " \t");
++		if (parse_addr(p, &addr)) {
++			ret = -EINVAL;
++			goto out;
++		}
++		if (arg2 && *arg2) {
++			n = simple_strtoul(strstrip(arg2), NULL, 0);
++			if (n == 0 || n > MAX_WORDS) {
++				ret = -EINVAL;
++				goto out;
++			}
++		}
++		if (!addr_allowed(addr, n * sizeof(u32))) {
++			ret = -EINVAL;
++			goto out;
++		}
++
++		map = ioremap(addr, n * sizeof(u32));
++		if (!map) {
++			ret = -ENOMEM;
++			goto out;
++		}
++		for (i = 0; i < n; i++)
++			words[i] = ioread32(map + i * sizeof(u32));
++		iounmap(map);
++
++		/*
++		 * One line per word, address first, so the output can be
++		 * diffed between runs and pasted into a bug report.
++		 */
++		mutex_lock(&esp32_regs_lock);
++		for (i = 0; i < n; i++) {
++			int len = scnprintf(esp32_regs_result + pos,
++					    RESULT_MAX - pos,
++					    "0x%08lx 0x%08x\n",
++					    addr + i * sizeof(u32), words[i]);
++
++			if (len <= 0 || pos + len >= RESULT_MAX)
++				break;
++			pos += len;
++		}
++		esp32_regs_result_len = pos;
++		mutex_unlock(&esp32_regs_lock);
++
++		ret = count;
++		goto out;
++	}
++
++	if (!strcmp(arg1, "write")) {
++		char *p;
++
++		if (!arg2 || !*arg2) {
++			ret = -EINVAL;
++			goto out;
++		}
++		p = strsep(&arg2, " \t");
++		if (parse_addr(p, &addr)) {
++			ret = -EINVAL;
++			goto out;
++		}
++		if (!arg2 || !*arg2) {
++			ret = -EINVAL;
++			goto out;
++		}
++		value = simple_strtoul(strstrip(arg2), NULL, 0);
++		if (!addr_allowed(addr, sizeof(u32))) {
++			ret = -EINVAL;
++			goto out;
++		}
++
++		map = ioremap(addr, sizeof(u32));
++		if (!map) {
++			ret = -ENOMEM;
++			goto out;
++		}
++		iowrite32((u32)value, map);
++		iounmap(map);
++
++		/*
++		 * A write has no value to report, but it must clear any
++		 * stale answer, or the next cat would return the previous
++		 * command's result and look like this write's.
++		 */
++		mutex_lock(&esp32_regs_lock);
++		esp32_regs_result_len = 0;
++		mutex_unlock(&esp32_regs_lock);
++
++		ret = count;
++		goto out;
++	}
++
++	/* Anything else is a typo, and saying so is more useful than -EINVAL. */
++	ret = -EINVAL;
++
++out:
++	kfree(buf);
++	return ret;
++}
++
++static ssize_t esp32_regs_read(struct file *file, char __user *ubuf,
++			       size_t count, loff_t *ppos)
++{
++	ssize_t ret;
++
++	if (*ppos != 0)
++		return 0;
++
++	mutex_lock(&esp32_regs_lock);
++	if (esp32_regs_result_len == 0) {
++		mutex_unlock(&esp32_regs_lock);
++		return 0;
++	}
++	if (count > esp32_regs_result_len)
++		count = esp32_regs_result_len;
++	if (copy_to_user(ubuf, esp32_regs_result, count)) {
++		mutex_unlock(&esp32_regs_lock);
++		return -EFAULT;
++	}
++	/* Consumed: a second cat must not repeat it. */
++	esp32_regs_result_len = 0;
++	ret = count;
++	mutex_unlock(&esp32_regs_lock);
++
++	*ppos += ret;
++	return ret;
++}
++
++/*
++ * Where the mapping goes. On NOMMU the answer is the physical address itself:
++ * mm/nommu.c takes whatever this returns and makes it vma->vm_start, so the
++ * program's pointer and the hardware address are the same number. That is the
++ * whole mechanism -- there is no translation to set up.
++ *
++ * pgoff is in pages and is the offset the program passed to mmap(), so a
++ * program can map a sub-range of the window by passing an offset.
++ */
++static unsigned long esp32_regs_get_unmapped_area(struct file *file,
++						  unsigned long addr,
++						  unsigned long len,
++						  unsigned long pgoff,
++						  unsigned long flags)
++{
++	unsigned long phys = SRAM_BASE + (pgoff << PAGE_SHIFT);
++
++	if (!sram_allowed(phys, len))
++		return -EINVAL;
++
++	return phys;
++}
++
++/*
++ * NOMMU_MAP_DIRECT is what makes MAP_SHARED possible at all; without it
++ * mm/nommu.c:764 refuses the request with -ENODEV. READ and WRITE are both
++ * named because a descriptor list is written, not just read.
++ */
++static unsigned esp32_regs_mmap_capabilities(struct file *file)
++{
++	return NOMMU_MAP_DIRECT | NOMMU_MAP_READ | NOMMU_MAP_WRITE;
++}
++
++/*
++ * The hook itself. On NOMMU remap_pfn_range() does not install anything -- it
++ * checks that addr == pfn << PAGE_SHIFT and sets VM_IO|VM_PFNMAP, which is
++ * what tells the rest of the kernel this range is device memory and must not
++ * be treated as a normal page. The identity it checks is exactly the one
++ * get_unmapped_area() established, so it holds.
++ *
++ * Wrapping the SRAM window in VM_IO is the point, not a formality: it is what
++ * stops the kernel from faulting these addresses in as ordinary anonymous
++ * pages. The address is the same either way; the flag is what makes the
++ * access go to the SRAM rather than to a page fault.
++ */
++static int esp32_regs_mmap(struct file *file, struct vm_area_struct *vma)
++{
++	unsigned long len = vma->vm_end - vma->vm_start;
++	unsigned long phys = SRAM_BASE + (vma->vm_pgoff << PAGE_SHIFT);
++
++	if (!sram_allowed(phys, len))
++		return -EINVAL;
++
++	/*
++	 * The window is internal SRAM, not a peripheral FIFO, so the normal
++	 * cacheable attribute is correct. pgprot_noncached() is what the
++	 * register windows would want if they were mmap-able; they are not.
++	 */
++	return remap_pfn_range(vma, vma->vm_start, phys >> PAGE_SHIFT,
++			       len, vma->vm_page_prot);
++}
++
++static const struct file_operations esp32_regs_fops = {
++	.owner		= THIS_MODULE,
++	.read		= esp32_regs_read,
++	.write		= esp32_regs_write,
++	.llseek		= noop_llseek,
++	.mmap		= esp32_regs_mmap,
++	.get_unmapped_area = esp32_regs_get_unmapped_area,
++	.mmap_capabilities = esp32_regs_mmap_capabilities,
++};
++
++static struct miscdevice esp32_regs_misc = {
++	.minor	= MISC_DYNAMIC_MINOR,
++	.name	= DRV_NAME,
++	.fops	= &esp32_regs_fops,
++	.mode	= 0600,
++};
++
++static int __init esp32_regs_init(void)
++{
++	int ret;
++
++	ret = misc_register(&esp32_regs_misc);
++	if (ret)
++		return ret;
++
++	pr_info(DRV_NAME ": /dev/%s ready; window 0x%08x-0x%08x and 0x%08x-0x%08x\n",
++		DRV_NAME, PERIPH_BASE, PERIPH_END, SYS_BASE, SYS_END);
++	pr_info(DRV_NAME ": mmap window 0x%08x-0x%08x (internal SRAM)\n",
++		SRAM_BASE, SRAM_END);
++	pr_warn(DRV_NAME ": development tool; a wrong write can hang the board\n");
++	return 0;
++}
++
++static void __exit esp32_regs_exit(void)
++{
++	misc_deregister(&esp32_regs_misc);
++}
++
++module_init(esp32_regs_init);
++module_exit(esp32_regs_exit);
++
++MODULE_AUTHOR("Shreyan Dey");
++MODULE_DESCRIPTION("Development register window for the ESP32-S3 peripherals");
++MODULE_LICENSE("GPL");

@@ -1,0 +1,76 @@
+#!/bin/sh
+# Run before init/ifup: migrate the interface name, then await the radio.
+# The immutable /usr copy also serves systems with an older SD-backed /etc.
+root=${WIFI_ROOT:-}
+config="$root/etc/network/interfaces"
+if [ -f "$config" ] && grep -Eq '(^|[[:space:]])espsta0([[:space:]]|$)|^[[:space:]]*(auto|allow-hotplug)[[:space:]]+([^#]*[[:space:]])?wlan0([[:space:]]|$)' "$config"; then
+    tmp=$(mktemp "$config.new.XXXXXX") || exit 1
+    if ! cp -p "$config" "$tmp"; then rm -f "$tmp"; exit 1; fi
+    if ! awk '
+        {
+            text=$0; out=""
+            while ((p=index(text,"espsta0")) != 0) {
+                before=substr(text,1,p-1); after=substr(text,p+7)
+                left=(p==1 || substr(before,length(before),1) ~ /[[:space:]]/)
+                right=(after=="" || substr(after,1,1) ~ /[[:space:]]/)
+                out=out before (left && right ? "wlan0" : "espsta0")
+                text=after
+            }
+            line=out text
+            # Leave WLAN manual even when the old SD config said auto.
+            count=split(line,fields,/[ \t]+/)
+            if (line ~ /^[ \t]*(auto|allow-hotplug)[ \t]/) {
+                directive=""; remaining=""
+                for (i=1;i<=count;i++) {
+                    if (fields[i]=="") continue
+                    if (directive=="") { directive=fields[i]; continue }
+                    if (fields[i]!="wlan0") remaining=remaining " " fields[i]
+                }
+                if (remaining!="") print directive remaining
+            } else print line
+        }' "$config" > "$tmp"; then
+        rm -f "$tmp"; exit 1
+    fi
+    if ! cmp -s "$config" "$tmp"; then
+        if [ ! -e "$config.pre-wlan0" ]; then
+            cp -p "$config" "$config.pre-wlan0" || { rm -f "$tmp"; exit 1; }
+        fi
+        mv "$tmp" "$config" || { rm -f "$tmp"; exit 1; }
+        sync
+        echo 'wifi: configured wlan0 for user-controlled connections'
+    else
+        rm -f "$tmp"
+    fi
+fi
+
+WIFI_RADIO_ENABLE=1
+[ ! -r "$root/etc/default/wifi" ] || . "$root/etc/default/wifi"
+case " $(cat "$root/proc/cmdline" 2>/dev/null) " in
+    *' esp32_wifi.enable=0 '*|*' esp32_wifi.enable=false '*) WIFI_RADIO_ENABLE=0 ;;
+esac
+if [ "$WIFI_RADIO_ENABLE" != 1 ]; then
+    echo 'wifi: automatic radio startup disabled'
+    exit 0
+fi
+enable="$root/sys/module/esp32_wifi/parameters/enable"
+[ -e "$enable" ] || exit 0
+if [ ! -d "$root/sys/class/net/wlan0" ]; then
+    echo 1 > "$enable" || exit 1
+fi
+n=0
+while [ ! -d "$root/sys/class/net/wlan0" ] && [ "$n" -lt 20 ]; do
+    sleep 1
+    n=$((n + 1))
+done
+if [ ! -d "$root/sys/class/net/wlan0" ]; then
+    echo 'wifi: radio startup timed out; continuing boot for recovery' >&2
+    exit 1
+fi
+# rcS runs S40network after this helper. Join retained credentials only when
+# Wi-Fi is enabled; an unsaved network still needs the interactive picker.
+credentials="$root/etc/wpa_supplicant.conf"
+if [ -r "$credentials" ] &&
+   grep -Eq '^[[:space:]]*network[[:space:]]*=[[:space:]]*\{' "$credentials"; then
+    printf 'auto wlan0\n' >> "$config" || exit 1
+fi
+exit 0

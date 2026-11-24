@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""usr/sbin/remote-login, ssh-server and web-server on the host, against a fake /etc."""
+"""usr/sbin/remote-login and ssh-server on the host, against a fake /etc."""
 import os
 from pathlib import Path
 import shutil
@@ -10,9 +10,18 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 SH = os.environ.get('BOARD_SH', 'sh')
 SBIN = ROOT / 'new-files/board/espressif/esp32s3/rootfs_overlay/usr/sbin'
-WEB = '#80\tstream\ttcp\tnowait\twww-data\t/usr/sbin/httpd\thttpd -i -h /home/www\n'
+# Lines from an older image, which still had a web server and a telnet server.
+# This image has neither, and /etc survives a flash, so the lines have to be
+# tolerated and then dropped.
+OLD_WEB = '#80\tstream\ttcp\tnowait\twww-data\t/usr/sbin/httpd\thttpd -i -h /home/www\n'
+OLD_TELNET = '#telnet\tstream\ttcp\tnowait\troot\t/usr/sbin/telnetd\ttelnetd -i\n'
 OLD = ('ssh\tstream\ttcp\tnowait\troot\t/usr/sbin/dropbear\tdropbear -i -R -I 600\n'
-       '#telnet\tstream\ttcp\tnowait\troot\t/usr/sbin/telnetd\ttelnetd -i\n')
+       + OLD_TELNET)
+# A line remote-login does not own, so it must survive every rewrite. busybox
+# inetd builtins are written as "internal" plus the builtin's name, and this
+# image enables the echo one (CONFIG_FEATURE_INETD_SUPPORT_BUILTIN_ECHO), so it
+# is a line a user could genuinely have added.
+FOREIGN = 'echo\tstream\ttcp\tnowait\troot\tinternal\techo\n'
 
 
 class Base(unittest.TestCase):
@@ -27,12 +36,9 @@ class Base(unittest.TestCase):
         self.dropbear = self.dir / 'dropbear'
         self.dropbear.write_text('')
         self.dropbear.chmod(0o755)
-        self.www = self.dir / 'www'
-        self.www.mkdir()
-        (self.www / 'index.html').write_text('hi\n')
         self.inetd = self.etc / 'inetd.conf'
-        self.inetd.write_text(WEB)
-        self.fake('id', 'case "$*" in "-u") echo 0 ;; "-u www-data") echo 33 ;; *) exit 0 ;; esac')
+        self.inetd.write_text('')
+        self.fake('id', 'case "$*" in "-u") echo 0 ;; *) exit 0 ;; esac')
         self.fake('killall', 'echo "$@" >> %s/killall.log' % self.dir)
         self.fake('remote-login', f'exec {SH} {SBIN / "remote-login"} "$@"')
 
@@ -44,8 +50,7 @@ class Base(unittest.TestCase):
     def run_sbin(self, name, *args):
         env = {**os.environ, 'PATH': f'{self.bin}:{os.environ["PATH"]}',
                'REMOTE_LOGIN_ETC': str(self.etc), 'REMOTE_LOGIN_DROPBEAR': str(self.dropbear),
-               'REMOTE_LOGIN_HOME': str(self.home), 'WEB_SERVER_CONF': str(self.inetd),
-               'WEB_SERVER_DOCROOT': str(self.www)}
+               'REMOTE_LOGIN_HOME': str(self.home)}
         return subprocess.run([SH, str(SBIN / name), *args], capture_output=True,
                               text=True, env=env, timeout=20)
 
@@ -72,7 +77,6 @@ class RemoteLoginTests(Base):
         self.assertIn('SSH on port 22 (password or key)', r.stdout)
         ssh = self.line('dropbear')
         self.assertEqual((ssh[0], ssh[6]), ('22', 'dropbear -i -R -I 600'))
-        self.assertFalse(self.listening('telnetd'))
         self.assertIn('-HUP inetd', (self.dir / 'killall.log').read_text())
 
     def test_port_moves_ssh_and_survives_switching(self):
@@ -80,20 +84,12 @@ class RemoteLoginTests(Base):
         self.ok('remote-login', 'port', 'ssh', '2222')
         self.assertEqual(self.line('dropbear')[0], '2222')
         self.assertTrue(self.listening('dropbear'))
-        self.ok('remote-login', 'telnet')
+        self.ok('remote-login', 'off')
         self.ok('remote-login', 'ssh')
         self.assertEqual(self.line('dropbear')[0], '2222')
         self.assertIn('SSH_PORT=2222', (self.etc / 'remote-login.conf').read_text())
         self.ok('remote-login', 'port', 'ssh', 'default')
         self.assertEqual(self.line('dropbear')[0], '22')
-
-    def test_telnet_port(self):
-        self.ok('remote-login', 'telnet')
-        r = self.ok('remote-login', 'port', 'telnet', '2323')
-        self.assertIn('Telnet port is 2323', r.stdout)
-        self.assertEqual(self.line('telnetd')[0], '2323')
-        self.assertTrue(self.listening('telnetd'))
-        self.assertFalse(self.listening('dropbear'))
 
     def test_auth_modes_pick_the_dropbear_flags(self):
         self.ok('remote-login', 'ssh')
@@ -122,21 +118,12 @@ class RemoteLoginTests(Base):
         self.assertEqual(self.inetd.read_text(), before)
         self.assertFalse((self.etc / 'remote-login.conf').exists())
 
-    def test_ssh_and_telnet_cannot_share_a_port_or_take_the_web_one(self):
-        self.ok('remote-login', 'port', 'telnet', '2222')
-        r = self.run_sbin('remote-login', 'port', 'ssh', '2222')
-        self.assertIn('cannot share port 2222', r.stderr)
-        r = self.run_sbin('remote-login', 'port', 'ssh', '80')
-        self.assertIn('belongs to the web server', r.stderr)
-        self.assertNotIn('SSH_PORT=80', (self.etc / 'remote-login.conf').read_text())
-
     def test_hand_edited_settings_take_effect_on_apply(self):
         self.ok('remote-login', 'ssh')
-        (self.etc / 'remote-login.conf').write_text('SSH_PORT=2200\nSSH_AUTH=key\nJUNK\nTELNET_PORT=x\n')
+        (self.etc / 'remote-login.conf').write_text('SSH_PORT=2200\nSSH_AUTH=key\nJUNK\n')
         self.ok('remote-login', 'apply')
         ssh = self.line('dropbear')
         self.assertEqual((ssh[0], ssh[6]), ('2200', 'dropbear -i -R -I 600 -s'))
-        self.assertEqual(self.line('telnetd')[0], '#23')
 
     def test_status_names_ports_and_auth(self):
         self.assertIn('Listening: nothing', self.ok('remote-login', 'status').stdout)
@@ -146,37 +133,60 @@ class RemoteLoginTests(Base):
         out = self.ok('remote-login').stdout
         self.assertIn('Listening: ssh', out)
         self.assertIn('SSH: port 2022, password only', out)
-        self.assertIn('Telnet: port 23, off', out)
 
     def test_an_old_inetd_conf_is_rewritten_without_duplicates(self):
-        self.inetd.write_text(WEB + OLD)
+        self.inetd.write_text(OLD_WEB + OLD)
         (self.etc / 'remote-login').write_text('ssh\n')
         self.ok('remote-login', 'apply')
-        self.assertEqual(len(self.lines()), 3)
+        self.assertEqual(len(self.lines()), 1)
         self.assertEqual(self.line('dropbear')[0], '22')
         self.assertTrue(self.listening('dropbear'))
-        self.assertEqual(self.line('httpd')[0], '#80')
+
+    def test_a_line_from_the_old_web_server_is_dropped(self):
+        # /etc is jffs2 and outlives a flash, so a board updated from an image
+        # that had a web server still names /usr/sbin/httpd. This image has no
+        # such program, so the line is removed rather than left to fail.
+        self.inetd.write_text(OLD_WEB)
+        self.ok('remote-login', 'apply')
+        self.assertEqual([f for f in self.lines() if f[5] == '/usr/sbin/httpd'], [])
+        self.assertEqual(len(self.lines()), 1)
+
+    def test_a_line_from_the_old_telnet_server_is_dropped(self):
+        # Same reasoning as the web server above: this image builds no telnetd,
+        # so a line naming one is removed rather than left to fork a name that
+        # no longer exists.
+        self.inetd.write_text(OLD_TELNET)
+        self.ok('remote-login', 'apply')
+        self.assertEqual([f for f in self.lines() if f[5] == '/usr/sbin/telnetd'], [])
+        self.assertEqual(len(self.lines()), 1)
+
+    def test_a_line_remote_login_does_not_own_is_left_alone(self):
+        self.inetd.write_text(FOREIGN)
+        self.ok('remote-login', 'ssh')
+        self.ok('remote-login', 'port', 'ssh', '2222')
+        self.ok('remote-login', 'off')
+        self.assertIn(FOREIGN, self.inetd.read_text())
+        self.assertEqual(len(self.lines()), 2)
+        self.assertFalse(self.listening('dropbear'))
 
     def test_usage_on_nonsense(self):
-        for args in (['port'], ['port', 'web', '81'], ['auth', 'maybe'], ['reboot']):
+        for args in (['port'], ['port', 'web', '81'], ['auth', 'maybe'], ['reboot'],
+                     ['telnet']):
             r = self.run_sbin('remote-login', *args)
             self.assertNotEqual(r.returncode, 0, args)
             self.assertIn('usage:', r.stderr)
 
 
 class SshServerTests(Base):
-    def test_on_adds_ssh_next_to_telnet_and_off_takes_it_away(self):
-        self.ok('remote-login', 'telnet')
+    def test_on_and_off_round_trip(self):
         self.ok('remote-login', 'port', 'ssh', '2222')
         self.ok('ssh-server', 'on')
         self.assertTrue(self.listening('dropbear'))
-        self.assertTrue(self.listening('telnetd'))
         self.assertEqual(self.line('dropbear')[0], '2222')
         self.assertIn('SSH: enabled', self.ok('ssh-server', 'status').stdout)
-        self.assertIn('Listening: ssh telnet', self.ok('remote-login', 'status').stdout)
+        self.assertIn('Listening: ssh', self.ok('remote-login', 'status').stdout)
         self.ok('ssh-server', 'off')
         self.assertFalse(self.listening('dropbear'))
-        self.assertTrue(self.listening('telnetd'))
         self.assertIn('SSH: disabled', self.ok('ssh-server', 'status').stdout)
 
     def test_off_with_nothing_else_leaves_nothing(self):
@@ -185,57 +195,6 @@ class SshServerTests(Base):
         self.ok('ssh-server', 'off')
         self.assertEqual((self.etc / 'remote-login').read_text().split(), ['off'])
         self.assertFalse(self.listening('dropbear'))
-
-
-class WebServerTests(Base):
-    def test_on_off_and_status_on_the_default_port(self):
-        self.assertIn('disabled: port 80', self.ok('web-server', 'status').stdout)
-        self.assertIn('enabled: port 80', self.ok('web-server', 'on').stdout)
-        self.assertEqual(self.line('httpd')[0], '80')
-        self.assertIn('already enabled', self.ok('web-server', 'on').stdout)
-        self.ok('web-server', 'off')
-        self.assertEqual(self.line('httpd')[0], '#80')
-
-    def test_port_moves_the_page_and_keeps_its_state(self):
-        self.ok('web-server', 'on')
-        self.assertIn('port is 8080', self.ok('web-server', 'port', '8080').stdout)
-        self.assertEqual(self.line('httpd')[0], '8080')
-        self.assertIn('enabled: port 8080', self.ok('web-server', 'status').stdout)
-        self.ok('web-server', 'off')
-        self.assertEqual(self.line('httpd')[0], '#8080')
-        self.ok('web-server', 'port', 'default')
-        self.assertEqual(self.line('httpd')[0], '#80')
-
-    def test_port_refuses_one_ssh_uses(self):
-        self.ok('remote-login', 'ssh')
-        r = self.run_sbin('web-server', 'port', '22')
-        self.assertIn('already used', r.stderr)
-        self.inetd.write_text(WEB + OLD)
-        r = self.run_sbin('web-server', 'port', '22')
-        self.assertIn('already used', r.stderr)
-        for port in ('0', '70000', 'x'):
-            self.assertNotEqual(self.run_sbin('web-server', 'port', port).returncode, 0)
-        self.assertEqual(self.line('httpd')[0], '#80')
-
-    def test_migrate_moves_an_old_www_line_to_home_www(self):
-        self.inetd.write_text('80\tstream\ttcp\tnowait\troot\t/usr/sbin/httpd\thttpd -i -h /www\n')
-        self.ok('web-server', 'migrate')
-        self.assertEqual(self.line('httpd')[4:], ['www-data', '/usr/sbin/httpd', 'httpd -i -h /home/www'])
-        self.assertEqual(self.line('httpd')[0], '80')
-        self.assertTrue((self.etc / 'inetd.conf.before-home-www').exists())
-
-    def test_migrate_leaves_a_custom_line_alone(self):
-        custom = '80\tstream\ttcp\tnowait\troot\t/usr/sbin/httpd\thttpd -i -h /srv -p 9\n'
-        self.inetd.write_text(custom)
-        r = self.run_sbin('web-server', 'migrate')
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn('custom configuration', r.stderr)
-        self.assertEqual(self.inetd.read_text(), custom)
-
-    def test_no_line_yet_is_created_on_enable(self):
-        self.inetd.write_text('')
-        self.ok('web-server', 'on')
-        self.assertEqual(self.line('httpd')[0], '80')
 
 
 if __name__ == '__main__':

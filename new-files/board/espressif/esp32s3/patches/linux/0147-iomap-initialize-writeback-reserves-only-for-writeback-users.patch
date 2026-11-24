@@ -1,0 +1,96 @@
+--- a/fs/Kconfig
++++ b/fs/Kconfig
+@@ -17,6 +17,11 @@
+ 
+ config FS_IOMAP
+ 	bool
++
++config FS_IOMAP_WRITEBACK
++	bool
++	select FS_IOMAP
++
+ 
+ # Stackable filesystems
+ config FS_STACK
+--- a/fs/xfs/Kconfig
++++ b/fs/xfs/Kconfig
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ config XFS_FS
+ 	tristate "XFS filesystem support"
++	select FS_IOMAP_WRITEBACK
+ 	depends on BLOCK
+ 	select EXPORTFS
+ 	select CRC32
+--- a/fs/gfs2/Kconfig
++++ b/fs/gfs2/Kconfig
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ config GFS2_FS
+ 	tristate "GFS2 file system support"
++	select FS_IOMAP_WRITEBACK
+ 	select BUFFER_HEAD
+ 	select FS_POSIX_ACL
+ 	select CRC32
+--- a/fs/fuse/Kconfig
++++ b/fs/fuse/Kconfig
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ config FUSE_FS
+ 	tristate "FUSE (Filesystem in Userspace) support"
++	select FS_IOMAP_WRITEBACK
+ 	select FS_POSIX_ACL
+ 	select FS_IOMAP
+ 	help
+--- a/fs/exfat/Kconfig
++++ b/fs/exfat/Kconfig
+@@ -2,6 +2,7 @@
+ 
+ config EXFAT_FS
+ 	tristate "exFAT filesystem support"
++	select FS_IOMAP_WRITEBACK
+ 	select BUFFER_HEAD
+ 	select NLS
+ 	select FS_IOMAP
+--- a/fs/ntfs/Kconfig
++++ b/fs/ntfs/Kconfig
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ config NTFS_FS
+ 	tristate "NTFS file system support"
++	select FS_IOMAP_WRITEBACK
+ 	select NLS
+ 	select FS_IOMAP
+ 	help
+--- a/fs/ntfs3/Kconfig
++++ b/fs/ntfs3/Kconfig
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ config NTFS3_FS
+ 	tristate "NTFS Read-Write file system support"
++	select FS_IOMAP_WRITEBACK
+ 	depends on !NTFS_FS || m
+ 	select BUFFER_HEAD
+ 	select NLS
+--- a/fs/zonefs/Kconfig
++++ b/fs/zonefs/Kconfig
+@@ -1,5 +1,6 @@
+ config ZONEFS_FS
+ 	tristate "zonefs filesystem support"
++	select FS_IOMAP_WRITEBACK
+ 	depends on BLOCK
+ 	depends on BLK_DEV_ZONED
+ 	select FS_IOMAP
+--- a/fs/iomap/ioend.c
++++ b/fs/iomap/ioend.c
+@@ -516,6 +516,10 @@
+ 	const unsigned int nr_mempool_entries = 4 * (PAGE_SIZE / SECTOR_SIZE);
+ 	int error;
+ 
++	/* Direct-I/O-only users do not need buffered-writeback reserves. */
++	if (!IS_ENABLED(CONFIG_FS_IOMAP_WRITEBACK))
++		return 0;
++
+ 	error = bioset_init(&iomap_ioend_bioset, nr_mempool_entries,
+ 			   offsetof(struct iomap_ioend, io_bio),
+ 			   BIOSET_NEED_BVECS);

@@ -1,0 +1,225 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -32,6 +32,8 @@
+ #define pr_fmt(fmt) "esp32-wifi-blob: " fmt
+ 
+ #include <linux/atomic.h>
++#include <linux/genalloc.h>
++#include <linux/overflow.h>
+ #include <linux/io.h>
+ #include <linux/interrupt.h>
+ #include <linux/irqdomain.h>
+@@ -454,6 +456,100 @@
+ 	atomic64_add(delta, &osi_heap_used);
+ }
+ 
++/* The DT supplies an exclusively reserved, DMA-capable D-bus SRAM range.
++ * Never satisfy a capability-constrained allocation with ordinary PSRAM.
++ * Headers consume one 32-byte quantum so returned buffers stay aligned.
++ */
++static struct gen_pool *osi_internal_pool;
++struct osi_internal_header { size_t requested; size_t allocated; };
++#define OSI_INTERNAL_HEADER_SIZE 32
++
++static bool osi_is_internal(const void *p)
++{
++	return p && osi_internal_pool &&
++		gen_pool_has_addr(osi_internal_pool, (unsigned long)p, 1);
++}
++
++static void *osi_malloc_internal(size_t size)
++{
++	struct osi_internal_header *h;
++	size_t total;
++	unsigned long addr;
++
++	if (!osi_internal_pool ||
++	    check_add_overflow(size ? size : 1, (size_t)OSI_INTERNAL_HEADER_SIZE, &total))
++		return NULL;
++	if (total > gen_pool_size(osi_internal_pool))
++		return NULL;
++	addr = gen_pool_alloc(osi_internal_pool, total);
++	if (!addr) {
++		pr_err_ratelimited("internal SRAM allocation %zu failed (%zu bytes free)\n",
++				  size, gen_pool_avail(osi_internal_pool));
++		return NULL;
++	}
++	h = (void *)addr;
++	h->requested = size;
++	h->allocated = total;
++	return (void *)(addr + OSI_INTERNAL_HEADER_SIZE);
++}
++
++static void osi_free_internal(void *p)
++{
++	struct osi_internal_header *h = p - OSI_INTERNAL_HEADER_SIZE;
++
++	gen_pool_free(osi_internal_pool, (unsigned long)h, h->allocated);
++}
++
++static void *osi_calloc_internal(size_t n, size_t size)
++{
++	size_t total;
++	void *p;
++
++	if (check_mul_overflow(n, size, &total))
++		return NULL;
++	p = osi_malloc_internal(total);
++	if (p)
++		memset(p, 0, total);
++	return p;
++}
++
++static void *osi_zalloc_internal(size_t size)
++{
++	return osi_calloc_internal(1, size);
++}
++
++static void *osi_realloc_internal(void *ptr, size_t size)
++{
++	void *p;
++	size_t old;
++
++	if (!ptr)
++		return osi_malloc_internal(size);
++	if (!size) {
++		if (osi_is_internal(ptr))
++			osi_free_internal(ptr);
++		else {
++			osi_heap_track(-(s64)ksize(ptr));
++			kfree(ptr);
++		}
++		return NULL;
++	}
++	old = osi_is_internal(ptr) ?
++		((struct osi_internal_header *)(ptr - OSI_INTERNAL_HEADER_SIZE))->requested :
++		ksize(ptr);
++	p = osi_malloc_internal(size);
++	if (!p)
++		return NULL;
++	memcpy(p, ptr, min(old, size));
++	if (osi_is_internal(ptr))
++		osi_free_internal(ptr);
++	else {
++		osi_heap_track(-(s64)ksize(ptr));
++		kfree(ptr);
++	}
++	return p;
++}
++
+ /* A zero-byte kmalloc does not return NULL. It returns ZERO_SIZE_PTR,  */
+ /* which is the constant (void *)16, and every later dereference of it  */
+ /* faults at a low address. The blob's own allocator callers never ask  */
+@@ -483,6 +579,10 @@
+ {
+ 	if (!p)
+ 		return;
++	if (osi_is_internal(p)) {
++		osi_free_internal(p);
++		return;
++	}
+ 	osi_heap_track(-(s64)ksize(p));
+ 	kfree(p);
+ }
+@@ -498,7 +598,11 @@
+ 
+ static void *osi_realloc(void *ptr, size_t size)
+ {
+-	size_t before = ptr ? ksize(ptr) : 0;
++	size_t before;
++
++	if (osi_is_internal(ptr))
++		return osi_realloc_internal(ptr, size);
++	before = ptr ? ksize(ptr) : 0;
+ 	void *p = krealloc(ptr, OSI_ALLOC_SIZE(size), GFP_ATOMIC);
+ 
+ 	if (p)
+@@ -526,17 +630,7 @@
+ 
+ static uint32_t osi_get_free_heap_size(void)
+ {
+-	s64 used = atomic64_read(&osi_heap_used);
+-	u64 free = (u64)global_zone_page_state(NR_FREE_PAGES) * PAGE_SIZE;
+-
+-	/* A double free would drive the counter negative; clamp rather than
+-	 * wrap, so the blob never sees an absurd figure.
+-	 */
+-	if (used < 0)
+-		used = 0;
+-	if ((u64)used >= free)
+-		return 0;
+-	return (uint32_t)(free - (u64)used);
++	return osi_internal_pool ? gen_pool_avail(osi_internal_pool) : 0;
+ }
+ 
+ /* ------------------------------------------------------------------ */
+@@ -3083,7 +3177,7 @@
+ 	._semphr_take		= osi_semphr_take,
+ 	._semphr_give		= osi_semphr_give,
+ 	._is_in_isr		= osi_is_in_isr,
+-	._malloc_internal	= osi_malloc,
++	._malloc_internal	= osi_malloc_internal,
+ 	._free			= osi_free,
+ 	._esp_timer_get_time	= osi_esp_timer_get_time,
+ 	._env_is_chip		= osi_env_is_chip,
+@@ -3231,10 +3325,10 @@
+ 	._log_write = osi_log_write,
+ 	._log_writev = osi_log_writev,
+ 	._log_timestamp = osi_log_timestamp,
+-	._malloc_internal = osi_malloc,
+-	._realloc_internal = osi_realloc,
+-	._calloc_internal = osi_calloc,
+-	._zalloc_internal = osi_zalloc,
++	._malloc_internal = osi_malloc_internal,
++	._realloc_internal = osi_realloc_internal,
++	._calloc_internal = osi_calloc_internal,
++	._zalloc_internal = osi_zalloc_internal,
+ 	._wifi_malloc = osi_malloc,
+ 	._wifi_realloc = osi_realloc,
+ 	._wifi_calloc = osi_calloc,
+@@ -3853,7 +3947,7 @@
+ 		pr_err("osi: no probe yet; cannot start the blob\n");
+ 		return -ENODEV;
+ 	}
+-	schedule_work(&wifi_blob_work);
++	schedule_work_on(0, &wifi_blob_work);
+ 	return 0;
+ }
+ 
+@@ -3870,6 +3964,26 @@
+ 	struct esp_wifi_blob *hw;
+ 	u32 osi_addr = ESP32_ROM_OSI_FUNCS_P;
+ 	int ret, i;
++	struct resource *sram;
++	void __iomem *sram_base;
++
++	/* Fail before touching the radio if the board has no owned SRAM. */
++	sram = platform_get_resource_byname(pdev, IORESOURCE_MEM, "wifi-sram");
++	sram_base = devm_ioremap_resource(&pdev->dev, sram);
++	if (IS_ERR(sram_base))
++		return PTR_ERR(sram_base);
++	osi_internal_pool = devm_gen_pool_create(&pdev->dev, 5, -1, "wifi-internal");
++	if (IS_ERR(osi_internal_pool)) {
++		ret = PTR_ERR(osi_internal_pool);
++		osi_internal_pool = NULL;
++		return ret;
++	}
++	ret = gen_pool_add_virt(osi_internal_pool, (unsigned long)sram_base,
++			       sram->start, resource_size(sram), -1);
++	if (ret)
++		return ret;
++	dev_info(&pdev->dev, "internal SRAM pool: %zu bytes\n",
++		 gen_pool_size(osi_internal_pool));
+ 
+ 	/*
+ 	 * The fault dump goes in first, before a single blob instruction
+@@ -4063,7 +4177,8 @@
+ 		return 0;
+ 	}
+ 
+-	return esp32_wifi_blob_start(hw);
++	schedule_work_on(0, &wifi_blob_work);
++	return 0;
+ 
+ 	/*
+ 	 * The probe's own unwinds. These are reachable only from the setup

@@ -1,0 +1,221 @@
+Subject: [PATCH] crypto: esp32s3: own RSA clock, power and reset dependencies
+
+Match pinned IDF: enable the RSA clock and release DS before RSA, then
+clear memory power-down and retain the bounded clean handshake. Leave DS
+deasserted on cleanup because its assertion also resets AES. Refuse crypto
+registration after a failed requested self-test.
+
+diff --git a/drivers/crypto/esp32s3_rsa.c b/drivers/crypto/esp32s3_rsa.c
+--- a/drivers/crypto/esp32s3_rsa.c
++++ b/drivers/crypto/esp32s3_rsa.c
+@@ -2,6 +2,10 @@
+ 
+ #include <linux/delay.h>
+ #include <linux/io.h>
++#include <linux/clk.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/reset.h>
+ #include <linux/kernel.h>
+ #include <linux/string.h>
+ #include <linux/module.h>
+@@ -14,10 +18,6 @@
+ #include <crypto/akcipher.h>
+ #include <crypto/algapi.h>
+ 
+-#define RSA_BASE	0x6003C000
+-#define RSA_SPAN	0x900
+-#define SYS_BASE	0x600C0000
+-#define SYS_SPAN	0x100
+ 
+ #define RSA_M_MEM	0x000
+ #define RSA_Z_MEM	0x200
+@@ -34,7 +34,7 @@
+ #define RSA_SEARCH_POS	0x828
+ #define RSA_INT_ENA	0x82C
+ 
+-#define SYS_RSA_PD_CTRL	0x40
++#define SYS_RSA_PD_CTRL	0x00 /* dedicated power-control resource */
+ #define RSA_MEM_PD_BIT	BIT(0)
+ 
+ #define ESP_RSA_MAX_WORDS	128
+@@ -465,7 +465,7 @@
+ module_param_named(selftest, rsa_selftest, bool, 0444);
+ MODULE_PARM_DESC(selftest, "Run the RSA self-test at init (default off)");
+ 
+-static void esp_rsa_selftest(void)
++static int esp_rsa_selftest(void)
+ {
+ 	static const int sizes[] = { 64, 256 };
+ 	int i, r;
+@@ -474,15 +474,14 @@
+ 		r = selftest_one(sizes[i]);
+ 		pr_info("esp32s3-rsa: selftest %d-bit %s\n",
+ 			sizes[i] * 8, r ? "FAIL" : "PASS");
+-	}
+-}
+-
+-/* The accelerator clears its memory after being powered up and reports that
+- * through RSA_QUERY_CLEAN. This used to spin without a bound, so a block that
+- * never answered -- the firmware hands it over with periph_module_enable, and
+- * if that has not happened the register reads zero forever -- stopped the boot
+- * dead, with nothing printed. It is a documented hazard in DEVELOPMENT.md
+- * (incident 6) that had no fix. Time it out and let the driver fail instead.
++		if (r)
++			return r;
++	}
++	return 0;
++}
++
++/* Clock and reset are owned by the Linux platform driver. After powering
++ * memory, retain the bounded wait for the hardware's memory-clear handshake.
+  */
+ static int rsa_hw_enable(void)
+ {
+@@ -505,46 +504,85 @@
+ 	return -ETIMEDOUT;
+ }
+ 
+-static int __init esp_rsa_init(void)
+-{
++static void esp_rsa_power_down(void *data)
++{
++	writel(readl(sys + SYS_RSA_PD_CTRL) | RSA_MEM_PD_BIT,
++	       sys + SYS_RSA_PD_CTRL);
++	reset_control_assert(data);
++}
++
++static int esp_rsa_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct reset_control *rst, *ds_rst;
++	struct clk *clk;
+ 	int ret;
+ 
+-	rsa = ioremap(RSA_BASE, RSA_SPAN);
+-	sys = ioremap(SYS_BASE, SYS_SPAN);
+-	if (!rsa || !sys) {
+-		ret = -ENOMEM;
+-		goto err;
+-	}
++	rsa = devm_platform_ioremap_resource_byname(pdev, "rsa");
++	if (IS_ERR(rsa))
++		return PTR_ERR(rsa);
++	sys = devm_platform_ioremap_resource_byname(pdev, "power");
++	if (IS_ERR(sys))
++		return PTR_ERR(sys);
++	/* IDF enables PERIPH_RSA_MODULE before clearing RSA_MEM_PD.
++	 * Use the common clock/reset providers, including their RMW locks.
++	 */
++	clk = devm_clk_get_enabled(dev, "rsa");
++	if (IS_ERR(clk))
++		return dev_err_probe(dev, PTR_ERR(clk), "RSA clock unavailable\n");
++	rst = devm_reset_control_get_exclusive(dev, "rsa");
++	if (IS_ERR(rst))
++		return dev_err_probe(dev, PTR_ERR(rst), "RSA reset unavailable\n");
++	ds_rst = devm_reset_control_get_exclusive(dev, "ds");
++	if (IS_ERR(ds_rst))
++		return dev_err_probe(dev, PTR_ERR(ds_rst), "RSA DS reset unavailable\n");
++	/* IDF clk_gate_ll.h: RSA remains held in reset while DS_RST is set.
++	 * Leave DS deasserted on remove: asserting DS also resets AES.
++	 */
++	ret = reset_control_deassert(ds_rst);
++	if (ret)
++		return ret;
++	ret = reset_control_deassert(rst);
++	if (ret)
++		return ret;
++	ret = devm_add_action_or_reset(dev, esp_rsa_power_down, rst);
++	if (ret)
++		return ret;
+ 	ret = rsa_hw_enable();
+ 	if (ret)
+-		goto err;
+-	if (rsa_selftest)
+-		esp_rsa_selftest();
+-
++		return ret;
++	if (rsa_selftest) {
++		ret = esp_rsa_selftest();
++		if (ret)
++			return dev_err_probe(dev, ret, "RSA self-test failed\n");
++	}
+ 	ret = crypto_register_akcipher(&esp_rsa_alg);
+-	if (ret) {
+-		pr_err("esp32s3-rsa: akcipher register failed: %d\n", ret);
+-		goto err;
+-	}
+-	pr_info("esp32s3-rsa: hardware RSA registered (rsa-esp32s3)\n");
++	if (ret)
++		return dev_err_probe(dev, ret, "akcipher registration failed\n");
++	dev_info(dev, "hardware RSA registered (rsa-esp32s3)\n");
+ 	return 0;
+-err:
+-	if (rsa)
+-		iounmap(rsa);
+-	if (sys)
+-		iounmap(sys);
+-	return ret;
+-}
+-
+-static void __exit esp_rsa_exit(void)
++}
++
++static void esp_rsa_remove(struct platform_device *pdev)
+ {
+ 	crypto_unregister_akcipher(&esp_rsa_alg);
+-	iounmap(rsa);
+-	iounmap(sys);
+-}
+-
+-module_init(esp_rsa_init);
+-module_exit(esp_rsa_exit);
++}
++
++static const struct of_device_id esp_rsa_match[] = {
++	{ .compatible = "espressif,esp32s3-rsa" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, esp_rsa_match);
++
++static struct platform_driver esp_rsa_driver = {
++	.probe = esp_rsa_probe,
++	.remove = esp_rsa_remove,
++	.driver = {
++		.name = "esp32s3-rsa",
++		.of_match_table = esp_rsa_match,
++	},
++};
++module_platform_driver(esp_rsa_driver);
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_DESCRIPTION("ESP32-S3 hardware RSA accelerator (Crypto API akcipher)");
+diff --git a/arch/xtensa/boot/dts/esp32s3.dtsi b/arch/xtensa/boot/dts/esp32s3.dtsi
+--- a/arch/xtensa/boot/dts/esp32s3.dtsi
++++ b/arch/xtensa/boot/dts/esp32s3.dtsi
+@@ -381,3 +381,25 @@
+ 		};
+ 	};
+ };
++
++/* Linux owns the RSA gate/reset; no firmware crypto initialization required. */
++&{/clocks} {
++	rsa_clk: rsa_clk {
++		#clock-cells = <0>;
++		compatible = "gpio-gate-clock";
++		clocks = <&clk 2>;
++		enable-gpios = <&clk_gpio1 3 0>;
++	};
++};
++
++&{/soc} {
++	rsa@6003c000 {
++		compatible = "espressif,esp32s3-rsa";
++		reg = <0x6003c000 0x900>, <0x600c0040 0x4>;
++		reg-names = "rsa", "power";
++		clocks = <&rsa_clk>;
++		clock-names = "rsa";
++		resets = <&reset 35>, <&reset 36>;
++		reset-names = "rsa", "ds";
++	};
++};

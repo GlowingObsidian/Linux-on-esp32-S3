@@ -1,0 +1,46 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -4946,6 +4946,7 @@
+ 	 * notifier would break state the running board still depends on.
+ 	 */
+ err_blob_deinit:
++	cancel_work_sync(&blob_scan_cleanup);
+ 	esp_wifi_deinit_internal();
+ err_adapter:
+ 	esp_wifi_deinit(&hw->adapter);
+@@ -4962,6 +4963,7 @@
+ 	unregister_die_notifier(&osi_die_nb);
+ 	if (hw->started) {
+ 		esp_wifi_stop();
++		cancel_work_sync(&blob_scan_cleanup);
+ 		esp_wifi_deinit_internal();
+ 	}
+ 	esp_wifi_deinit(&hw->adapter);
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_cmd.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_cmd.c
+@@ -654,6 +654,14 @@
+ 
+ 	esp_info("Connection status: %d\n", event->header.status);
+ 
++#ifdef CONFIG_ESP32_WIFI_BLOB
++	/* Native callbacks forward rejected responses too, so cfg80211
++	 * can report the actual AP status. A fixed assoc response needs
++	 * a 24-byte MAC header and six-byte body before status is read.
++	 */
++	if (le16_to_cpu(event->frame_len) < 30)
++		return;
++#endif
+ 	memcpy(mac, event->bssid, MAC_ADDR_LEN);
+ 	priv->rssi = event->rssi;
+ 
+@@ -670,6 +678,10 @@
+ 	}
+ #endif
+ 
++#ifdef CONFIG_ESP32_WIFI_BLOB
++	if (get_unaligned_le16(event->frame + 26))
++		return;
++#endif
+ 	esp_port_open(priv);
+ }
+ 

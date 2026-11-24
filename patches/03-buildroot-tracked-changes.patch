@@ -2,10 +2,9 @@ diff --git a/board/espressif/esp32s3/rootfs_overlay/etc/inetd.conf b/board/espre
 index 6a86f988b1..755e1cbef3 100644
 --- a/board/espressif/esp32s3/rootfs_overlay/etc/inetd.conf
 +++ b/board/espressif/esp32s3/rootfs_overlay/etc/inetd.conf
-@@ -1 +1,2 @@
+@@ -1 +1 @@
 -ssh     stream  tcp     nowait  root    /usr/sbin/dropbear      dropbear -i -B
 +#ssh     stream  tcp     nowait  root    /usr/sbin/dropbear      dropbear -i -R -I 600
-+#telnet  stream  tcp     nowait  root    /usr/sbin/telnetd       telnetd -i
 diff --git a/board/espressif/esp32s3/rootfs_overlay/etc/wpa_supplicant.conf.example b/board/espressif/esp32s3/rootfs_overlay/etc/wpa_supplicant.conf.example
 index f49bd3d1a8..bc164ab136 100644
 --- a/board/espressif/esp32s3/rootfs_overlay/etc/wpa_supplicant.conf.example
@@ -24,16 +23,17 @@ new file mode 100644
 index 0000000000..2701fe7385
 --- /dev/null
 +++ b/board/espressif/esp32s3/rootfs_overlay/home/README.txt
-@@ -0,0 +1,9 @@
-+If you can read this file, the /home partition did NOT mount.
+@@ -0,0 +1,10 @@
++/home is on the read-only rootfs. There is no separate home partition and
++nothing is mounted over this directory, so files written here do not survive
++a reboot -- and on a cramfs they cannot be written at all.
 +
-+This copy lives on the read-only cramfs and is normally hidden by the jffs2
-+"home" partition mounted over it (see /etc/fstab). Seeing it means the mount
-+failed, so nothing written to /home will survive a reboot.
++That is deliberate. A writable /home needs a flash-write path, and this port
++gives the whole flash to Linux read-only so that core 0 can be handed to the
++kernel instead of staying behind to serve writes.
 +
-+Check:  dmesg | grep -i jffs2
-+        cat /proc/mtd          (a "home" partition should be listed)
-+        mount | grep home
++Put anything that must persist in the rootfs image, or in /tmp for the
++length of a boot.
 diff --git a/board/espressif/esp32s3/rootfs_overlay/root/README.txt b/board/espressif/esp32s3/rootfs_overlay/root/README.txt
 new file mode 100644
 index 0000000000..c1ec921a14
@@ -65,7 +65,7 @@ new file mode 100755
 index 0000000000..9a01b69374
 --- /dev/null
 +++ b/board/espressif/esp32s3/setup-home.sh
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,22 @@
 +#! /bin/sh
 +#
 +# Point root at /home/root instead of /root. Done here rather than in the
@@ -76,7 +76,9 @@ index 0000000000..9a01b69374
 +
 +set -e
 +
-+chmod 0755 "$1/etc/init.d/S05home"
++# S05home used to be chmod'd here. It is gone: /home is part of the
++# read-only rootfs now, so there is no separate filesystem to mount and
++# nothing for that script to check.
 +chmod 0755 "$1/usr/bin/wifi"
 +
 +sed -i 's|^root:\([^:]*\):0:0:\([^:]*\):/root:|root:\1:0:0:\2:/home/root:|' \
@@ -86,20 +88,6 @@ index 0000000000..9a01b69374
 +	echo "setup-home.sh: failed to repoint root's home in /etc/passwd" >&2
 +	exit 1
 +}
-diff --git a/configs/esp32s3_devkit_c1_8m_defconfig b/configs/esp32s3_devkit_c1_8m_defconfig
-index 91ec9aa32c..1a75b5f1ae 100644
---- a/configs/esp32s3_devkit_c1_8m_defconfig
-+++ b/configs/esp32s3_devkit_c1_8m_defconfig
-@@ -29,6 +29,9 @@ BR2_PACKAGE_DROPBEAR=y
- BR2_PACKAGE_IW=y
- BR2_PACKAGE_WIRELESS_REGDB=y
- BR2_PACKAGE_WPA_SUPPLICANT=y
-+# hostapd needs real fork() (os_unix.c); this target's uclibc-fdpic is NOMMU
-+# and does not declare it, so hostapd cannot be built here. The SoftAP is
-+# started directly by the ESP32 firmware instead (fixed SSID, no hostapd).
- # BR2_PACKAGE_URANDOM_SCRIPTS is not set
- BR2_TARGET_ROOTFS_CRAMFS=y
- BR2_TARGET_ROOTFS_CRAMFS_XIP=y
 diff --git a/linux/linux.mk b/linux/linux.mk
 index 16d9f194..abbef47b 100644
 --- a/linux/linux.mk
@@ -144,3 +132,53 @@ index 3661cbf5bd..014f5143d8 100644
  LIBCURL_DEPENDENCIES += mbedtls
  else
  LIBCURL_CONF_OPTS += --without-mbedtls
+diff --git a/board/espressif/esp32s3/post-build.sh b/board/espressif/esp32s3/post-build.sh
+--- a/board/espressif/esp32s3/post-build.sh
++++ b/board/espressif/esp32s3/post-build.sh
+@@ -1,3 +1,21 @@
+ #! /bin/sh
+ 
+-mv "$1/rootfs.jffs2" "$1/etc.jffs2"
++# The jffs2 image is no longer renamed to etc.jffs2.
++#
++# It used to become the /etc partition: a small writable filesystem holding
++# accounts, network configuration and the dropbear host keys, separate from
++# the read-only cramfs root. This port has no use for it. Wi-Fi is parked,
++# so wpa_supplicant.conf is moot; nothing on the board changes accounts; and
++# a writable /etc is the one thing that forces core 0 to stay alive serving
++# flash writes over the IPC, which is incompatible with giving core 0 to
++# Linux.
++#
++# /etc and /home are both in the cramfs already -- buildroot's target rootfs
++# contains them, and mkfs-etc.sh used to carve /etc back out into its own
++# image. With the jffs2 image left alone it is simply an unused artifact, and
++# etc.jffs2 is never produced.
++#
++# Leaving the rename out rather than deleting the file: buildroot invokes
++# every script in BR2_ROOTFS_POST_BUILD_SCRIPT, and a missing one is an
++# error.
++:
+diff --git a/board/espressif/esp32s3/mkfs-etc.sh b/board/espressif/esp32s3/mkfs-etc.sh
+--- a/board/espressif/esp32s3/mkfs-etc.sh
++++ b/board/espressif/esp32s3/mkfs-etc.sh
+@@ -1,7 +1,15 @@
+ #! /bin/sh
+ 
+-echo "$1" | grep -q 'jffs2/target$' || exit 0
+-echo 'Trimming jffs2 image to the contents of /etc'
+-find "$1" -mindepth 1 -maxdepth 1 -not -name 'etc' -print0 | xargs -0 rm -rf
+-mv "$1/etc/"* "$1"
+-rm -rf "$1/etc"
++# This used to strip the jffs2 target down to just /etc, so the resulting
++# image could be written to the etc partition. There is no etc partition any
++# more -- /etc comes from the read-only cramfs -- so the trim is gone.
++#
++# It is left as a no-op rather than deleted because buildroot runs every
++# script named in BR2_ROOTFS_POST_BUILD_SCRIPT and fails on a missing one.
++# The jffs2 rootfs is still built (BR2_TARGET_ROOTFS_JFFS2 is still set) and
++# is simply not used by anything.
++#
++# If the jffs2 image is ever wanted again, note that the original also
++# depended on $1 ending in jffs2/target, which is how it avoided running
++# against the cramfs target.
++:

@@ -3,7 +3,7 @@ set -euo pipefail
 task_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd -- "$task_dir/../../.." && pwd)
 build_dir="$repo_dir/../refs/esp32-linux-build/build"
-source_dir="$build_dir/build-buildroot-esp32s3_devkit_c1_16m/build/linux-7.2.4"
+source_dir="$build_dir/build-buildroot-arduino_nano_esp32/build/linux-7.2.4"
 kernel_dir="$task_dir/../out/linux-fork"
 prefix="$build_dir/crosstool-NG/builds/xtensa-esp32s3-linux-uclibcfdpic/bin/xtensa-esp32s3-linux-uclibcfdpic-"
 export XTENSA_GNU_CONFIG="$build_dir/xtensa-dynconfig/esp32s3.so"
@@ -11,7 +11,7 @@ if [[ ! -e "$kernel_dir" ]]; then
     # The copy inherits buildroot's config and patches: a stale buildroot
     # tree gives a stale copy, and deleting the copy does not fix that.
     if ! python3 "$task_dir/check-kernel-config.py" \
-            "$repo_dir/new-files/board/espressif/esp32s3/devkit_c1_16m_linux.config" \
+            "$repo_dir/new-files/board/espressif/esp32s3/nano_esp32_linux.config" \
             "$source_dir/.config" >/dev/null 2>&1; then
         echo "build-kernel.sh: buildroot's kernel tree predates the board config:" >&2
         echo "  $source_dir" >&2
@@ -26,7 +26,7 @@ cd -- "$kernel_dir"
 # $kernel_dir/firmware; buildroot has already installed them into the target.
 mkdir -p firmware
 for blob in regulatory.db regulatory.db.p7s; do
-    src="$build_dir/build-buildroot-esp32s3_devkit_c1_16m/target/lib/firmware/$blob"
+    src="$build_dir/build-buildroot-arduino_nano_esp32/target/lib/firmware/$blob"
     if [[ -f "$src" ]]; then
         cp -f "$src" "firmware/$blob"
     else
@@ -40,9 +40,13 @@ else
     patch --batch --forward --dry-run -p1 < "$task_dir/kernel.patch"
     patch --batch --forward -p1 < "$task_dir/kernel.patch"
 fi
+if [[ "${FORK_CONFIGURE_ONLY:-0}" == 1 ]]; then
+    echo "Fork base sources ready; caller must apply the remaining fork patches before building."
+    exit 0
+fi
 scripts/config --enable XTENSA_NOMMU_FORK --set-str LOCALVERSION '-forkbank'
 make ARCH=xtensa CROSS_COMPILE="$prefix" olddefconfig
-python3 "$task_dir/check-kernel-config.py" \
-    "$repo_dir/new-files/board/espressif/esp32s3/devkit_c1_16m_linux.config" .config
+python3 "$task_dir/check-kernel-config.py" --require-fork \
+    "$repo_dir/new-files/board/espressif/esp32s3/nano_esp32_linux.config" .config
 make -j8 ARCH=xtensa CROSS_COMPILE="$prefix" xipImage 2>&1 | tee "$task_dir/../out/fork-kernel-build.log"
 echo "Built only. Original source tree, images and board unchanged."

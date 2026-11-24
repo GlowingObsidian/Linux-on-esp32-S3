@@ -1,0 +1,91 @@
+From: Shreyan Dey <shreyan@example.com>
+Subject: [PATCH] mm: nommu: optionally reclaim duplicate executable cache
+
+Disk-backed private text is copied into contiguous RAM on NOMMU. On small
+systems, retaining its clean source cache wastes RAM and fragments later
+exec allocations. Add an opt-in clean-cache reclaim policy after successful
+copy, and allow bounded reclaim retries for costly immutable text mappings.
+Direct/XIP, writable, shared and anonymous mappings retain existing behavior.
+
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -919,6 +919,17 @@
+ /*
+  * set up a private mapping or an anonymous shared mapping
+  */
++/* Copied immutable text already has its resident executable copy. On small
++ * NOMMU systems retain that shareable region, rather than duplicate clean
++ * file-cache pages. Direct/XIP mappings never enter this copying path.
++ */
++static bool nommu_reclaim_exec_cache(const struct vm_area_struct *vma)
++{
++	return IS_ENABLED(CONFIG_NOMMU_EXEC_DROP_FILE_CACHE) && vma->vm_file &&
++	       (vma->vm_flags & VM_EXEC) &&
++	       !(vma->vm_flags & (VM_WRITE | VM_SHARED));
++}
++
+ static int do_mmap_private(struct vm_area_struct *vma,
+ 			   struct vm_region *region,
+ 			   unsigned long len,
+@@ -927,6 +938,7 @@
+ 	unsigned long total, point;
+ 	void *base;
+ 	int ret, order;
++	gfp_t gfp = GFP_KERNEL;
+ 
+ 	/*
+ 	 * Invoke the file's mapping function so that it can keep track of
+@@ -964,7 +976,9 @@
+ 	if (sysctl_nr_trim_pages && total - point >= sysctl_nr_trim_pages)
+ 		total = point;
+ 
+-	base = alloc_pages_exact(total << PAGE_SHIFT, GFP_KERNEL);
++	if (nommu_reclaim_exec_cache(vma) && order > PAGE_ALLOC_COSTLY_ORDER)
++		gfp |= __GFP_RETRY_MAYFAIL;
++	base = alloc_pages_exact(total << PAGE_SHIFT, gfp);
+ 	if (!base)
+ 		goto enomem;
+ 
+@@ -994,6 +1008,15 @@
+ 		if (ret < len)
+ 			memset(base + ret, 0, len - ret);
+ 
++		if (nommu_reclaim_exec_cache(vma)) {
++			/* Best effort only: never discard dirty, locked or mapped
++			 * pages. Finish the copy before releasing its source cache.
++			 */
++			lru_add_drain();
++			invalidate_mapping_pages(vma->vm_file->f_mapping,
++				vma->vm_pgoff,
++				vma->vm_pgoff + ((len - 1) >> PAGE_SHIFT));
++		}
+ 	} else {
+ 		vma_set_anonymous(vma);
+ 	}
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -790,6 +790,24 @@
+ 	depends on MEMORY_FAILURE && DEBUG_KERNEL && PROC_FS
+ 	select PROC_PAGE_MONITOR
+ 
++config NOMMU_EXEC_DROP_FILE_CACHE
++	bool "Reclaim duplicate file cache after copying executable text"
++	depends on !MMU
++	help
++	  Private read-only executable mappings on disk-backed filesystems are
++	  copied into contiguous RAM on NOMMU systems. Keeping their original
++	  file-cache pages as well can consume scarce RAM and fragment later
++	  executable allocations. Reclaim clean, unlocked cache pages for the
++	  copied range after a successful read. Dirty or busy pages are skipped.
++
++	  Also allow bounded reclaim retries for costly read-only executable
++	  allocations. Failure is still returned as ENOMEM, without requesting
++	  indefinite retries or invoking the OOM killer directly.
++
++	  This does not affect direct/XIP mappings, anonymous memory, shared
++	  mappings, or writable executable mappings. It can increase file I/O
++	  when executable bytes are read again rather than using a shared copy.
++
+ config NOMMU_INITIAL_TRIM_EXCESS
+ 	int "Turn on mmap() excess space trimming before booting"
+ 	depends on !MMU

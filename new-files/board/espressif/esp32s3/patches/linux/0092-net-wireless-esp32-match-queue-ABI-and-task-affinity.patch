@@ -1,0 +1,130 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -1138,7 +1138,7 @@
+ 	q = kzalloc(sizeof(*q), GFP_KERNEL);
+ 	if (!q)
+ 		return NULL;
+-	q->buf = kzalloc((size_t)queue_len * item_size, GFP_KERNEL);
++	q->buf = kcalloc(queue_len, item_size, GFP_KERNEL);
+ 	if (!q->buf) {
+ 		kfree(q);
+ 		return NULL;
+@@ -1155,13 +1155,6 @@
+ 	return osi_queue_create_common(queue_len, item_size);
+ }
+ 
+-static void *osi_wifi_create_queue(int queue_len, int item_size)
+-{
+-	if (queue_len <= 0 || item_size <= 0)
+-		return NULL;
+-	return osi_queue_create_common((uint32_t)queue_len, (uint32_t)item_size);
+-}
+-
+ static void osi_queue_delete(void *queue)
+ {
+ 	struct osi_queue *q = queue;
+@@ -1170,6 +1163,41 @@
+ 		return;
+ 	kfree(q->buf);
+ 	kfree(q);
++}
++
++/* IDF wifi_static_queue_t ABI: libpp unwraps handle at offset zero.
++ * Ordinary _queue_create callers still receive the raw Linux queue.
++ */
++struct osi_wifi_queue {
++	void *handle;
++	void *storage;
++};
++
++static void *osi_wifi_create_queue(int queue_len, int item_size)
++{
++	struct osi_wifi_queue *queue;
++
++	if (queue_len <= 0 || item_size <= 0)
++		return NULL;
++	queue = kzalloc(sizeof(*queue), GFP_KERNEL);
++	if (!queue)
++		return NULL;
++	queue->handle = osi_queue_create_common(queue_len, item_size);
++	if (!queue->handle) {
++		kfree(queue);
++		return NULL;
++	}
++	return queue;
++}
++
++static void osi_wifi_delete_queue(void *opaque)
++{
++	struct osi_wifi_queue *queue = opaque;
++
++	if (!queue)
++		return;
++	osi_queue_delete(queue->handle);
++	kfree(queue);
+ }
+ 
+ static int osi_queue_put(struct osi_queue *q, void *item, bool front)
+@@ -1541,11 +1569,17 @@
+ /* blob reads as failure on the success path.                          */
+ static int32_t osi_task_create_common(void *task_func, const char *name,
+ 				      uint32_t stack_depth, void *param,
+-				      uint32_t prio, void *task_handle)
++				      uint32_t prio, void *task_handle,
++				      uint32_t core_id)
+ {
+ 	struct osi_task *t;
+ 	struct task_struct *tsk;
+ 
++	/* Match NuttX: an out-of-range core denotes no affinity. */
++	if (core_id < nr_cpu_ids && !cpu_online(core_id))
++		return 0;
++	if (task_handle)
++		*(void **)task_handle = NULL;
+ 	t = kzalloc(sizeof(*t), GFP_KERNEL);
+ 	if (!t)
+ 		return 0;		/* pdFAIL */
+@@ -1569,10 +1603,12 @@
+ 	 */
+ 	if (prio)
+ 		set_user_nice(tsk, -10);
+-	wake_up_process(tsk);
+-
++	if (core_id < nr_cpu_ids)
++		kthread_bind(tsk, core_id);
++	/* The new task may inspect its handle immediately after wakeup. */
+ 	if (task_handle)
+ 		*(void **)task_handle = t;
++	wake_up_process(tsk);
+ 	osi_note("task created");
+ 	return 1;			/* pdPASS */
+ }
+@@ -1582,7 +1618,7 @@
+ 			       uint32_t prio, void *task_handle)
+ {
+ 	return osi_task_create_common(task_func, name, stack_depth, param,
+-				      prio, task_handle);
++				      prio, task_handle, ~0U);
+ }
+ 
+ static int32_t osi_task_create_pinned_to_core(void *task_func, const char *name,
+@@ -1590,9 +1626,8 @@
+ 					      uint32_t prio, void *task_handle,
+ 					      uint32_t core_id)
+ {
+-	/* One core. The pin is honoured by ignoring it. */
+ 	return osi_task_create_common(task_func, name, stack_depth, param,
+-				      prio, task_handle);
++				      prio, task_handle, core_id);
+ }
+ 
+ /* IDF binds this slot straight to vTaskDelete, which never blocks on  */
+@@ -3201,7 +3236,7 @@
+ 	._wifi_calloc = osi_calloc,
+ 	._wifi_zalloc = osi_zalloc,
+ 	._wifi_create_queue = osi_wifi_create_queue,
+-	._wifi_delete_queue = osi_queue_delete,
++	._wifi_delete_queue = osi_wifi_delete_queue,
+ 	._coex_init = osi_coex_init,
+ 	._coex_deinit = osi_coex_deinit,
+ 	._coex_enable = osi_coex_enable,

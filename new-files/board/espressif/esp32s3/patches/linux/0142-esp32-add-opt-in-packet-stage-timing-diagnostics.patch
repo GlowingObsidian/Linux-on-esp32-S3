@@ -1,0 +1,161 @@
+Subject: [PATCH] esp32: add opt-in packet-stage timing diagnostics
+
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -684,6 +684,100 @@
+ };
+ module_param_cb(stats, &wifi_stats_ops, NULL, 0444);
+ 
++/* Opt-in packet-stage measurements. Snapshot under one IRQ-safe lock so
++ * 64-bit totals remain coherent on this 32-bit SMP target. No per-packet log.
++ */
++enum wifi_time_kind {
++	WIFI_TIME_TX_QUEUE, WIFI_TIME_TX_API, WIFI_TIME_TX_RETRY,
++	WIFI_TIME_RX_COPY, WIFI_TIME_COUNT
++};
++struct wifi_time_sample {
++	u64 count, total_us, max_us, ge_1ms, ge_10ms, ge_100ms;
++};
++static bool wifi_timing_enabled;
++static DEFINE_SPINLOCK(wifi_time_lock);
++static struct wifi_time_sample wifi_times[WIFI_TIME_COUNT];
++module_param_named(timing_enabled, wifi_timing_enabled, bool, 0644);
++
++static u64 wifi_time_start(void)
++{
++	return READ_ONCE(wifi_timing_enabled) ? ktime_get_ns() : 0;
++}
++
++static void wifi_time_record(enum wifi_time_kind kind, u64 start)
++{
++	struct wifi_time_sample *sample;
++	unsigned long flags;
++	u64 us;
++
++	if (!start)
++		return;
++	us = div_u64(ktime_get_ns() - start, 1000);
++	spin_lock_irqsave(&wifi_time_lock, flags);
++	sample = &wifi_times[kind];
++	sample->count++;
++	sample->total_us += us;
++	if (us > sample->max_us)
++		sample->max_us = us;
++	sample->ge_1ms += us >= 1000;
++	sample->ge_10ms += us >= 10000;
++	sample->ge_100ms += us >= 100000;
++	spin_unlock_irqrestore(&wifi_time_lock, flags);
++}
++
++/* Transport owns cb after successful admission. Preserve esp_skb_cb at its
++ * beginning; only the last eight bytes carry the optional queue timestamp.
++ * memcpy avoids imposing a new 64-bit alignment requirement on cb.
++ */
++static void wifi_time_enqueue(struct sk_buff *skb)
++{
++	u64 start = wifi_time_start();
++
++	BUILD_BUG_ON(sizeof(struct esp_skb_cb) + sizeof(start) > sizeof(skb->cb));
++	memcpy(skb->cb + sizeof(skb->cb) - sizeof(start), &start, sizeof(start));
++}
++
++static void wifi_time_dequeue(struct sk_buff *skb)
++{
++	u64 start;
++
++	memcpy(&start, skb->cb + sizeof(skb->cb) - sizeof(start), sizeof(start));
++	wifi_time_record(WIFI_TIME_TX_QUEUE, start);
++}
++
++static int wifi_timing_get(char *buffer, const struct kernel_param *kp)
++{
++	static const char * const names[] = {
++		"tx_queue", "tx_api", "tx_retry_wait", "rx_copy"
++	};
++	struct wifi_time_sample samples[WIFI_TIME_COUNT];
++	unsigned long flags;
++	int i, len;
++
++	(void)kp;
++	spin_lock_irqsave(&wifi_time_lock, flags);
++	memcpy(samples, wifi_times, sizeof(samples));
++	spin_unlock_irqrestore(&wifi_time_lock, flags);
++	len = scnprintf(buffer, PAGE_SIZE, "enabled=%u jiffy_us=%u\n",
++		READ_ONCE(wifi_timing_enabled), (unsigned int)(USEC_PER_SEC / HZ));
++	for (i = 0; i < WIFI_TIME_COUNT; i++) {
++		struct wifi_time_sample *v = &samples[i];
++
++		len += scnprintf(buffer + len, PAGE_SIZE - len,
++			"%s count=%llu total_us=%llu max_us=%llu ge_1ms=%llu ge_10ms=%llu ge_100ms=%llu\n",
++			names[i], (unsigned long long)v->count,
++			(unsigned long long)v->total_us, (unsigned long long)v->max_us,
++			(unsigned long long)v->ge_1ms, (unsigned long long)v->ge_10ms,
++			(unsigned long long)v->ge_100ms);
++	}
++	return len;
++}
++static const struct kernel_param_ops wifi_timing_ops = {
++	.get = wifi_timing_get,
++};
++module_param_cb(timing, &wifi_timing_ops, NULL, 0444);
++
++
+ /* ------------------------------------------------------------------ */
+ /* Mutexes. The blob's mutexes are recursive, because the Wi-Fi code    */
+ /* takes the same lock from nested paths. Linux's are not, so a        */
+@@ -3422,8 +3516,11 @@
+  */
+ static int blob_rx_cb(void *buf, u16 len, void *eb)
+ {
++	u64 started = wifi_time_start();
++
+ 	if (buf && len >= ETH_HLEN && len <= 2304)
+ 		blob_queue_packet(g_blob, PACKET_TYPE_DATA, buf, len);
++	wifi_time_record(WIFI_TIME_RX_COPY, started);
+ 	if (eb)
+ 		esp_wifi_internal_free_rx_buffer(eb);
+ 	return 0;
+@@ -4346,6 +4443,7 @@
+ 	unsigned long deadline;
+ 	int sequence;
+ 	int ret;
++	u64 started;
+ 
+ 	if (!skb || !skb->data || skb->len < sizeof(*hdr)) {
+ 		if (skb)
+@@ -4413,15 +4511,19 @@
+ 		}
+ 		sequence = atomic_read(&wifi_tx_done);
+ 		atomic_inc(&wifi_tx_calls);
++		started = wifi_time_start();
+ 		ret = esp_wifi_internal_tx(NULL, skb->data, skb->len);
++		wifi_time_record(WIFI_TIME_TX_API, started);
+ 		if (ret == 0x101)
+ 			atomic_inc(&wifi_tx_no_mem);
+ 		if (ret != 0x101 || time_after_eq(jiffies, deadline))
+ 			break;
++		started = wifi_time_start();
+ 		wait_event_timeout(hw->tx_wait,
+ 			READ_ONCE(hw->tx_stopping) ||
+ 			atomic_read(&wifi_tx_done) != sequence,
+ 			msecs_to_jiffies(2));
++		wifi_time_record(WIFI_TIME_TX_RETRY, started);
+ 	}
+ 	if (ret)
+ 		atomic_inc(&wifi_tx_failed);
+@@ -4448,6 +4550,7 @@
+ 	while ((skb = skb_dequeue(&hw->tx_q))) {
+ 		data = ((struct esp_payload_header *)skb->data)->packet_type !=
+ 			PACKET_TYPE_COMMAND_REQUEST;
++		wifi_time_dequeue(skb);
+ 		ret = blob_process_packet(&hw->adapter, skb);
+ 		if (data) {
+ 			spin_lock_irqsave(&hw->tx_q.lock, flags);
+@@ -4497,6 +4600,7 @@
+ 		atomic_inc(&wifi_tx_queue_full);
+ 		ret = -ENOBUFS;
+ 	} else {
++		wifi_time_enqueue(skb);
+ 		__skb_queue_tail(&hw->tx_q, skb);
+ 		if (header->packet_type != PACKET_TYPE_COMMAND_REQUEST) {
+ 			hw->tx_data_pending++;

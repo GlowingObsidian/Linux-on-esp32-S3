@@ -1,0 +1,318 @@
+nommu-bank: preserve fork isolation with per-family SMP placement
+
+Serialize bank metadata and shared cache-MMU transactions across CPUs.
+Confine bank siblings to one CPU until exec installs an independent mm.
+CPU hotplug remains unsupported for bank families.
+
+diff --git a/arch/xtensa/Kconfig b/arch/xtensa/Kconfig
+--- a/arch/xtensa/Kconfig
++++ b/arch/xtensa/Kconfig
+@@ -473,7 +473,8 @@
+ 
+ config XTENSA_NOMMU_FORK
+ 	bool "Experimental NOMMU fork memory banks"
+-	depends on XTENSA_PLATFORM_ESP32 && !MMU && !SMP
++	depends on XTENSA_PLATFORM_ESP32 && !MMU
++	depends on !SMP || (XTENSA_SMP_ESP32 && !HOTPLUG_CPU)
+ 	help
+ 	  Duplicate private user memory into page-sized software banks and
+ 	  restore it on context switches. This is experimental, not memory
+diff --git a/arch/xtensa/include/asm/nommu_context.h b/arch/xtensa/include/asm/nommu_context.h
+--- a/arch/xtensa/include/asm/nommu_context.h
++++ b/arch/xtensa/include/asm/nommu_context.h
+@@ -17,6 +17,10 @@
+ static inline int init_new_context(struct task_struct *tsk, struct mm_struct *mm)
+ {
+ 	INIT_LIST_HEAD(&mm->context.nommu_banks);
++	mm->context.bank_switch_pending = 0;
++#ifdef CONFIG_SMP
++	mm->context.bank_cpu = 0;
++#endif
+ 	return 0;
+ }
+ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+@@ -38,6 +42,13 @@
+ 		nommu_bank_switch(mm);
+ 	}
+ }
++#ifdef CONFIG_SMP
++struct cpumask;
++struct task_struct;
++const struct cpumask *xtensa_nommu_task_cpus(struct task_struct *task);
++#define task_cpu_possible_mask(task) xtensa_nommu_task_cpus(task)
++#define task_cpu_fallback_mask(task) xtensa_nommu_task_cpus(task)
++#endif
+ #include <asm-generic/mmu_context.h>
+ #else
+ #include <asm-generic/nommu_context.h>
+diff --git a/arch/xtensa/include/asm/processor.h b/arch/xtensa/include/asm/processor.h
+--- a/arch/xtensa/include/asm/processor.h
++++ b/arch/xtensa/include/asm/processor.h
+@@ -150,11 +150,19 @@
+  */
+ #define SPILL_SLOT_CALL12(sp, reg) (*(((unsigned long *)(sp)) - 16 + (reg)))
+ 
++#if defined(CONFIG_XTENSA_NOMMU_FORK) && defined(CONFIG_SMP)
++void xtensa_nommu_exec(void);
++#define arch_setup_new_exec xtensa_nommu_exec
++#endif
++
+ struct thread_struct {
+ 
+ 	/* kernel's return address and stack pointer for context switching */
+ 	unsigned long ra; /* kernel's a0: return address and window call size */
+ 	unsigned long sp; /* kernel's a1: stack pointer */
++#if defined(CONFIG_XTENSA_NOMMU_FORK) && defined(CONFIG_SMP)
++	unsigned int nommu_bank_cpu; /* scheduler constraint: CPU + 1, or zero */
++#endif
+ 
+ #ifdef CONFIG_HAVE_HW_BREAKPOINT
+ 	struct perf_event *ptrace_bp[XCHAL_NUM_IBREAK];
+diff --git a/arch/xtensa/kernel/process.c b/arch/xtensa/kernel/process.c
+--- a/arch/xtensa/kernel/process.c
++++ b/arch/xtensa/kernel/process.c
+@@ -22,6 +22,7 @@
+ #include <linux/sched/task_stack.h>
+ #include <linux/kernel.h>
+ #include <linux/mm.h>
++#include <linux/mmu_context.h>
+ #include <linux/smp.h>
+ #include <linux/stddef.h>
+ #include <linux/unistd.h>
+@@ -201,6 +202,27 @@
+  * Flush thread state. This is called when a thread does an execve()
+  * Note that we flush coprocessor registers for the case execve fails.
+  */
++#if defined(CONFIG_XTENSA_NOMMU_FORK) && defined(CONFIG_SMP)
++/* Read the task field, not task->mm: affinity callers do not hold an mm ref. */
++const struct cpumask *xtensa_nommu_task_cpus(struct task_struct *task)
++{
++	unsigned int bank_cpu = READ_ONCE(task->thread.nommu_bank_cpu);
++
++	return bank_cpu ? cpumask_of(bank_cpu - 1) : cpu_possible_mask;
++}
++
++void xtensa_nommu_exec(void)
++{
++	/* exec installed an independent mm. Release the old family's constraint
++	 * and recover the user's affinity through the scheduler's compatibility API.
++	 */
++	if (current->thread.nommu_bank_cpu) {
++		WRITE_ONCE(current->thread.nommu_bank_cpu, 0);
++		relax_compatible_cpus_allowed_ptr(current);
++	}
++}
++#endif
++
+ void flush_thread(void)
+ {
+ #if XTENSA_HAVE_COPROCESSORS
+@@ -271,6 +293,21 @@
+ 	unsigned long usp_thread_fn = args->stack;
+ 	unsigned long tls = args->tls;
+ 	struct pt_regs *childregs = task_pt_regs(p);
++
++#if defined(CONFIG_XTENSA_NOMMU_FORK) && defined(CONFIG_SMP)
++	unsigned int bank_cpu = p->mm ? p->mm->context.bank_cpu : 0;
++	int ret;
++
++	/* dup_task_struct preceded the parent's first bank pin. Set the newborn
++	 * constraint and affinity again before wake_up_new_task can place it.
++	 */
++	p->thread.nommu_bank_cpu = bank_cpu;
++	if (bank_cpu) {
++		ret = set_cpus_allowed_ptr(p, cpumask_of(bank_cpu - 1));
++		if (ret)
++			return ret;
++	}
++#endif
+ 
+ #if (XTENSA_HAVE_COPROCESSORS || XTENSA_HAVE_IO_PORTS)
+ 	struct thread_info *ti;
+diff --git a/include/asm-generic/mmu.h b/include/asm-generic/mmu.h
+--- a/include/asm-generic/mmu.h
++++ b/include/asm-generic/mmu.h
+@@ -15,6 +15,9 @@
+ #ifdef CONFIG_XTENSA_NOMMU_FORK
+ 	struct list_head nommu_banks;
+ 	unsigned int bank_switch_pending;
++#ifdef CONFIG_SMP
++	unsigned int bank_cpu; /* zero: independent mm; otherwise CPU + 1 */
++#endif
+ #endif
+ 
+ #ifdef CONFIG_BINFMT_ELF_FDPIC
+diff --git a/mm/nommu-bank.inc b/mm/nommu-bank.inc
+--- a/mm/nommu-bank.inc
++++ b/mm/nommu-bank.inc
+@@ -1,7 +1,15 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+-/* Included by nommu.c: experimental UP, eager-copy fork backend. */
++/* Included by nommu.c: software bank fork backend; SMP serializes each bank family. */
+ #include <linux/sched/signal.h>
+ #include <linux/moduleparam.h>
++#include <linux/spinlock.h>
++
++/* CPU-local IRQ exclusion alone cannot protect shared metadata, remote /proc
++ * access or the shared cache-MMU transaction registers. Never allocate while
++ * holding this lock. Each executing bank family is also confined to one CPU:
++ * a lock around the swap cannot protect a sibling executing userspace.
++ */
++static DEFINE_RAW_SPINLOCK(nommu_bank_lock);
+ 
+ /* Successful forks are normal operation, not console diagnostics. */
+ static bool nommu_bank_trace;
+@@ -93,21 +101,20 @@
+ 
+ 	if (likely(!READ_ONCE(nommu_bank_orphan_count)))
+ 		return;
+-	local_irq_save(flags);
++	raw_spin_lock_irqsave(&nommu_bank_lock, flags);
+ 	n = nommu_bank_orphan_count;
+ 	for (i = 0; i < n; i++)
+ 		pages[i] = nommu_bank_orphans[i];
+ 	nommu_bank_orphan_count = 0;
+-	local_irq_restore(flags);
++	raw_spin_unlock_irqrestore(&nommu_bank_lock, flags);
+ 	for (i = 0; i < n; i++)
+ 		free_page((unsigned long)pages[i]);
+ }
+ 
+ static void bank_report_broken(const char *where)
+ {
+-	if (likely(!READ_ONCE(nommu_bank_broken)))
++	if (likely(!xchg(&nommu_bank_broken, false)))
+ 		return;
+-	WRITE_ONCE(nommu_bank_broken, false);
+ 	pr_err("nommu-bank: inconsistent bank state seen during a context switch, noticed in %s\n",
+ 	       where);
+ 	dump_stack();
+@@ -439,7 +446,12 @@
+ 	/* init_mm has no user banks and a zero-initialized context. */
+ 	if (!mm->context.nommu_banks.next)
+ 		return;
+-	preempt_disable();
++	/* Process context only: keep UART/timer/IPI service enabled during
++	 * word exchanges, as in the original interruptible bank switch. The
++	 * raw lock prevents scheduling and excludes remote bank access. Only
++	 * the short shared-MMU transaction below needs local IRQ exclusion.
++	 */
++	raw_spin_lock(&nommu_bank_lock);
+ 	started = get_ccount();
+ 	list_for_each_entry(bank, &mm->context.nommu_banks, link) {
+ 		struct vm_region *region = bank->region;
+@@ -484,7 +496,7 @@
+ 	nommu_bank_switch_last_cycles = get_ccount() - started;
+ 	if (nommu_bank_switch_last_cycles > nommu_bank_switch_max_cycles)
+ 		nommu_bank_switch_max_cycles = nommu_bank_switch_last_cycles;
+-	preempt_enable();
++	raw_spin_unlock(&nommu_bank_lock);
+ }
+ 
+ static void bank_detach(struct vm_area_struct *vma)
+@@ -497,7 +509,7 @@
+ 	bank_drain_orphans();
+ 	if (!bank)
+ 		return;
+-	local_irq_save(flags);
++	raw_spin_lock_irqsave(&nommu_bank_lock, flags);
+ 	list_del_init(&bank->link);
+ 	was_owner = bank->region->bank_owner == bank;
+ 	if (was_owner)
+@@ -510,8 +522,8 @@
+ 		 * it is now dead. Promote a sibling: restore its saved state and
+ 		 * hand back the pages it no longer needs, which is the same
+ 		 * invariant a switch maintains -- the resident owner holds none.
+-		 * UP only: free_page and kfree do not sleep here, and IRQ
+-		 * exclusion also covers the switch list and a concurrent clone.
++		 * The bank lock also excludes switches, remote accesses and clones.
++		 * Page release does not sleep; descriptor release follows unlock.
+ 		 */
+ 		if (was_owner) {
+ 			bank_exchange(heir);
+@@ -524,7 +536,7 @@
+ 		atomic_long_add(bank->count, &nommu_bank_recovered_pages);
+ 	}
+ 	vma->nommu_bank = NULL;
+-	local_irq_restore(flags);
++	raw_spin_unlock_irqrestore(&nommu_bank_lock, flags);
+ 	bank_free(bank);
+ }
+ 
+@@ -568,7 +580,7 @@
+ 			return -ENOMEM;
+ 		}
+ 	}
+-	local_irq_save(flags);
++	raw_spin_lock_irqsave(&nommu_bank_lock, flags);
+ 	/* One bank per region per mm. Two would make nommu_bank_switch() walk
+ 	 * the same region twice in one pass: the second visit swaps it back,
+ 	 * leaving the process on a stale snapshot with its live pages parked
+@@ -577,7 +589,7 @@
+ 	 */
+ 	list_for_each_entry(existing, &dst->vm_mm->context.nommu_banks, link) {
+ 		if (existing->region == region) {
+-			local_irq_restore(flags);
++			raw_spin_unlock_irqrestore(&nommu_bank_lock, flags);
+ 			bank_free(child);
+ 			if (fresh)
+ 				bank_free(parent);
+@@ -594,7 +606,7 @@
+ 	dst->nommu_bank = child;
+ 	list_add_tail(&child->siblings, &parent->siblings);
+ 	list_add_tail(&child->link, &dst->vm_mm->context.nommu_banks);
+-	local_irq_restore(flags);
++	raw_spin_unlock_irqrestore(&nommu_bank_lock, flags);
+ 	return 0;
+ }
+ 
+@@ -602,10 +614,10 @@
+ {
+ 	struct nommu_bank *bank;
+ 	unsigned long flags, pages = 0;
+-	local_irq_save(flags);
++	raw_spin_lock_irqsave(&nommu_bank_lock, flags);
+ 	list_for_each_entry(bank, &mm->context.nommu_banks, link)
+ 		pages += bank->count;
+-	local_irq_restore(flags);
++	raw_spin_unlock_irqrestore(&nommu_bank_lock, flags);
+ 	return pages;
+ }
+ 
+@@ -660,6 +672,19 @@
+ 			if (page_count(virt_to_page((void *)addr)) != 1)
+ 				return -EBUSY;
+ 	}
++#ifdef CONFIG_SMP
++	if (!oldmm->context.bank_cpu) {
++		unsigned int cpu = get_cpu();
++
++		WRITE_ONCE(current->thread.nommu_bank_cpu, cpu + 1);
++		put_cpu();
++		force_compatible_cpus_allowed_ptr(current);
++		if (WARN_ON_ONCE(!cpumask_equal(current->cpus_ptr, cpumask_of(cpu))))
++			return -EINVAL;
++		oldmm->context.bank_cpu = cpu + 1;
++	}
++	mm->context.bank_cpu = oldmm->context.bank_cpu;
++#endif
+ 	vma_iter_set(&src_iter, 0);
+ 	for_each_vma(src_iter, src) {
+ 		if (src->vm_flags & (VM_DONTCOPY | VM_WIPEONFORK))
+@@ -717,14 +742,14 @@
+ 		unsigned long chunk = min(len, PAGE_SIZE - offset_in_page(offset));
+ 		void *ptr;
+ 
+-		local_irq_save(flags);
++		raw_spin_lock_irqsave(&nommu_bank_lock, flags);
+ 		ptr = bank->region->bank_owner == bank ? (void *)addr :
+ 			bank->pages[offset >> PAGE_SHIFT] + offset_in_page(offset);
+ 		if (write)
+ 			memcpy(ptr, buf, chunk);
+ 		else
+ 			memcpy(buf, ptr, chunk);
+-		local_irq_restore(flags);
++		raw_spin_unlock_irqrestore(&nommu_bank_lock, flags);
+ 		addr += chunk;
+ 		buf += chunk;
+ 		len -= chunk;

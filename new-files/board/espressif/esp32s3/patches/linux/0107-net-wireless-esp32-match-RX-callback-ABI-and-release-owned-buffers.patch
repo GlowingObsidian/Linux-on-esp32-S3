@@ -1,0 +1,114 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -90,7 +90,9 @@
+ extern int esp_wifi_set_ps(int type);
+ extern int esp_wifi_stop(void);
+ extern int esp_wifi_set_mode(int mode);
+-extern int esp_wifi_internal_reg_rxcb(void *netif, void *fn);
++typedef int (*blob_wifi_rxcb_t)(void *buffer, u16 len, void *eb);
++extern int esp_wifi_internal_reg_rxcb(int ifx, blob_wifi_rxcb_t fn);
++extern void esp_wifi_internal_free_rx_buffer(void *eb);
+ extern int esp_wifi_internal_tx(void *netif, void *buf, u16 len);
+ 
+ /*
+@@ -3337,35 +3339,41 @@
+  * where the interface type and number are stamped, and it is what makes
+  * get_priv_from_payload_header() find the station interface.
+  */
+-static int blob_rx_cb(void *netif, void *buf, u16 len, void *eb)
+-{
+-	struct esp_wifi_blob *hw = g_blob;
++static int blob_queue_packet(struct esp_wifi_blob *hw, u8 type,
++			     const void *buf, u16 len)
++{
+ 	struct sk_buff *skb;
+ 	struct esp_payload_header *hdr;
+-	u16 total;
+-
+-	if (!hw)
+-		return -1;
+-
+-	total = len + sizeof(*hdr);
+-	skb = dev_alloc_skb(total + SKB_DATA_ADDR_ALIGNMENT);
+-	if (!skb) {
+-		pr_err("rx: dev_alloc_skb(%u) failed\n", total);
+-		return -1;
+-	}
++
++	if (!hw || !buf || !len || len > 4096)
++		return -EINVAL;
++	skb = dev_alloc_skb(sizeof(*hdr) + len + SKB_DATA_ADDR_ALIGNMENT);
++	if (!skb)
++		return -ENOMEM;
+ 	skb_reserve(skb, SKB_DATA_ADDR_ALIGNMENT);
+ 	hdr = skb_put(skb, sizeof(*hdr));
+ 	memset(hdr, 0, sizeof(*hdr));
+ 	hdr->if_type = ESP_STA_IF;
+ 	hdr->if_num = 0;
+-	hdr->flags = 0;
+ 	hdr->len = cpu_to_le16(len);
+ 	hdr->offset = cpu_to_le16(sizeof(*hdr));
+-	hdr->packet_type = PACKET_TYPE_DATA;
++	hdr->packet_type = type;
+ 	skb_put_data(skb, buf, len);
+-
+ 	skb_queue_tail(&hw->rx_q[PRIO_Q_HIGH], skb);
+ 	esp_process_new_packet_intr(&hw->adapter);
++	return 0;
++}
++
++/* Pinned wifi_rxcb_t has three arguments. After copying or dropping a
++ * frame we consume its eb exactly once and report successful ownership
++ * transfer; an allocation failure must not strand a hardware RX buffer.
++ */
++static int blob_rx_cb(void *buf, u16 len, void *eb)
++{
++	if (buf && len >= ETH_HLEN && len <= 2304)
++		blob_queue_packet(g_blob, PACKET_TYPE_DATA, buf, len);
++	if (eb)
++		esp_wifi_internal_free_rx_buffer(eb);
+ 	return 0;
+ }
+ 
+@@ -3459,31 +3467,7 @@
+  */
+ static int blob_post_event(struct esp_wifi_blob *hw, const void *body, u16 len)
+ {
+-	struct sk_buff *skb;
+-	struct esp_payload_header *hdr;
+-	u16 total = len + sizeof(*hdr);
+-
+-	skb = dev_alloc_skb(total + SKB_DATA_ADDR_ALIGNMENT);
+-	if (!skb) {
+-		pr_err("event: dev_alloc_skb(%u) failed\n", total);
+-		return -ENOMEM;
+-	}
+-	skb_reserve(skb, SKB_DATA_ADDR_ALIGNMENT);
+-
+-	hdr = skb_put(skb, sizeof(*hdr));
+-	memset(hdr, 0, sizeof(*hdr));
+-	hdr->if_type = ESP_STA_IF;
+-	hdr->if_num = 0;
+-	hdr->flags = 0;
+-	hdr->len = cpu_to_le16(len);
+-	hdr->offset = cpu_to_le16(sizeof(*hdr));
+-	hdr->packet_type = PACKET_TYPE_EVENT;
+-
+-	skb_put_data(skb, body, len);
+-
+-	skb_queue_tail(&hw->rx_q[PRIO_Q_HIGH], skb);
+-	esp_process_new_packet_intr(&hw->adapter);
+-	return 0;
++	return blob_queue_packet(hw, PACKET_TYPE_EVENT, body, len);
+ }
+ 
+ int esp_wifi_blob_event_post(const char *event_base, int32_t event_id,
+@@ -4361,7 +4345,7 @@
+ 	 * blob's first argument is the interface enum. Passing NULL is
+ 	 * correct here and only here.
+ 	 */
+-	ret = esp_wifi_internal_reg_rxcb(NULL, blob_rx_cb);
++	ret = esp_wifi_internal_reg_rxcb(0, blob_rx_cb);
+ 	if (ret) {
+ 		dev_err(hw->adapter.dev, "esp_wifi_internal_reg_rxcb: %d\n", ret);
+ 		goto err_blob_deinit;

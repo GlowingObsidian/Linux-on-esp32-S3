@@ -3,7 +3,7 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd -- "$script_dir/../.." && pwd)
 build_dir=${1:-"$repo_dir/../refs/esp32-linux-build/build"}
-host_dir="$build_dir/build-buildroot-esp32s3_devkit_c1_16m/host"
+host_dir="$build_dir/build-buildroot-arduino_nano_esp32/host"
 bash "$script_dir/build.sh" "$build_dir"
 bash "$script_dir/build-micropython.sh" "$build_dir"
 bash "$script_dir/test-host.sh"
@@ -40,7 +40,7 @@ install -m 644 "$script_dir/profile.sh" "$image_work/tree/etc/profile.d/history.
 "$host_dir/sbin/mkfs.jffs2" -l -e 65536 -U -f --pad=458752 \
     -d "$image_work/tree/etc" -o "$script_dir/out/etc-no-history.jffs2"
 rootfs_bytes=$(wc -c < "$script_dir/out/rootfs-probe.cramfs")
-if ((rootfs_bytes > 0x780000)); then
+if ((rootfs_bytes > 0x6f0000)); then
     echo "Experimental rootfs exceeds its partition; DO NOT FLASH." >&2
     exit 1
 fi

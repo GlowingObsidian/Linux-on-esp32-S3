@@ -1,0 +1,104 @@
+Subject: [PATCH] xtensa: avoid extra word reads in narrow-load emulation
+
+--- a/arch/xtensa/kernel/align.S
++++ b/arch/xtensa/kernel/align.S
+@@ -164,6 +164,55 @@
+  */
+ 
+ 	.literal_position
++
++/* Read only the aligned words needed by the decoded load. A byte/halfword
++ * in the final IROM word must not probe the next, unmapped flash window.
++ * a3 is aligned EXCVADDR, a8 is original EXCVADDR, a4 is the instruction.
++ * Preserve a0/a4/a7/a8; a5/a6 are scratch just as in the original sequence.
++ */
++	.macro load_required_words op0, user=0
++#if !XCHAL_HAVE_BE
++#if XCHAL_HAVE_DENSITY
++	_beqi	\op0, OP0_L32I_N, .Lrequired_word\@
++#endif
++	extui	a5, a4, INSN_OP1, 4
++	_beqz	a5, .Lrequired_single\@
++	_beqi	a5, OP1_L16UI, .Lrequired_half\@
++	addi	a6, a5, -OP1_L16SI
++	_beqz	a6, .Lrequired_half\@
++	beqi	a5, OP1_L32I, .Lrequired_word\@
++	j	.Linvalid_instruction
++.Lrequired_word\@:
++	extui	a5, a8, 0, 2
++	_beqz	a5, .Lrequired_single\@
++	j	.Lrequired_pair\@
++.Lrequired_half\@:
++	extui	a5, a8, 0, 2
++	bnei	a5, 3, .Lrequired_single\@
++.Lrequired_pair\@:
++#endif
++	.if \user
++	addi	a3, a3, 8
++	l32e	a5, a3, -8
++	l32e	a6, a3, -4
++	.else
++	l32i	a5, a3, 0
++	l32i	a6, a3, 4
++	.endif
++#if !XCHAL_HAVE_BE
++	j	.Lrequired_done\@
++.Lrequired_single\@:
++	.if \user
++	addi	a3, a3, 8
++	l32e	a5, a3, -8
++	.else
++	l32i	a5, a3, 0
++	.endif
++	movi	a6, 0
++.Lrequired_done\@:
++#endif
++	.endm
++
+ #ifdef CONFIG_XTENSA_LOAD_STORE
+ ENTRY(fast_load_store)
+ 
+@@ -194,20 +243,23 @@
+ 	access_ok a3, a5, a6, a2, .Linvalid_instruction
+ 1:
+ #endif
+-	l32i	a5, a3, 0
+-	l32i	a6, a3, 4
++	load_required_words a0
+ 	__src_b	a3, a5, a6		# a3 has the data word
+ 
+ #if XCHAL_HAVE_DENSITY
+ 	addi	a7, a7, 2		# increment PC (assume 16-bit insn)
+-	_beqi	a0, OP0_L32I_N, .Lload_w# l32i.n: jump
++	bnei	a0, OP0_L32I_N, .Lfast_nondense
++	j	.Lload_w
++.Lfast_nondense:
+ 	addi	a7, a7, 1
+ #else
+ 	addi	a7, a7, 3
+ #endif
+ 
+ 	extui	a5, a4, INSN_OP1, 4
+-	_beqi	a5, OP1_L32I, .Lload_w
++	bnei	a5, OP1_L32I, .Lfast_nonword
++	j	.Lload_w
++.Lfast_nonword:
+ 	bnei	a5, OP1_L8UI, .Lload16
+ 	extui	a3, a3, 0, 8
+ 	j	.Lload_w
+@@ -264,12 +316,9 @@
+ 
+ 	__ssa8	a8
+ #ifdef UNALIGNED_USER_EXCEPTION
+-	addi	a3, a3, 8
+-	l32e	a5, a3, -8
+-	l32e	a6, a3, -4
+-#else
+-	l32i	a5, a3, 0
+-	l32i	a6, a3, 4
++	load_required_words a5, 1
++#else
++	load_required_words a5
+ #endif
+ 	__src_b	a3, a5, a6		# a3 has the data word
+ 

@@ -1,0 +1,36 @@
+diff --git a/drivers/mtd/devices/esp32s3-flash-nor-ll.c b/drivers/mtd/devices/esp32s3-flash-nor-ll.c
+--- a/drivers/mtd/devices/esp32s3-flash-nor-ll.c
++++ b/drivers/mtd/devices/esp32s3-flash-nor-ll.c
+@@ -195,7 +195,7 @@
+ 		t->result = 0;
+ 		goto restore;
+ 	}
+-	if (t->jedec != 0xef4018U)
++	if (!FN_JEDEC_SUPPORTED(t->jedec))
+ 		goto restore;
+ 	if (t->operation == FN_READ) {
+ 		wr(SPI1 + 0x04, t->address);
+diff --git a/drivers/mtd/devices/esp32s3-flash-nor-main.inc b/drivers/mtd/devices/esp32s3-flash-nor-main.inc
+--- a/drivers/mtd/devices/esp32s3-flash-nor-main.inc
++++ b/drivers/mtd/devices/esp32s3-flash-nor-main.inc
+@@ -89,7 +89,7 @@
+ 		ret = -EIO;
+ 	if (!ret && op == FN_IDENTIFY) {
+ 		fg->nor_jedec = readl(&t->jedec);
+-		fg->nor_id_ok = fg->nor_jedec == 0xef4018;
++		fg->nor_id_ok = FN_JEDEC_SUPPORTED(fg->nor_jedec);
+ 	}
+ 	if (!ret && output)
+ 		memcpy_fromio(output, t->data, length);
+diff --git a/drivers/mtd/devices/esp32s3-flash-nor.h b/drivers/mtd/devices/esp32s3-flash-nor.h
+--- a/drivers/mtd/devices/esp32s3-flash-nor.h
++++ b/drivers/mtd/devices/esp32s3-flash-nor.h
+@@ -19,6 +19,8 @@
+ #define FN_READ 2U
+ #define FN_PROGRAM 3U
+ #define FN_ERASE 4U
++/* Identical 24-bit/256-byte/64-KiB command path in pinned IDF. */
++#define FN_JEDEC_SUPPORTED(id) ((id) == 0xef4018U || (id) == 0xc84018U)
+ 
+ /* Independent of kernel headers: the cache-off object uses call0 ABI. */
+ typedef __UINT32_TYPE__ fn_u32;

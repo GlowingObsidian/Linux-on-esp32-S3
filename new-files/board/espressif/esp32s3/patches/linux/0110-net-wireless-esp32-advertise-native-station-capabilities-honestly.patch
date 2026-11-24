@@ -1,0 +1,19 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_cfg80211.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_cfg80211.c
+@@ -736,12 +736,14 @@
+ 	wiphy->max_scan_ie_len = 1000;
+ 	wiphy->max_sched_scan_ssids = 10;
+ 	wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
+-#ifdef CONFIG_PM
++#if defined(CONFIG_PM) && !defined(CONFIG_ESP32_WIFI_BLOB)
+ 	wiphy->wowlan = &esp_wowlan_support;
+ #endif
+ 
+-	/* Advertise SAE support */
++#ifndef CONFIG_ESP32_WIFI_BLOB
++	/* Native station bridge currently implements open/WPA2-CCMP. */
+ 	wiphy->features |= NL80211_FEATURE_SAE;
++#endif
+ 
+ 	wiphy->reg_notifier = esp_reg_notifier;
+ 

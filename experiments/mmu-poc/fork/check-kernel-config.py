@@ -13,6 +13,7 @@ and neither is named in the seed, so neither is flagged. Naming either one in
 the seed would fail every build.
 """
 import re
+import argparse
 import sys
 from pathlib import Path
 
@@ -55,13 +56,24 @@ def show(value):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 3:
-        sys.exit('usage: check-kernel-config.py SEED BUILT')
-    found = compare(sys.argv[1], sys.argv[2])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--require-fork', action='store_true',
+                        help='reject a kernel incompatible with the forkbank rootfs')
+    parser.add_argument('seed')
+    parser.add_argument('built')
+    args = parser.parse_args()
+    found = compare(args.seed, args.built)
+    if args.require_fork:
+        built = statements(Path(args.built).read_text())
+        if built.get('CONFIG_XTENSA_NOMMU_FORK') != 'y':
+            print('Forkbank rootfs requires CONFIG_XTENSA_NOMMU_FORK=y. '
+                  'Kconfig may have disabled it because its dependencies are unmet; '
+                  'do not package or flash this kernel with libfork/Bash.', file=sys.stderr)
+            raise SystemExit(1)
     if not found:
-        print(f'{sys.argv[2]}: matches every statement in {sys.argv[1]}')
+        print(f'{args.built}: matches every statement in {args.seed}')
         raise SystemExit(0)
-    print(f'{sys.argv[2]} does not carry {len(found)} statement(s) from {sys.argv[1]}:',
+    print(f'{args.built} does not carry {len(found)} statement(s) from {args.seed}:',
           file=sys.stderr)
     for symbol, wanted, got in found:
         print(f'  {symbol}: seed says {show(wanted)}, built has {show(got)}', file=sys.stderr)

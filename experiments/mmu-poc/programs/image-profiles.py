@@ -15,8 +15,8 @@ OUT = EXP / 'out'
 PROGRAMS = OUT / 'programs'
 REPO = EXP.parent.parent
 BUILD = (REPO.parent / 'refs/esp32-linux-build/build').resolve()
-HOST = BUILD / 'build-buildroot-esp32s3_devkit_c1_16m/host'
-LIMIT = 0x780000
+HOST = BUILD / 'build-buildroot-arduino_nano_esp32/host'
+LIMIT = 0x6f0000
 PROFILES = {'all': ['bash', 'dash', 'make', 'micropython', 'socat'],
             'bash-red': ['bash', 'dash', 'make', 'socat'],
             'python-automatizacion': ['dash', 'make', 'micropython'], 'base': []}
@@ -25,7 +25,10 @@ PACKAGES = {
              'extras': ['usr/share/bash', 'usr/share/licenses/bash', 'usr/share/program-tests/bash-test.sh']},
     'dash': {'binary': 'usr/bin/dash', 'source': 'real-bins/dash-baseline',
              'extras': ['usr/share/licenses/dash', 'usr/share/fork-real/dash-test.sh']},
-    'make': {'binary': 'usr/bin/make', 'source': 'real-bins/make-lto',
+    # make-oz, not make-lto: the pinned compiler's LTO aborts under the make
+    # jobserver (see the note in build/container-build.sh). Must match the
+    # variant that stage builds, or pack() fails on a missing artifact.
+    'make': {'binary': 'usr/bin/make', 'source': 'real-bins/make-oz',
              'extras': ['usr/share/licenses/make', 'usr/share/fork-real/make-test.sh',
                         'usr/share/fork-real/peer.sh', 'usr/share/fork-real/Makefile.test']},
     'micropython': {'binary': 'usr/bin/micropython', 'source': 'programs/micropython-linux',
@@ -53,7 +56,8 @@ def pack(selected, output):
     if not base.is_file():
         raise SystemExit('Missing baseline image. Run make-image.sh/compact-image.sh first; see README.')
     sources = [OUT / PACKAGES[n]['source'] for n in selected]
-    sources += [PROGRAMS / name for name in ('busybox-with-netcat', 'process-test', 'programbench', 'jobq', 'dtach')]
+    sources += [PROGRAMS / name for name in ('busybox-with-netcat', 'process-test', 'programbench', 'jobq', 'dtach', 'lscpu')]
+    sources += [PROGRAMS / 'pthread-smp-test']
     missing = [str(p) for p in sources if not p.is_file()]
     if missing:
         raise SystemExit('Missing compiled artifacts (nothing flashed):\n' + '\n'.join(missing))
@@ -81,6 +85,10 @@ def pack(selected, output):
         for name in ('process-test', 'programbench', 'jobq'):
             install(PROGRAMS / name, tree / 'usr/bin' / name)
         install(HERE / 'user-shell', tree / 'usr/bin/user-shell')
+        install(OUT / 'fork-smp-test', tree / 'usr/bin/fork-smp-test')
+        install(PROGRAMS / 'lscpu', tree / 'usr/bin/lscpu')
+        install(PROGRAMS / 'pthread-smp-test', tree / 'usr/bin/pthread-smp-test')
+        install(PROGRAMS / 'util-linux-2.39.3/COPYING', tree / 'usr/share/licenses/lscpu/COPYING', 0o644)
         install(HERE / 'set-user-shell.sh', tree / 'usr/sbin/set-user-shell')
         board = REPO / 'new-files/board/espressif/esp32s3'
         overlay = board / 'rootfs_overlay'
@@ -90,15 +98,7 @@ def pack(selected, output):
             if not source.is_file():
                 continue
             relative = source.relative_to(overlay)
-            # /home is seeded by prepare-home.sh into the archive, not here.
-            if relative.parts[0] == 'home':
-                continue
             install(source, tree / relative, 0o755 if os.access(source, os.X_OK) else 0o644)
-        run('sh', board / 'prepare-home.sh', tree)
-        for directory, name in (('usr/bin', 'crontab'), ('usr/sbin', 'crond')):
-            path = tree / directory / name
-            remove(path)
-            path.symlink_to('../../bin/busybox')
         install(PROGRAMS / 'dtach', tree / 'usr/bin/dtach')
         install(PROGRAMS / 'dtach-b027c27b2439081064d07a86883c8e0b20a183c9/COPYING',
                 tree / 'usr/share/licenses/dtach/COPYING', 0o644)
@@ -191,7 +191,7 @@ def main():
                 else: commands.append((name, HERE / f'build-{name}.sh', None))
             for name, script, argument in commands:
                 subprocess.run(['bash', str(script)] + ([argument] if argument else []),
-                               env={**os.environ, 'OPT_VARIANT': 'baseline' if name in ('busybox', 'dash', 'micropython') else 'lto'}, check=True)
+                               env={**os.environ, 'OPT_VARIANT': 'baseline' if name in ('busybox', 'dash', 'micropython') else 'oz'}, check=True)
         pack(selected, output)
         print('Built and checked only. No flash, commit or push was performed.')
 

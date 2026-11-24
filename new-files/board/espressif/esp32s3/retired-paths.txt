@@ -1,0 +1,92 @@
+# Copyright (c) 2026 Paulneja. GPLv3, see LICENSE. https://github.com/paulneja/Linux-on-esp32-S3
+#
+# Paths this image used to carry and no longer does.
+#
+# Every stage of the cramfs chain that builds this image is add-only: it
+# extracts a tree, copies files into it and repacks. Nothing removes anything,
+# so a file deleted from rootfs_overlay/ stays in whatever image the stage
+# extracted, and ships anyway with the build reporting success. That has
+# happened three times -- usr/sbin/first-login, etc/motd.tagline and
+# devkit_c1_16m_linux.config all outlived their own removals that way, which is
+# the same failure new-files/toplevel/apply-local-changes.sh documents for the
+# Buildroot clone.
+#
+# So the removal is done at the last repack instead of being trusted to an
+# earlier stage, and every path named here is then asserted absent, making a
+# survivor a build failure rather than a file nobody notices. That is
+# build/package-final.py, which reads this file, deletes what it names from the
+# tree it is about to pack -- before /etc is written out to its own jffs2
+# partition, so a retired path under /etc is dropped from both -- and then
+# checks each one is gone.
+#
+# Write one path per line, relative to the rootfs root; a leading or trailing
+# slash is accepted and ignored. Blank lines and anything after a '#' are
+# ignored, so a path can carry a note. Add a line whenever something is deleted
+# from rootfs_overlay/ or from an image this project inherits.
+#
+# A directory is a path like any other: if it is a symlink or a file it is
+# unlinked, if it is a directory the whole tree under it goes. That matters for
+# anything Buildroot used to install and stopped -- it never removes a
+# directory a package no longer creates, so the empty tree sits in target/ and
+# is packed into the image even though nothing on this side ever added it.
+
+# The first-boot dialog asking whether to bring up SSH, telnet or nothing.
+# Removed on request: usr/sbin/remote-login is the one path to a remote shell
+# and the image does not need to ask which one to take.
+usr/sbin/first-login
+
+# The line printed under the login banner's art. The banner keeps the art, the
+# uname line and the Last login stamp; the facts the tagline introduced are
+# printed in full by neofetch, so a second copy of them was a second thing to
+# keep true.
+etc/motd.tagline
+
+# The art itself, and the tagline's reason for existing with it. Removed on
+# request: the kernel now draws the Arduino mark on the panel at boot, so the
+# splash no longer has to say which board this is in text. The banner prints
+# the system line, the licence notice and Last login, and nothing else.
+etc/motd.art
+
+# The USB Serial/JTAG console, and the service that made init reread inittab
+# for its getty. Both are dead once the OTG controller owns the SoC's only USB
+# PHY: the acm node is disabled, so ttyGS3 does not exist to log in on, and the
+# console is UART0 on D0/D1. The getty line inside inittab is not a path, so it
+# is not named here -- trim-target.sh drops it, which also cleans an inherited
+# inittab that still carries the script's commented placeholder.
+usr/sbin/usb-console
+etc/init.d/S47usbconsole
+
+# Cron. Nothing on the board installed a job and no service depended on it, so
+# it was removed on request: the two applets, the init script and the two
+# helpers that managed it. inetd stays -- SSH is reached through it.
+usr/sbin/crond
+usr/bin/crontab
+usr/sbin/cron-setup
+usr/sbin/cron-server
+etc/init.d/S50crond
+# The directory is listed as well as the files, because Buildroot creates it
+# from busybox.mk's BUSYBOX_INSTALL_CROND_SCRIPT and never removes it when
+# CONFIG_CROND goes off: the mkdir is inside the `grep -q CONFIG_CROND=y` test,
+# so nothing deletes /etc/cron/crontabs on a later build. It survives in
+# buildroot's target/ directory and is packed into the image as an empty tree.
+# /etc is also a jffs2 partition of its own, so it has to leave both.
+etc/cron
+# S50crond's master copy. prepare-home.sh installed it here and the init
+# script copied it into /etc/init.d on first boot; deleting the install line
+# left the file in target/ from the build before, the same way
+# usr/sbin/first-login outlived its own removal. Nothing reads it now --
+# cron-setup was its only consumer and cron-setup is gone.
+usr/share/esp32-cron
+
+# Telnet, both halves: the server sent the password in clear text and the
+# client was the only way to reach it. SSH is the one way in now. inetd stays.
+usr/sbin/telnetd
+usr/bin/telnet
+
+# Removed from this checkout's overlay when /etc and /home moved into rootfs.
+# Cached images must not retain scripts which try to mount the retired parts.
+etc/init.d/S03keepconfig
+etc/init.d/S05home
+etc/init.d/S06home-users
+usr/sbin/home-init
+usr/sbin/home-users-setup

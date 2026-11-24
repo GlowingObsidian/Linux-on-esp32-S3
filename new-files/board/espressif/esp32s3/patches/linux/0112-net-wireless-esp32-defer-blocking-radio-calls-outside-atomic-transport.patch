@@ -1,0 +1,149 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -1899,6 +1899,8 @@
+ 	struct esp_adapter adapter;
+ 	struct sk_buff_head rx_q[MAX_PRIORITY_QUEUES];
+ 	struct sk_buff_head tx_q;
++	struct work_struct tx_work;
++	bool tx_stopping;
+ 	void __iomem *osi_slot;
+ 	void __iomem *xphy_slot;	/* ROM pointer slot 0x3fcef904 */
+ 	struct device_node *intc_np;
+@@ -4240,7 +4242,7 @@
+  * is the frame as it goes on the wire; the header is stripped back off
+  * before the blob sees it.
+  */
+-static int blob_write_packet(struct esp_adapter *adapter, struct sk_buff *skb)
++static int blob_process_packet(struct esp_adapter *adapter, struct sk_buff *skb)
+ {
+ 	struct esp_payload_header *hdr;
+ 	struct command_header *cmd;
+@@ -4303,6 +4305,87 @@
+ 	return ret;
+ }
+ 
++/* The upper half calls write with spin_lock_bh held for commands and
++ * from the network TX path for data. Vendor APIs submit ioctls and wait
++ * on the Wi-Fi task, even for a nonblocking scan. Keep write atomic and
++ * retain its transport ownership contract; only this worker calls them.
++ * Reuse the existing skb queue and system workqueue, not a new kthread.
++ */
++#define BLOB_TX_QUEUE_LIMIT 16
++
++static void blob_tx_work(struct work_struct *work)
++{
++	struct esp_wifi_blob *hw = container_of(work, struct esp_wifi_blob, tx_work);
++	struct sk_buff *skb;
++	int ret;
++
++	while ((skb = skb_dequeue(&hw->tx_q))) {
++		ret = blob_process_packet(&hw->adapter, skb);
++		if (ret)
++			pr_warn_ratelimited("radio TX/command failed: %d\n", ret);
++	}
++}
++
++static int blob_write_packet(struct esp_adapter *adapter, struct sk_buff *skb)
++{
++	struct esp_wifi_blob *hw = READ_ONCE(g_blob);
++	struct esp_payload_header *header;
++	unsigned long flags;
++	u16 offset, len;
++	int ret = 0;
++
++	if (!skb)
++		return -EINVAL;
++	if (!hw || adapter != &hw->adapter) {
++		ret = -ENODEV;
++		goto drop;
++	}
++	if (skb->len < sizeof(*header) || skb->len > 4096) {
++		ret = -EINVAL;
++		goto drop;
++	}
++	header = (void *)skb->data;
++	offset = le16_to_cpu(header->offset);
++	len = le16_to_cpu(header->len);
++	if (offset < sizeof(*header) || offset > skb->len ||
++	    len > skb->len - offset ||
++	    (header->packet_type == PACKET_TYPE_COMMAND_REQUEST &&
++	     len < sizeof(struct command_header))) {
++		ret = -EINVAL;
++		goto drop;
++	}
++	spin_lock_irqsave(&hw->tx_q.lock, flags);
++	if (hw->tx_stopping)
++		ret = -ESHUTDOWN;
++	else if (skb_queue_len(&hw->tx_q) >= BLOB_TX_QUEUE_LIMIT)
++		ret = -ENOBUFS;
++	else {
++		__skb_queue_tail(&hw->tx_q, skb);
++		/* Queue under the same lock as shutdown so flush cannot miss
++		 * a packet accepted immediately before stopping was set.
++		 */
++		queue_work_on(0, system_long_wq, &hw->tx_work);
++	}
++	spin_unlock_irqrestore(&hw->tx_q.lock, flags);
++	if (!ret)
++		return 0;
++ drop:
++	dev_kfree_skb_any(skb);
++	return ret;
++}
++
++static void blob_tx_shutdown(void *data)
++{
++	struct esp_wifi_blob *hw = data;
++	unsigned long flags;
++
++	spin_lock_irqsave(&hw->tx_q.lock, flags);
++	hw->tx_stopping = true;
++	spin_unlock_irqrestore(&hw->tx_q.lock, flags);
++	flush_work(&hw->tx_work);
++	skb_queue_purge(&hw->tx_q);
++}
++
+ /*
+  * ------------------------------------------------------------------
+  * Symbols main.c expects from the transport.
+@@ -4513,6 +4596,12 @@
+ 	for (i = 0; i < MAX_PRIORITY_QUEUES; i++)
+ 		skb_queue_head_init(&hw->rx_q[i]);
+ 	skb_queue_head_init(&hw->tx_q);
++	INIT_WORK(&hw->tx_work, blob_tx_work);
++	ret = devm_add_action_or_reset(&pdev->dev, blob_tx_shutdown, hw);
++	if (ret) {
++		unregister_die_notifier(&osi_die_nb);
++		return ret;
++	}
+ 
+ 	/*
+ 	 * The interrupt matrix, so _set_intr can turn a (matrix row, core
+@@ -4946,6 +5035,7 @@
+ 	 * notifier would break state the running board still depends on.
+ 	 */
+ err_blob_deinit:
++	blob_tx_shutdown(hw);
+ 	cancel_work_sync(&blob_scan_cleanup);
+ 	esp_wifi_deinit_internal();
+ err_adapter:
+@@ -4961,6 +5051,7 @@
+ 	if (!hw)
+ 		return;
+ 	unregister_die_notifier(&osi_die_nb);
++	blob_tx_shutdown(hw);
+ 	if (hw->started) {
+ 		esp_wifi_stop();
+ 		cancel_work_sync(&blob_scan_cleanup);
+--- a/drivers/net/wireless/espressif/esp32-ng/main.c
++++ b/drivers/net/wireless/espressif/esp32-ng/main.c
+@@ -145,7 +145,8 @@
+ 			priv->stats.tx_errors++;
+ 		} else {
+ 			priv->stats.tx_packets++;
+-			priv->stats.tx_bytes += skb->len;
++			/* write owns skb and may free it before returning. */
++			priv->stats.tx_bytes += len;
+ 		}
+ 	} else {
+ 		dev_kfree_skb_any(skb);

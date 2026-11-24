@@ -9,6 +9,7 @@ source = (root / 'out/linux-fork/mm/nommu-bank.inc').read_text()
 source = source.split('int nommu_bank_dup_mmap(', 1)[0]
 source = source.replace('#include <linux/sched/signal.h>\n', '')
 source = source.replace('#include <linux/moduleparam.h>\n', '')
+source = source.replace('#include <linux/spinlock.h>\n', '')
 shim = r'''
 #include <assert.h>
 #include <stddef.h>
@@ -45,6 +46,15 @@ typedef long atomic_long_t;
 static unsigned irq_depth;
 #define local_irq_save(f) do { (f)=irq_depth++; } while (0)
 #define local_irq_restore(f) do { irq_depth=(f); } while (0)
+/* This single-threaded accounting model checks balanced/nonrecursive locking;
+ * the board SMP suite is responsible for cross-core execution and ordering.
+ */
+#define DEFINE_RAW_SPINLOCK(name) unsigned name
+#define raw_spin_lock(p) do { assert(!*(p)); *(p)=1; } while (0)
+#define raw_spin_unlock(p) do { assert(*(p)==1); *(p)=0; } while (0)
+#define raw_spin_lock_irqsave(p,f) do { local_irq_save(f); raw_spin_lock(p); } while (0)
+#define raw_spin_unlock_irqrestore(p,f) do { raw_spin_unlock(p); local_irq_restore(f); } while (0)
+#define xchg(p,v) __atomic_exchange_n((p),(v),__ATOMIC_SEQ_CST)
 #define preempt_disable() ((void)0)
 #define preempt_enable() ((void)0)
 #define SZ_64K 65536

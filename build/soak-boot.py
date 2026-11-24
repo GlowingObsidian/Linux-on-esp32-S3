@@ -3,8 +3,8 @@
 
 Each round rewrites /etc and /home from the artifacts, holds the board in
 reset until the port is listening, watches the console, then logs in and
-reads dmesg and the taint flags back (a quiet console shows KERN_ERR and
-worse only). A round ends in exactly one of three states:
+reads dmesg and the taint flags back, rather than trusting the console. A
+round ends in exactly one of three states:
 
   PASS          login prompt, last init script ran, kernel log and taint
                 flags read back clean, nothing in the fault list printed
@@ -36,18 +36,26 @@ FAULT = re.compile(rb'Oops:|BUG:|Kernel panic|Illegal [Ii]nstruction'
                    rb'|Redzone overwritten|Poison overwritten'
                    rb'|list_add corruption|list_del corruption'
                    rb'|corrupted stack end|Bad page state|WARNING: CPU')
-LOGIN = re.compile(rb'buildroot login: ?')
-# The last init script: once it ran, home-init and everything before it did.
-MARKER = re.compile(rb'Starting cron: OK')
+# getty builds its prompt out of the hostname, so matching "buildroot login:"
+# would tie a soak run to the stock image's name. This image is called
+# arduino, and the hostname is a configurable value rather than a
+# fact about the board, so the pattern takes whatever name is there.
+LOGIN = re.compile(rb'[\w.-]+ login: ?')
+# The last init script: once it ran, everything before it did.
+# This was `Starting cron: OK` until cron was removed; inetd is started by a
+# Buildroot-shipped script that sorts after S40network, so it is now the last
+# thing to start, and it stays in the image because SSH is reached through it.
+MARKER = re.compile(rb'Starting inetd: OK')
 RESET_BANNER = re.compile(rb'ESP-ROM:esp32s3')
-# A quiet console types KERN_ERR and worse only; a user-space illegal
-# instruction (pr_info) and a WARN never reach it. The ring buffer has them,
-# so every round that logs in reads it back, with the taint flags.
+# The console is not the authority. On a `quiet` image it types KERN_ERR and
+# worse only, where a user-space illegal instruction (pr_info) and a WARN
+# never reach it; the ring buffer has them either way, so every round that
+# logs in reads it back, with the taint flags.
 HEALTH = ('cat /proc/sys/kernel/tainted', 'dmesg')
 TAINTED = re.compile(rb'^\s*(\d+)\s*$', re.M)
-OFFSETS = {'etc.jffs2': '0xd0000', 'home.jffs2': '0xcc0000'}
+OFFSETS = {'etc.jffs2': '0xd0000', 'home.jffs2': '0xc00000'}
 # Kernel and firmware partitions, read back to identify what actually booted.
-IDENTITY = {'linux': ('0x140000', 0x400000), 'factory': ('0x10000', 0xc0000)}
+IDENTITY = {'linux': ('0x140000', 0x3d0000), 'factory': ('0x10000', 0xc0000)}
 
 parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
 parser.add_argument('port')
@@ -57,7 +65,7 @@ parser.add_argument('--rounds', type=int, default=5)
 parser.add_argument('--boot-seconds', type=int, default=120,
                     help='total observation budget per round, from reset')
 parser.add_argument('--settle-seconds', type=int, default=25,
-                    help='keep watching this long after login and marker: the network and BLE come up later')
+                    help='keep watching this long after login and marker: the network comes up later')
 parser.add_argument('--esptool', default='esptool')
 parser.add_argument('--baud', type=int, default=460800,
                     help='esptool transfer rate for the restore. At 115200 the 3.8 MB rewrite takes '

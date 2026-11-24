@@ -1,8 +1,10 @@
 #!/bin/sh
 #
-# How much of the kernel's log reaches the console. `quiet` is compiled into
-# the device tree, so this cannot change the command line: it sets the console
-# level, and S00bootlog replays the buffered log at boot. Persists in /etc.
+# How much of the kernel's log reaches the console. This cannot change the
+# command line -- that is the device tree, and it carries no `quiet` -- so it
+# sets the console level. `verbose` is recorded in /etc and S00bootlog puts it
+# back at every boot. `quiet` lasts only for the boot it is run on: it leaves no
+# marker, and the kernel restores its own default level at the next one.
 
 set -e
 DIR=${BOOTLOG_DIR:-/etc/bootlog}
@@ -25,17 +27,24 @@ verbose|on)
 	: > "$DIR/verbose"
 	set_level "$VERBOSE"
 	echo 'Console shows the whole kernel log, now and at every boot.'
-	echo 'Messages from before init are replayed at boot; dmesg has them already.'
+	echo 'The boot streams live; dmesg has anything from before this.'
 	;;
 quiet|off)
 	mkdir -p "$DIR"
 	rm -f "$DIR/verbose"
 	set_level "$QUIET"
-	echo 'Console shows KERN_ERR and worse, the default. dmesg still has all of it.'
+	echo 'Console shows KERN_ERR and worse until the next reboot.'
+	# Said plainly because the tool is named for something it cannot do here:
+	# the kernel writes its whole log before any script runs, so a boot cannot
+	# be silenced from userspace, only the rest of the boot you are on.
+	echo 'It cannot quieten a boot: the kernel prints its log before any script runs.'
 	;;
 status)
-	if [ -e "$DIR/verbose" ]; then echo 'setting: verbose'
-	else echo 'setting: quiet (the default)'; fi
+	if [ -e "$DIR/verbose" ]; then
+		echo 'setting: verbose (recorded in /etc; re-applied at every boot)'
+	else
+		echo 'setting: quiet (this boot only; a reboot returns to the default)'
+	fi
 	echo "console level now: $(now)	(4 = quiet, 8 = everything)"
 	;;
 *)

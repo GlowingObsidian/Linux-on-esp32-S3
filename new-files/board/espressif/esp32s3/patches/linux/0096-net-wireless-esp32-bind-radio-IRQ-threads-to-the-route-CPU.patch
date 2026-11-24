@@ -1,0 +1,22 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -2021,6 +2021,19 @@
+ 		return;
+ 	}
+ 
++#ifdef CONFIG_SMP
++	/* Route and IRQ-thread affinity must agree. The blob's ROM helpers
++	 * may use per-CPU interrupt state even though the handler can sleep.
++	 */
++	ret = irq_set_affinity(virq, cpumask_of(osi_intr_cpu[n]));
++	if (ret) {
++		pr_err("osi: cannot bind IRQ %d to CPU%u: %d\n",
++		       virq, osi_intr_cpu[n], ret);
++		irq_dispose_mapping(virq);
++		return;
++	}
++#endif
++
+ 	/*
+ 	 * IRQF_ONESHOT, because the primary handler is NULL. The kernel
+ 	 * substitutes irq_default_primary_handler for a NULL primary, and

@@ -32,8 +32,8 @@ install -m 644 "$programs_out/socat-1.8.1.3/COPYING" "$image_dir/tree/usr/share/
 python3 "$programs_dir/strip-rootfs.py" "$image_dir/tree" --strip "$prefix-strip"
 "$host_dir/bin/mkcramfs" -X -q "$image_dir/tree" "$image_dir/rootfs.cramfs"
 size=$(wc -c < "$image_dir/rootfs.cramfs")
-echo "Image $image_dir: $size bytes, free $((0x780000-size)); not flashed."
-test "$size" -le $((0x780000))
+echo "Image $image_dir: $size bytes, free $((0x6f0000-size)); not flashed."
+test "$size" -le $((0x6f0000))
 "$host_dir/bin/cramfsck" "$image_dir/rootfs.cramfs"
 cp "$image_dir/rootfs.cramfs" "$output"
 sha256sum "$output"

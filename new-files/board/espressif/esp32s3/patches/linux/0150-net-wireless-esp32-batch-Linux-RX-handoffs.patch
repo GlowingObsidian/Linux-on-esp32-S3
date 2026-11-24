@@ -1,0 +1,192 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/main.c
++++ b/drivers/net/wireless/espressif/esp32-ng/main.c
+@@ -674,7 +674,37 @@
+ 	return 0;
+ }
+ 
+-static void process_rx_packet(struct esp_adapter *adapter, struct sk_buff *skb)
++enum { ESP_RX_BATCH_MAX = 8 };
++static bool wifi_rx_batch;
++module_param_named(rx_batch, wifi_rx_batch, bool, 0644);
++MODULE_PARM_DESC(rx_batch, "Batch up to eight data frames per Linux RX handoff");
++
++static void esp_rx_flush(struct sk_buff_head *batch)
++{
++	struct sk_buff *skb;
++
++	if (skb_queue_empty(batch))
++		return;
++	/* netif_rx() sees bottom halves already disabled, so the backlog can
++	 * process the entire burst instead of running after every submission.
++	 */
++	local_bh_disable();
++	while ((skb = __skb_dequeue(batch)))
++		NETIF_RX_NI(skb);
++	local_bh_enable();
++}
++
++static bool esp_rx_is_data(const struct sk_buff *skb)
++{
++	const struct esp_payload_header *header = (const void *)skb->data;
++
++	return skb->len >= sizeof(*header) &&
++		(header->if_type == ESP_STA_IF || header->if_type == ESP_AP_IF) &&
++		header->packet_type == PACKET_TYPE_DATA;
++}
++
++static void process_rx_packet(struct esp_adapter *adapter, struct sk_buff *skb,
++			      struct sk_buff_head *batch)
+ {
+ 	struct esp_wifi_device *priv = NULL;
+ 	struct esp_payload_header *payload_header = NULL;
+@@ -752,9 +782,11 @@
+ 			skb->ip_summed = CHECKSUM_NONE;
+ 
+ 			priv->stats.rx_bytes += skb->len;
+-			/* Forward skb to kernel */
+-			NETIF_RX_NI(skb);
+ 			priv->stats.rx_packets++;
++			if (batch)
++				__skb_queue_tail(batch, skb);
++			else
++				NETIF_RX_NI(skb);
+ 		} else if (payload_header->packet_type == PACKET_TYPE_COMMAND_RESPONSE) {
+ 			process_cmd_resp(priv->adapter, skb);
+ 		} else if (payload_header->packet_type == PACKET_TYPE_EVENT) {
+@@ -871,13 +903,30 @@
+ 
+ static void esp_get_packets(struct esp_adapter *adapter)
+ {
++	struct sk_buff_head batch;
+ 	struct sk_buff *skb;
++	bool batching;
+ 
+ 	if (!adapter || !adapter->if_ops || !adapter->if_ops->read)
+ 		return;
+ 
+-	while ((skb = adapter->if_ops->read(adapter)))
+-	       process_rx_packet(adapter, skb);
++	batching = LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0) &&
++		READ_ONCE(wifi_rx_batch);
++	__skb_queue_head_init(&batch);
++	while ((skb = adapter->if_ops->read(adapter))) {
++		if (!batching || !esp_rx_is_data(skb)) {
++			/* Process authentication and control in the original order
++			 * and in process context, where they may sleep.
++			 */
++			esp_rx_flush(&batch);
++			process_rx_packet(adapter, skb, NULL);
++			continue;
++		}
++		process_rx_packet(adapter, skb, &batch);
++		if (skb_queue_len(&batch) == ESP_RX_BATCH_MAX)
++			esp_rx_flush(&batch);
++	}
++	esp_rx_flush(&batch);
+ }
+ 
+ int esp_send_packet(struct esp_adapter *adapter, struct sk_buff *skb)
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -729,6 +729,8 @@
+ static atomic_t wifi_tx_done = ATOMIC_INIT(0);
+ static atomic_t wifi_tx_done_failed = ATOMIC_INIT(0);
+ static atomic_t wifi_tx_queue_full = ATOMIC_INIT(0);
++static atomic_t wifi_rx_alloc_failed = ATOMIC_INIT(0);
++static atomic_t wifi_rx_rejected = ATOMIC_INIT(0);
+ static unsigned int wifi_iram_bytes;
+ 
+ /* Controlled A/B settings: apply between traffic runs. Workqueue ownership
+@@ -760,7 +762,7 @@
+ {
+ 	(void)kp;
+ 	return scnprintf(buffer, PAGE_SIZE,
+-		"sram_total=%zu sram_free=%zu tx_calls=%d tx_no_mem=%d tx_accepted=%d tx_failed=%d tx_done=%d tx_done_failed=%d tx_queue_full=%d tx_mode=static static_tx=%d cache_tx=%d cache_tx_enabled=%d iram_bytes=%u control_total=%zu control_free=%zu\n",
++		"sram_total=%zu sram_free=%zu tx_calls=%d tx_no_mem=%d tx_accepted=%d tx_failed=%d tx_done=%d tx_done_failed=%d tx_queue_full=%d tx_mode=static static_tx=%d cache_tx=%d cache_tx_enabled=%d iram_bytes=%u control_total=%zu control_free=%zu rx_alloc_failed=%d rx_rejected=%d\n",
+ 		osi_internal_pool ? gen_pool_size(osi_internal_pool) : 0,
+ 		osi_internal_pool ? gen_pool_avail(osi_internal_pool) : 0,
+ 		atomic_read(&wifi_tx_calls), atomic_read(&wifi_tx_no_mem),
+@@ -771,7 +773,8 @@
+ 		config_get_wifi_cache_tx_buffer_num(),
+ 		config_is_cache_tx_buf_enabled(), READ_ONCE(wifi_iram_bytes),
+ 		osi_control_pool ? gen_pool_size(osi_control_pool) : 0,
+-		osi_control_pool ? gen_pool_avail(osi_control_pool) : 0);
++		osi_control_pool ? gen_pool_avail(osi_control_pool) : 0,
++		atomic_read(&wifi_rx_alloc_failed), atomic_read(&wifi_rx_rejected));
+ }
+ 
+ static const struct kernel_param_ops wifi_stats_ops = {
+@@ -784,7 +787,7 @@
+  */
+ enum wifi_time_kind {
+ 	WIFI_TIME_TX_QUEUE, WIFI_TIME_TX_API, WIFI_TIME_TX_RETRY,
+-	WIFI_TIME_RX_COPY, WIFI_TIME_COUNT
++	WIFI_TIME_RX_COPY, WIFI_TIME_RX_QUEUE, WIFI_TIME_COUNT
+ };
+ struct wifi_time_sample {
+ 	u64 count, total_us, max_us, ge_1ms, ge_10ms, ge_100ms;
+@@ -832,18 +835,18 @@
+ 	memcpy(skb->cb + sizeof(skb->cb) - sizeof(start), &start, sizeof(start));
+ }
+ 
+-static void wifi_time_dequeue(struct sk_buff *skb)
++static void wifi_time_dequeue(struct sk_buff *skb, enum wifi_time_kind kind)
+ {
+ 	u64 start;
+ 
+ 	memcpy(&start, skb->cb + sizeof(skb->cb) - sizeof(start), sizeof(start));
+-	wifi_time_record(WIFI_TIME_TX_QUEUE, start);
++	wifi_time_record(kind, start);
+ }
+ 
+ static int wifi_timing_get(char *buffer, const struct kernel_param *kp)
+ {
+ 	static const char * const names[] = {
+-		"tx_queue", "tx_api", "tx_retry_wait", "rx_copy"
++		"tx_queue", "tx_api", "tx_retry_wait", "rx_copy", "rx_queue"
+ 	};
+ 	struct wifi_time_sample samples[WIFI_TIME_COUNT];
+ 	unsigned long flags;
+@@ -3575,6 +3578,8 @@
+ 		skb = skb_dequeue(&hw->rx_q[PRIO_Q_MID]);
+ 	if (!skb)
+ 		skb = skb_dequeue(&hw->rx_q[PRIO_Q_LOW]);
++	if (skb && ((const struct esp_payload_header *)skb->data)->packet_type == PACKET_TYPE_DATA)
++		wifi_time_dequeue(skb, WIFI_TIME_RX_QUEUE);
+ 	return skb;
+ }
+ 
+@@ -3612,6 +3617,8 @@
+ 	hdr->offset = cpu_to_le16(sizeof(*hdr));
+ 	hdr->packet_type = type;
+ 	skb_put_data(skb, buf, len);
++	if (type == PACKET_TYPE_DATA)
++		wifi_time_enqueue(skb);
+ 	skb_queue_tail(&hw->rx_q[PRIO_Q_HIGH], skb);
+ 	esp_process_new_packet_intr(&hw->adapter);
+ 	return 0;
+@@ -3625,9 +3632,14 @@
+ static int blob_rx_cb(void *buf, u16 len, void *eb)
+ {
+ 	u64 started = wifi_time_start();
++	int ret = -EINVAL;
+ 
+ 	if (buf && len >= ETH_HLEN && len <= 2304)
+-		blob_queue_packet(g_blob, PACKET_TYPE_DATA, buf, len);
++		ret = blob_queue_packet(g_blob, PACKET_TYPE_DATA, buf, len);
++	if (ret == -ENOMEM)
++		atomic_inc(&wifi_rx_alloc_failed);
++	else if (ret)
++		atomic_inc(&wifi_rx_rejected);
+ 	wifi_time_record(WIFI_TIME_RX_COPY, started);
+ 	if (eb)
+ 		esp_wifi_internal_free_rx_buffer(eb);
+@@ -4665,7 +4677,7 @@
+ 	while ((skb = skb_dequeue(&hw->tx_q))) {
+ 		data = ((struct esp_payload_header *)skb->data)->packet_type !=
+ 			PACKET_TYPE_COMMAND_REQUEST;
+-		wifi_time_dequeue(skb);
++		wifi_time_dequeue(skb, WIFI_TIME_TX_QUEUE);
+ 		ret = blob_process_packet(&hw->adapter, skb);
+ 		if (data) {
+ 			spin_lock_irqsave(&hw->tx_q.lock, flags);

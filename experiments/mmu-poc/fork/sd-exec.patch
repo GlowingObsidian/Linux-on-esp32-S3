@@ -1,0 +1,49 @@
+From: Shreyan Dey <shreyan@example.com>
+Subject: [PATCH] mm: nommu-bank: share immutable RAM file text across fork
+
+--- a/mm/nommu-bank.inc
++++ b/mm/nommu-bank.inc
+@@ -9,7 +9,12 @@
+  * holding this lock. Each executing bank family is also confined to one CPU:
+  * a lock around the swap cannot protect a sibling executing userspace.
+  */
++#ifdef CONFIG_XTENSA_SMP_ESP32
++#include <asm/esp32-cache.h>
++#define nommu_bank_lock esp32_cache_lock
++#else
+ static DEFINE_RAW_SPINLOCK(nommu_bank_lock);
++#endif
+ 
+ /* Successful forks are normal operation, not console diagnostics. */
+ static bool nommu_bank_trace;
+@@ -657,9 +662,16 @@
+ 				return -EOPNOTSUPP;
+ 			continue; /* Read-only XIP mappings stay shared. */
+ 		}
+-		/* RAM executable mappings need a separate I/D cache protocol. */
+-		if (src->vm_file && (src->vm_flags & VM_EXEC))
+-			return -EOPNOTSUPP;
++		/* NOMMU cannot upgrade protection with mprotect(). Immutable file
++		 * text can share its region, whether XIP or copied from SD. It is
++		 * published to the I-bus by flush_icache_user_range() at mmap.
++		 * Writable executable file mappings still need a bank/cache protocol.
++		 */
++		if (src->vm_file && (src->vm_flags & VM_EXEC)) {
++			if (src->vm_flags & VM_WRITE)
++				return -EOPNOTSUPP;
++			continue;
++		}
+ 		if (src->vm_region->vm_usage != 1 && !src->nommu_bank)
+ 			return -EOPNOTSUPP;
+ 		len = src->vm_region->vm_top - src->vm_region->vm_start;
+@@ -700,7 +712,9 @@
+ 			vm_area_free(dst);
+ 			return -ENOMEM;
+ 		}
+-		if (!(src->vm_flags & VM_SHARED) && (src->vm_flags & VM_MAPPED_COPY)) {
++		if (!(src->vm_flags & VM_SHARED) && (src->vm_flags & VM_MAPPED_COPY) &&
++		    !(src->vm_file && (src->vm_flags & VM_EXEC) &&
++		      !(src->vm_flags & VM_WRITE))) {
+ 			ret = bank_clone(dst, src);
+ 			if (ret) {
+ 				vma_iter_free(&dst_iter);

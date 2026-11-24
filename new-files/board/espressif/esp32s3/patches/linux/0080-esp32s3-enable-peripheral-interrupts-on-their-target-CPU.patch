@@ -1,0 +1,269 @@
+esp32s3: enable peripheral inputs on their matrix target CPU
+
+Gate device sources in the shared interrupt matrix. Keep CPU-local
+INTENABLE updates on their owning CPU via a nonblocking IPI.
+
+diff --git a/arch/xtensa/kernel/smp.c b/arch/xtensa/kernel/smp.c
+--- a/arch/xtensa/kernel/smp.c
++++ b/arch/xtensa/kernel/smp.c
+@@ -18,6 +18,7 @@
+ #include <linux/init.h>
+ #include <linux/interrupt.h>
+ #include <linux/irqdomain.h>
++#include <linux/irqchip/xtensa-pic.h>
+ #include <linux/irq.h>
+ #include <linux/kdebug.h>
+ #include <linux/module.h>
+@@ -126,6 +127,8 @@
+ 
+ /* Atomic payload words accompany the two hardware doorbells. */
+ static DEFINE_PER_CPU(unsigned long, esp32_ipi_pending);
++/* External inputs only accumulate here; masking is done in the matrix. */
++static DEFINE_PER_CPU(unsigned long, esp32_irq_enable_pending);
+ 
+ /*
+  * init_IRQ runs before the esp32-intc platform driver is registered. Use the
+@@ -657,6 +660,9 @@
+ 	IPI_RESCHEDULE = 0,
+ 	IPI_CALL_FUNC,
+ 	IPI_CPU_STOP,
++#ifdef CONFIG_XTENSA_SMP_ESP32
++	IPI_ENABLE_IRQ,
++#endif
+ 	IPI_MAX
+ };
+ 
+@@ -667,6 +673,9 @@
+ 	{ .short_text = "RES", .long_text = "Rescheduling interrupts" },
+ 	{ .short_text = "CAL", .long_text = "Function call interrupts" },
+ 	{ .short_text = "DIE", .long_text = "CPU shutdown interrupts" },
++#ifdef CONFIG_XTENSA_SMP_ESP32
++	{ .short_text = "ENA", .long_text = "Peripheral IRQ enable interrupts" },
++#endif
+ };
+ 
+ struct ipi_data {
+@@ -731,6 +740,38 @@
+ 
+ #endif /* CONFIG_XTENSA_SMP_ESP32 */
+ 
++
++#ifdef CONFIG_XTENSA_SMP_ESP32
++static void esp32_enable_local_inputs(unsigned long inputs)
++{
++	unsigned long flags;
++
++	local_irq_save(flags);
++	xtensa_set_sr(xtensa_get_sr(intenable) | inputs, intenable);
++	asm volatile("rsync" ::: "memory");
++	local_irq_restore(flags);
++}
++
++void esp32_enable_peripheral_irq(unsigned int cpu, unsigned int hwirq)
++{
++	unsigned int here;
++
++	if (WARN_ON_ONCE(cpu >= nr_cpu_ids || hwirq >= XCHAL_NUM_INTERRUPTS))
++		return;
++	here = get_cpu();
++	if (cpu == here) {
++		esp32_enable_local_inputs(BIT(hwirq));
++	} else {
++		/* A synchronous IPI is unsafe under the caller's IRQ-desc lock.
++		 * Queue the input and ring the existing doorbell without waiting.
++		 * A not-yet-started CPU will drain this after enabling its IPI.
++		 */
++		set_bit(hwirq, &per_cpu(esp32_irq_enable_pending, cpu));
++		send_ipi_message(cpumask_of(cpu), IPI_ENABLE_IRQ);
++	}
++	put_cpu();
++}
++#endif
+ 
+ void arch_send_call_function_ipi_mask(const struct cpumask *mask)
+ {
+@@ -791,6 +832,15 @@
+ 		if (!msg)
+ 			break;
+ 
++#ifdef CONFIG_XTENSA_SMP_ESP32
++		if (msg & BIT(IPI_ENABLE_IRQ)) {
++			unsigned long inputs;
++
++			++ipi->ipi_count[IPI_ENABLE_IRQ];
++			inputs = xchg(&per_cpu(esp32_irq_enable_pending, cpu), 0);
++			esp32_enable_local_inputs(inputs);
++		}
++#endif
+ 		if (msg & (1 << IPI_CALL_FUNC)) {
+ 			++ipi->ipi_count[IPI_CALL_FUNC];
+ 			generic_smp_call_function_interrupt();
+diff --git a/drivers/irqchip/irq-esp32-intc.c b/drivers/irqchip/irq-esp32-intc.c
+--- a/drivers/irqchip/irq-esp32-intc.c
++++ b/drivers/irqchip/irq-esp32-intc.c
+@@ -4,6 +4,8 @@
+ #include <linux/irqdomain.h>
+ #include <linux/irq.h>
+ #include <linux/irqchip.h>
++#include <linux/irqchip/xtensa-pic.h>
++#include <linux/slab.h>
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+ 
+@@ -44,20 +46,133 @@
+ 		}
+ }
+ 
++#if defined(CONFIG_XTENSA_SMP_ESP32) && defined(CONFIG_SMP)
++struct esp32_intc_irq {
++	struct esp32_intc *intc;
++	unsigned int cpu;
++	unsigned int source;
++	unsigned int input;
++};
++
++static void esp32_intc_mask(struct irq_data *d)
++{
++	struct esp32_intc_irq *route = irq_data_get_irq_chip_data(d);
++
++	/* MMIO gating works from either CPU, unlike the parent's INTENABLE. */
++	esp32_intc_write(route->intc, route->cpu, route->source,
++			 ESP32_INTC_DISCONNECTED);
++}
++
++static void esp32_intc_unmask(struct irq_data *d)
++{
++	struct esp32_intc_irq *route = irq_data_get_irq_chip_data(d);
++
++	esp32_intc_write(route->intc, route->cpu, route->source, route->input);
++	esp32_enable_peripheral_irq(route->cpu, route->input);
++}
++
++static int esp32_intc_set_affinity(struct irq_data *d,
++				 const struct cpumask *mask, bool force)
++{
++	struct esp32_intc_irq *route = irq_data_get_irq_chip_data(d);
++
++	/* Preserve the DT's fixed CPU route; do not pretend the MX parent's
++	 * affinity callback can move an S3 interrupt-matrix connection.
++	 */
++	if (!cpumask_test_cpu(route->cpu, mask))
++		return -EINVAL;
++	irq_data_update_effective_affinity(d, cpumask_of(route->cpu));
++	return IRQ_SET_MASK_OK;
++}
++#endif
++
+ static struct irq_chip esp32_intc_chip = {
+ 	.name			= "esp32-intc",
+ 	.irq_eoi		= irq_chip_eoi_parent,
++#if defined(CONFIG_XTENSA_SMP_ESP32) && defined(CONFIG_SMP)
++	.irq_mask		= esp32_intc_mask,
++	.irq_unmask		= esp32_intc_unmask,
++#else
+ 	.irq_mask		= irq_chip_mask_parent,
+ 	.irq_unmask		= irq_chip_unmask_parent,
++#endif
+ 	.irq_retrigger		= irq_chip_retrigger_hierarchy,
+ 	.irq_set_type		= irq_chip_set_type_parent,
+ 	.flags			= IRQCHIP_MASK_ON_SUSPEND |
+ 				  IRQCHIP_SKIP_SET_WAKE,
+-#ifdef CONFIG_SMP
++#if defined(CONFIG_XTENSA_SMP_ESP32) && defined(CONFIG_SMP)
++	.irq_set_affinity	= esp32_intc_set_affinity,
++#elif defined(CONFIG_SMP)
+ 	.irq_set_affinity	= irq_chip_set_affinity_parent,
+ #endif
+ };
+ 
++#if defined(CONFIG_XTENSA_SMP_ESP32) && defined(CONFIG_SMP)
++static int esp32_intc_domain_alloc(struct irq_domain *domain, unsigned int virq,
++				 unsigned int nr_irqs, void *data)
++{
++	struct irq_fwspec *spec = data, parent;
++	struct esp32_intc *priv = domain->host_data;
++	struct esp32_intc_irq *route;
++	unsigned int cpu, source, input;
++	int ret;
++
++	/* One independently allocated matrix route per device IRQ. */
++	if (nr_irqs != 1 || spec->param_count < 2 || spec->param_count > 3)
++		return -EINVAL;
++	cpu = spec->param_count == 3 ? spec->param[2] : 0;
++	source = spec->param[0];
++	input = spec->param[1];
++	if (cpu >= priv->n_cpus || source >= priv->n_irq ||
++	    input >= XCHAL_NUM_INTERRUPTS)
++		return -EINVAL;
++	if (!(BIT(input) & XCHAL_INTTYPE_MASK_EXTERN_LEVEL))
++		return -EINVAL;
++	if (input == 2 || source == 79 || source == 80)
++		return -EBUSY; /* reserved cross-core doorbells */
++	route = kzalloc(sizeof(*route), GFP_KERNEL);
++	if (!route)
++		return -ENOMEM;
++	*route = (struct esp32_intc_irq) { priv, cpu, source, input };
++	parent.fwnode = domain->parent->fwnode;
++	parent.param_count = 2;
++	parent.param[0] = input;
++	parent.param[1] = 0;
++	ret = irq_domain_alloc_irqs_parent(domain, virq, 1, &parent);
++	if (ret)
++		goto free_route;
++	ret = irq_domain_set_hwirq_and_chip(domain, virq, input,
++					   &esp32_intc_chip, route);
++	if (ret) {
++		irq_domain_free_irqs_parent(domain, virq, 1);
++		goto free_route;
++	}
++	/* Leave the source masked until generic IRQ startup unmasks it. */
++	esp32_intc_write(priv, cpu, source, ESP32_INTC_DISCONNECTED);
++	irq_data_update_effective_affinity(irq_domain_get_irq_data(domain, virq),
++					   cpumask_of(cpu));
++	return 0;
++free_route:
++	kfree(route);
++	return ret;
++}
++
++static void esp32_intc_domain_free(struct irq_domain *domain, unsigned int virq,
++				 unsigned int nr_irqs)
++{
++	unsigned int i;
++
++	for (i = 0; i < nr_irqs; ++i) {
++		struct irq_data *d = irq_domain_get_irq_data(domain, virq + i);
++		struct esp32_intc_irq *route = irq_data_get_irq_chip_data(d);
++
++		esp32_intc_mask(d);
++		irq_domain_reset_irq_data(d);
++		kfree(route);
++	}
++	irq_domain_free_irqs_parent(domain, virq, nr_irqs);
++}
++#else
+ static int esp32_intc_domain_alloc(struct irq_domain *domain, unsigned int virq,
+ 				   unsigned int nr_irqs, void *data)
+ {
+@@ -122,6 +237,8 @@
+ {
+ 	pr_debug("%s\n", __func__);
+ }
++
++#endif
+ 
+ static const struct irq_domain_ops esp32_domain_ops = {
+ 	.alloc = esp32_intc_domain_alloc,
+diff --git a/include/linux/irqchip/xtensa-pic.h b/include/linux/irqchip/xtensa-pic.h
+--- a/include/linux/irqchip/xtensa-pic.h
++++ b/include/linux/irqchip/xtensa-pic.h
+@@ -15,4 +15,9 @@
+ struct device_node;
+ int xtensa_pic_init_legacy(struct device_node *interrupt_parent);
+ 
++#if defined(CONFIG_XTENSA_SMP_ESP32) && defined(CONFIG_SMP)
++/* May be called with an IRQ descriptor locked and local interrupts masked. */
++void esp32_enable_peripheral_irq(unsigned int cpu, unsigned int hwirq);
++#endif
++
+ #endif /* __LINUX_IRQCHIP_XTENSA_PIC_H */

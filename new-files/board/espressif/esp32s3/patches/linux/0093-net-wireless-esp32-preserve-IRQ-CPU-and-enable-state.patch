@@ -1,0 +1,132 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -1811,6 +1811,7 @@
+  * balanced rather than called twice for one transition.
+  */
+ static u32 osi_ints_enabled;
++static unsigned int osi_intr_cpu[OSI_MAX_ISR];
+ 
+ struct osi_isr_slot {
+ 	void (*fn)(void *);
+@@ -1892,7 +1893,8 @@
+ 		return -ENODEV;
+ 
+ 	fwspec.fwnode = of_fwnode_handle(g_blob->intc_np);
+-	fwspec.param_count = 2;
++	fwspec.param_count = 3;
++	fwspec.param[2] = osi_intr_cpu[n];
+ 	fwspec.param[0] = source;	/* matrix row */
+ 	fwspec.param[1] = n;		/* core interrupt */
+ 
+@@ -1919,7 +1921,7 @@
+ 	spin_unlock_irqrestore(&osi_isr_lock, flags);
+ 
+ 	virq = osi_map_irq(n, osi_intr_source[n]);
+-	if (virq < 0) {
++	if (virq <= 0) {
+ 		pr_err("osi: no Linux IRQ for core int %d from matrix row %d: %d\n",
+ 		       n, osi_intr_source[n], virq);
+ 		return;
+@@ -1935,17 +1937,20 @@
+ 	 * context and can re-enter it. With it, the line stays masked until
+ 	 * the thread returns.
+ 	 */
+-	ret = request_threaded_irq(virq, NULL, osi_isr_thunk, IRQF_ONESHOT,
++	ret = request_threaded_irq(virq, NULL, osi_isr_thunk, IRQF_ONESHOT | IRQF_NO_AUTOEN,
+ 				   "esp32-wifi-blob", s);
+ 	if (ret) {
+ 		pr_err("osi: request_threaded_irq(%d) for core int %d: %d\n",
+ 		       virq, n, ret);
++		irq_dispose_mapping(virq);
+ 		return;
+ 	}
+ 
+ 	spin_lock_irqsave(&osi_isr_lock, flags);
+ 	s->virq = virq;
+ 	s->mapped = true;
++	if (osi_ints_enabled & BIT(n))
++		enable_irq(virq);
+ 	spin_unlock_irqrestore(&osi_isr_lock, flags);
+ 
+ 	pr_info("osi: core int %d <- matrix row %d, Linux IRQ %d, handler %ps\n",
+@@ -1955,7 +1960,8 @@
+ static void osi_set_intr(int32_t cpu_no, uint32_t intr_source,
+ 			 uint32_t intr_num, int32_t intr_prio)
+ {
+-	if (intr_num >= OSI_MAX_ISR) {
++	if (intr_num >= OSI_MAX_ISR || cpu_no < 0 ||
++	    cpu_no >= nr_cpu_ids || !cpu_online(cpu_no)) {
+ 		pr_warn("osi: _set_intr core int %u out of range\n", intr_num);
+ 		return;
+ 	}
+@@ -1963,6 +1969,7 @@
+ 	pr_info("osi: _set_intr(cpu=%d, source=%u, num=%u, prio=%d)\n",
+ 		cpu_no, intr_source, intr_num, intr_prio);
+ 
++	osi_intr_cpu[intr_num] = cpu_no;
+ 	osi_intr_source[intr_num] = intr_source;
+ 	osi_intr_prio[intr_num] = intr_prio;
+ 	osi_try_connect(intr_num);
+@@ -2005,43 +2012,40 @@
+  * A bit with no mapping yet is not an error either -- the blob enables
+  * before it installs in some paths -- so it is only logged.
+  */
++/* Remember the desired state even when the blob enables before _set_isr.
++ * IRQF_NO_AUTOEN gives every new mapping exactly one initial disable depth.
++ * This chip has no sleeping bus lock, so transitions can be serialized here.
++ */
+ static void osi_ints_on(uint32_t mask)
+-
+-{
++{
++	unsigned long flags;
+ 	int n;
+ 
+-	pr_info("osi: _ints_on(0x%08x)\n", mask);
+-
++	spin_lock_irqsave(&osi_isr_lock, flags);
+ 	for (n = 0; n < OSI_MAX_ISR; n++) {
+-		if (!(mask & BIT(n)))
++		if (!(mask & BIT(n)) || (osi_ints_enabled & BIT(n)))
+ 			continue;
+-		if (!osi_isrs[n].mapped) {
+-			pr_info("osi: _ints_on bit %d has no IRQ yet\n", n);
+-			continue;
+-		}
+-		if (osi_ints_enabled & BIT(n))
+-			continue;
+-		enable_irq(osi_isrs[n].virq);
+ 		osi_ints_enabled |= BIT(n);
+-	}
++		if (osi_isrs[n].mapped)
++			enable_irq(osi_isrs[n].virq);
++	}
++	spin_unlock_irqrestore(&osi_isr_lock, flags);
+ }
+ 
+ static void osi_ints_off(uint32_t mask)
+ {
++	unsigned long flags;
+ 	int n;
+ 
+-	pr_info("osi: _ints_off(0x%08x)\n", mask);
+-
++	spin_lock_irqsave(&osi_isr_lock, flags);
+ 	for (n = 0; n < OSI_MAX_ISR; n++) {
+-		if (!(mask & BIT(n)))
+-			continue;
+-		if (!(osi_ints_enabled & BIT(n)))
++		if (!(mask & BIT(n)) || !(osi_ints_enabled & BIT(n)))
+ 			continue;
+ 		osi_ints_enabled &= ~BIT(n);
+-		if (!osi_isrs[n].mapped)
+-			continue;
+-		disable_irq_nosync(osi_isrs[n].virq);
+-	}
++		if (osi_isrs[n].mapped)
++			disable_irq_nosync(osi_isrs[n].virq);
++	}
++	spin_unlock_irqrestore(&osi_isr_lock, flags);
+ }
+ 
+ /*

@@ -1,0 +1,86 @@
+From: Shreyan Dey <shreyan@example.com>
+Subject: [PATCH] spi: esp32s3: restore PIO FIFO state between DMA requests
+
+Keep DMA FIFO controls inside DMA transactions. Reset CPU FIFOs before
+loading PIO data. Return the original error on DMA failure, then let MMC
+retry subsequent requests using PIO. Report OCR masks on voltage rejection.
+
+--- a/drivers/spi/spi-esp32.c
++++ b/drivers/spi/spi-esp32.c
+@@ -138,6 +138,7 @@
+ 	u32 dma_phys;
+ 	struct clk *dma_clk;
+ 	int irq;
++	bool dma_failed;
+ 	u32 speed_hz;			/* bus speed configured in SPI_CLOCK_REG */
+ 	struct completion done;		/* wake-up from interrupt */
+ };
+@@ -168,7 +169,7 @@
+ 	esp32_spi_write(spi, SPI_DMA_CONF_REG,
+ 			SPI_RX_AFIFO_RST |
+ 			SPI_BUF_AFIFO_RST | SPI_DMA_AFIFO_RST);
+-	esp32_spi_write(spi, SPI_DMA_CONF_REG, SPI_DMA_MASTER_FLAGS);
++	esp32_spi_write(spi, SPI_DMA_CONF_REG, 0);
+ }
+ 
+ static int
+@@ -469,12 +470,17 @@
+ 		esp32_spi_read(spi, SPI_DMA_INT_RAW_REG),
+ 		readl(spi->gdma + GDMA_IN_RAW), readl(spi->gdma + GDMA_OUT_RAW),
+ 		readl(spi->dma_sram + GDMA_RX_DESC), readl(spi->dma_sram + GDMA_TX_DESC));
++	spi->dma_failed = true;
++	dev_warn(spi->dev, "GDMA failed; subsequent requests use PIO until reboot\n");
++	/* The current transfer still fails: MMC must reissue its command, not
++	 * replay only a data phase after the card has already consumed it.
++	 */
+ 	/* Stop SPI before reclaiming its DMA buffers following an error. */
+ 	esp32_spi_init(spi);
+ 	spi->speed_hz = 0;
+ out:
+ 	esp32_spi_dma_reset(spi);
+-	esp32_spi_write(spi, SPI_DMA_CONF_REG, SPI_DMA_MASTER_FLAGS);
++	esp32_spi_write(spi, SPI_DMA_CONF_REG, 0);
+ 	return ret;
+ }
+ 
+@@ -545,7 +551,7 @@
+ 	unsigned int remaining_words = t->len;
+ 	int ret;
+ 
+-	if (spi->gdma && t->len >= ESP32_SPI_FIFO_SIZE && !(t->len & 3))
++	if (spi->gdma && !spi->dma_failed && t->len >= ESP32_SPI_FIFO_SIZE && !(t->len & 3))
+ 		return esp32_spi_dma_transfer(spi, device, t);
+ 
+ 	memset(idle, 0xff, sizeof(idle));
+@@ -557,6 +563,11 @@
+ 
+ 		const u8 *tx = tx_ptr ? tx_ptr : idle;
+ 
++		/* PIO and DMA have different FIFO completion policies. Explicitly
++		 * select CPU buffers and clear old FIFO state before loading W0.
++		 */
++		esp32_spi_write(spi, SPI_DMA_CONF_REG, SPI_RX_AFIFO_RST | SPI_BUF_AFIFO_RST);
++		esp32_spi_write(spi, SPI_DMA_CONF_REG, 0);
+ 		ret = esp32_spi_prepare_transfer(spi, device, t, n_words);
+ 		if (ret)
+ 			return ret;
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -1120,6 +1120,7 @@
+  */
+ u32 mmc_select_voltage(struct mmc_host *host, u32 ocr)
+ {
++	u32 card_ocr = ocr;
+ 	int bit;
+ 
+ 	/*
+@@ -1134,7 +1135,8 @@
+ 
+ 	ocr &= host->ocr_avail;
+ 	if (!ocr) {
+-		dev_warn(mmc_dev(host), "no support for card's volts\n");
++		dev_warn(mmc_dev(host), "no support for card's volts (OCR=%08x host=%08x)\n",
++			 card_ocr, host->ocr_avail);
+ 		return 0;
+ 	}
+ 

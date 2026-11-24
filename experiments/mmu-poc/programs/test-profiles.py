@@ -25,7 +25,8 @@ for name, selected in [('rootfs-all', set(p.PACKAGES)),
         assert (tree / 'bin/sh').readlink() == Path('busybox')
         assert (tree / 'bin/nc').readlink() == Path('busybox')
         for path in ('usr/bin/user-shell', 'usr/bin/programbench', 'usr/bin/jobq', 'usr/bin/process-test',
-                     'usr/sbin/ble-wifi-setup', 'usr/lib/libfork.so.0'):
+                     'usr/bin/neofetch', 'usr/share/esp/board-facts.sh',
+                     'usr/lib/libfork.so.0'):
             assert (tree / path).exists(), path
     r = subprocess.run(['python3', str(here / 'image-profiles.py'), 'build', '--output', str(image)],
                        capture_output=True, text=True)

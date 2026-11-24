@@ -1,2 +1,17 @@
 build-output/
 __pycache__/
+
+# espctl is compiled by the espctl stage in build/container-build.sh.
+new-files/board/espressif/esp32s3/rootfs_overlay/usr/bin/espctl
+
+# `flash.sh --backup DIR` reads /etc and /home off the board into these. They
+# hold account password hashes and wifi credentials, so they are kept out of
+# the repository by rule rather than by remembering.
+*.jffs2.bak
+
+# macOS writes one of these into every directory it browses, and `git status`
+# then reports a tree that is never actually clean -- which matters here
+# because build/reproduce-macos.sh stamps the image `-dirty` whenever
+# `git status --porcelain` is non-empty. A Finder window was enough to make
+# every build carry that marker.
+.DS_Store

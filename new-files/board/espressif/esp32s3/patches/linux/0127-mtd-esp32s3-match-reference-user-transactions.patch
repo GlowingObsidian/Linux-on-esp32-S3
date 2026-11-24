@@ -1,0 +1,46 @@
+diff --git a/drivers/mtd/devices/esp32s3-flash-nor-ll.c b/drivers/mtd/devices/esp32s3-flash-nor-ll.c
+--- a/drivers/mtd/devices/esp32s3-flash-nor-ll.c
++++ b/drivers/mtd/devices/esp32s3-flash-nor-ll.c
+@@ -11,6 +11,8 @@
+ #define SPI0 0x60003000U
+ #define EXTMEM 0x600c4000U
+ #define USR (1U << 18)
++#define FLASH_PE (1U << 17)
++#define D_Q_HIGH ((1U << 19) | (1U << 18))
+ #define COMMAND (1U << 31)
+ #define ADDRESS (1U << 30)
+ #define MISO (1U << 28)
+@@ -71,9 +73,11 @@
+ 	wr(SPI1 + 0x20, (7U << 28) | command);
+ 	wr(SPI1 + 0x24, output ? output * 8 - 1 : 0);
+ 	wr(SPI1 + 0x28, input ? input * 8 - 1 : 0);
+-	wr(SPI1, USR);
++	/* SPI_MEM_FLASH_PE marks user-mode program/erase, as in NuttX. Both
++	 * command indicators are self-clearing; poll the user transaction bit. */
++	wr(SPI1, USR | ((command == 0x02 || command == 0xd8) ? FLASH_PE : 0));
+ 	t->commands++;
+-	while (rd(SPI1)) {
++	while (rd(SPI1) & USR) {
+ 		if ((fn_u32)(cycles() - start) >= FN_COMMAND_CYCLES) {
+ 			t->result = 3;
+ 			park();
+@@ -175,7 +179,7 @@
+ 	CHECK_REGISTER(SPI0 + 0x54, t->preflight_value & 7);
+ 	CHECK_REGISTER(SPI1 + 0x54, t->preflight_value & 7);
+ 	CHECK_REGISTER(SPI0 + 0xe0, t->preflight_value & 1);
+-	CHECK_REGISTER(SPI0 + 0x08, t->preflight_value & 0x270U);
++	CHECK_REGISTER(SPI0 + 0x08, t->preflight_value & 0x3f0U);
+ 	CHECK_REGISTER(SPI1 + 0xa0, t->preflight_value & 1);
+ 	CHECK_REGISTER(SPI1 + 0x98, t->preflight_value & 1);
+ 	CHECK_REGISTER(SPI1 + 0xa4, t->preflight_value & 1);
+@@ -190,7 +194,9 @@
+ 	for (i = 0; i < 13; i++)
+ 		save[i] = rd(SPI1 + saved_offset(i));
+ 	/* SPI1 only. Leave SPI0 clock, PSRAM timing, pins and cache MMU alone. */
+-	wr(SPI1 + 0x08, 0);
++	/* NuttX sets D/Q high, and IDF's dummy-output setup uses out_level=1.
++	 * Keep every multi-line/read-mode flag off for these raw commands. */
++	wr(SPI1 + 0x08, D_Q_HIGH);
+ 	wr(SPI1 + 0x10, (save[2] & ~0x3fffU) | 1U | (1U << 7));
+ 	wr(SPI1 + 0x14, 23U | (11U << 8) | (23U << 16));
+ 	wr(SPI1 + 0x34, (save[9] & ~0xc03U) | 2U);

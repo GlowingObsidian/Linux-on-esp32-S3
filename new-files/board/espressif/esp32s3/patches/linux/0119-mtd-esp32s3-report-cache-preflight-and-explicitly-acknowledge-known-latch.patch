@@ -1,0 +1,337 @@
+--- a/drivers/mtd/devices/esp32s3-flash-guard-main.c
++++ b/drivers/mtd/devices/esp32s3-flash-guard-main.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+-/* Manual SRAM rendezvous (1) or tag-preserving cache suspend/resume (2).
+- * Both modes leave flash commands and the read-only MTD backend untouched.
++/* Manual SRAM rendezvous (1), strict cache gate (2), or a cache gate with
++ * explicit acknowledgement of the observed CPU0 status latch (3).
++ * All modes leave flash commands and the read-only MTD backend untouched.
+  */
+ #include <linux/cpu.h>
+ #include <linux/io.h>
+@@ -15,11 +16,13 @@
+ 
+ struct fg_device {
+ 	void __iomem *sram;
++	void __iomem *cache;
+ 	unsigned long iram;
+ 	struct mutex lock;
+ 	u32 code_bytes, cache_bytes, runs, mode;
+ 	int last_result;
+ 	bool checked[2], psram_ok;
++	u32 setup_before[3], setup_after[3];
+ };
+ extern const u8 esp32_flash_guard_template_start[];
+ extern const u8 esp32_flash_guard_template_end[];
+@@ -45,7 +48,7 @@
+ 	struct fg_device *fg = arg;
+ 	unsigned int cpu = raw_smp_processor_id();
+ 	typedef int (*fg_entry)(struct fg_control *, void *, unsigned int, u32);
+-	bool cache = fg->mode == 2;
++	bool cache = fg->mode != 1;
+ 	fg_entry entry = (fg_entry)(fg->iram + (cache ? FG_CACHE_CODE : 0));
+ 	struct fg_control *control = (void __force *)(fg->sram + FG_CONTROL);
+ 	void *stack = (void __force *)(fg->sram + FG_STACK(cpu) + FG_STACK_BYTES);
+@@ -88,10 +91,11 @@
+ 	ssize_t n;
+ 
+ 	mutex_lock(&fg->lock);
+-	n = sysfs_emit(buf, "runs=%u mode=%u result=%d code_bytes=%u cache_code_bytes=%u cpu0_internal=%u cpu1_internal=%u flash_operations=0 cache_changes=%u cache_stage=%u cache_off_cycles=%u peer_cache_off=%u psram_ok=%u\n",
++	n = sysfs_emit(buf, "runs=%u mode=%u result=%d code_bytes=%u cache_code_bytes=%u cpu0_internal=%u cpu1_internal=%u flash_operations=0 cache_changes=%u cache_stage=%u cache_off_cycles=%u peer_cache_off=%u psram_ok=%u cpu0_status=%u cpu1_status=%u status_acknowledged=%08x\n",
+ 		fg->runs, fg->mode, fg->last_result, fg->code_bytes, fg->cache_bytes,
+ 		fg->checked[0], fg->checked[1], readl(&c->attempt), readl(&c->stage),
+-		readl(&c->hold_cycles), readl(&c->peer_off), fg->psram_ok);
++		readl(&c->hold_cycles), readl(&c->peer_off), fg->psram_ok,
++		readl(&c->result[0]), readl(&c->result[1]), readl(&c->acknowledged));
+ 	mutex_unlock(&fg->lock);
+ 	return n;
+ }
+@@ -104,7 +108,7 @@
+ 	ssize_t n;
+ 
+ 	mutex_lock(&fg->lock);
+-	n = sysfs_emit(buf, "i_before=%08x i_after=%08x d_before=%08x d_after=%08x i_off=%08x d_off=%08x buses_off=%08x,%08x state_off=%08x errors_before=%08x,%08x,%08x errors_after=%08x,%08x,%08x irq_off=%08x,%08x windows=%08x,%08x\n",
++	n = sysfs_emit(buf, "i_before=%08x i_after=%08x d_before=%08x d_after=%08x i_off=%08x d_off=%08x buses_off=%08x,%08x state_off=%08x errors_before=%08x,%08x,%08x errors_after=%08x,%08x,%08x irq_off=%08x,%08x windows=%08x,%08x before_valid=%u off_valid=%u after_valid=%u errors_ack=%08x,%08x,%08x\n",
+ 		readl(&c->before[0]), readl(&c->after[0]),
+ 		readl(&c->before[4]), readl(&c->after[4]),
+ 		readl(&c->suspended[0]), readl(&c->suspended[1]),
+@@ -112,11 +116,40 @@
+ 		readl(&c->errors_before[0]), readl(&c->errors_before[1]), readl(&c->errors_before[2]),
+ 		readl(&c->errors_after[0]), readl(&c->errors_after[1]), readl(&c->errors_after[2]),
+ 		readl(&c->irq_off[0]), readl(&c->irq_off[1]),
+-		readl(&c->windows[0]), readl(&c->windows[1]));
++		readl(&c->windows[0]), readl(&c->windows[1]),
++		!!(readl(&c->snapshots) & 1), !!(readl(&c->snapshots) & 2),
++		!!(readl(&c->snapshots) & 4), readl(&c->errors_ack[0]),
++		readl(&c->errors_ack[1]), readl(&c->errors_ack[2]));
+ 	mutex_unlock(&fg->lock);
+ 	return n;
+ }
+ static DEVICE_ATTR_RO(cache_state);
++
++static void fg_read_errors(struct fg_device *fg, u32 errors[3])
++{
++	errors[0] = readl(fg->cache + 0xe4);
++	errors[1] = readl(fg->cache + 0xf0);
++	errors[2] = readl(fg->cache + 0xfc);
++}
++
++static ssize_t cache_live_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct fg_device *fg = dev_get_drvdata(dev);
++	u32 errors[3];
++	ssize_t n;
++
++	mutex_lock(&fg->lock);
++	fg_read_errors(fg, errors);
++	n = sysfs_emit(buf, "i_ctrl=%08x i_bus=%08x d_ctrl=%08x d_bus=%08x errors=%08x,%08x,%08x setup_before=%08x,%08x,%08x setup_after=%08x,%08x,%08x\n",
++		readl(fg->cache + 0x60), readl(fg->cache + 0x64),
++		readl(fg->cache), readl(fg->cache + 4),
++		errors[0], errors[1], errors[2],
++		fg->setup_before[0], fg->setup_before[1], fg->setup_before[2],
++		fg->setup_after[0], fg->setup_after[1], fg->setup_after[2]);
++	mutex_unlock(&fg->lock);
++	return n;
++}
++static DEVICE_ATTR_RO(cache_live);
+ 
+ static ssize_t test_store(struct device *dev, struct device_attribute *attr,
+ 			  const char *buf, size_t count)
+@@ -128,12 +161,18 @@
+ 	int ret;
+ 
+ 	ret = kstrtouint(buf, 0, &value);
+-	if (ret || (value != 1 && value != 2))
++	if (ret || (value != 1 && value != 2 && value != 3))
+ 		return -EINVAL;
+ 	mutex_lock(&fg->lock);
+ 	fg->mode = value;
+ 	fg->psram_ok = false;
+-	if (value == 2) {
++	memset_io(c, 0, sizeof(*c));
++	for (cpu = 0; cpu < 2; cpu++) {
++		fg->checked[cpu] = false;
++		writel(FG_CANARY, fg->sram + FG_STACK(cpu));
++	}
++	writel(value == 3, &c->ack_request);
++	if (value != 1) {
+ 		/* A temporary dirty PSRAM page exercises tag/data preservation.
+ 		 * It is never touched while caches are suspended.
+ 		 */
+@@ -150,11 +189,6 @@
+ 		ret = -ENODEV;
+ 		goto out;
+ 	}
+-	memset_io(c, 0, sizeof(*c));
+-	for (cpu = 0; cpu < 2; cpu++) {
+-		fg->checked[cpu] = false;
+-		writel(FG_CANARY, fg->sram + FG_STACK(cpu));
+-	}
+ 	asm volatile("memw\n\tisync" ::: "memory");
+ 	ret = stop_machine_cpuslocked(fg_cpu, fg, cpu_online_mask);
+ 	for (cpu = 0; cpu < 2; cpu++) {
+@@ -163,17 +197,19 @@
+ 		u32 status = readl(&c->result[cpu]);
+ 		u32 ready = readl(&c->ready[cpu]);
+ 		unsigned long low = FG_BASE + FG_STACK(cpu);
+-		unsigned long code = fg->iram + (value == 2 ? FG_CACHE_CODE : 0);
+-		u32 bytes = value == 2 ? fg->cache_bytes : fg->code_bytes;
++		unsigned long code = fg->iram + (value != 1 ? FG_CACHE_CODE : 0);
++		u32 bytes = value != 1 ? fg->cache_bytes : fg->code_bytes;
+ 
+ 		pc = (pc & 0x3fffffff) | (fg->iram & 0xc0000000);
+-		fg->checked[cpu] = ready == 1 && !status && sp >= low + 32 &&
++		fg->checked[cpu] = ready == 1 && sp >= low + 32 &&
+ 			sp < low + FG_STACK_BYTES && pc >= code && pc < code + bytes &&
+ 			readl(fg->sram + FG_STACK(cpu)) == FG_CANARY;
+ 		if (!fg->checked[cpu] && !ret)
+ 			ret = -EIO;
+-	}
+-	if (value == 2) {
++		if (status && !ret)
++			ret = status == 3 ? -ETIMEDOUT : (status == 5 ? -EBUSY : -EIO);
++	}
++	if (value != 1) {
+ 		fg->psram_ok = true;
+ 		for (i = 0; i < 1024; i++)
+ 			if (probe[i] != (0x5639a721 ^ (i * 0x10201)))
+@@ -186,9 +222,17 @@
+ 		    (readl(&c->suspended[2]) & 3) != 3 || (readl(&c->suspended[3]) & 3) != 3 ||
+ 		    readl(&c->state_off) != 0x1001 || readl(&c->hold_cycles) < FG_HOLD_CYCLES))
+ 			ret = -EIO;
+-		for (i = 0; i < 3; i++)
+-			if (readl(&c->errors_before[i]) || readl(&c->errors_after[i]))
++		for (i = 0; i < 3; i++) {
++			u32 allowed = value == 3 && i == 1 ? readl(&c->acknowledged) : 0;
++
++			if (!ret && ((readl(&c->errors_before[i]) & ~allowed) ||
++			    readl(&c->errors_after[i]) || readl(&c->errors_ack[i])))
+ 				ret = -EIO;
++		}
++		if (!ret && readl(&c->acknowledged) &&
++		    (value != 3 || readl(&c->acknowledged) != 2 ||
++		     readl(&c->errors_before[1]) != 2))
++			ret = -EIO;
+ 	}
+ 	fg->runs++;
+ out:
+@@ -197,9 +241,13 @@
+ unlock:
+ 	fg->last_result = ret;
+ 	mutex_unlock(&fg->lock);
+-	if (ret)
++	if (ret == -EBUSY && value != 1 && readl(&c->stage) == 1)
++		dev_warn(dev, "cache preflight blocked before cache changes; saved status=%08x,%08x,%08x ack=%08x errno=%d\n",
++			readl(&c->errors_before[0]), readl(&c->errors_before[1]),
++			readl(&c->errors_before[2]), readl(&c->acknowledged), ret);
++	else if (ret)
+ 		dev_warn(dev, "non-writing guard mode %u failed: %d\n", value, ret);
+-	else if (value == 2)
++	else if (value != 1)
+ 		dev_info(dev, "cache suspend/resume passed on both CPUs; PSRAM intact, no flash commands\n");
+ 	else
+ 		dev_info(dev, "internal-memory dry run passed on both CPUs; no flash/cache changes\n");
+@@ -208,7 +256,8 @@
+ static DEVICE_ATTR_WO(test);
+ 
+ static struct attribute *fg_attrs[] = {
+-	&dev_attr_result.attr, &dev_attr_cache_state.attr, &dev_attr_test.attr, NULL,
++	&dev_attr_result.attr, &dev_attr_cache_state.attr,
++	&dev_attr_cache_live.attr, &dev_attr_test.attr, NULL,
+ };
+ static const struct attribute_group fg_group = { .attrs = fg_attrs };
+ 
+@@ -241,6 +290,10 @@
+ 	static_assert(offsetof(struct fg_control, errors_after) == FGC_ERRORS_AFTER);
+ 	static_assert(offsetof(struct fg_control, suspended) == FGC_SUSPENDED);
+ 	static_assert(offsetof(struct fg_control, peer_off) == FGC_PEER_OFF);
++	static_assert(offsetof(struct fg_control, ack_request) == FGC_ACK_REQUEST);
++	static_assert(offsetof(struct fg_control, errors_ack) == FGC_ERRORS_ACK);
++	static_assert(offsetof(struct fg_control, acknowledged) == FGC_ACKNOWLEDGED);
++	static_assert(offsetof(struct fg_control, snapshots) == FGC_SNAPSHOTS);
+ 	static_assert(sizeof(struct fg_control) == FGC_BYTES);
+ 	static_assert(FG_CONTROL + FGC_BYTES <= FG_STACK(0));
+ 	if (!res || res->start != FG_BASE || resource_size(res) != FG_BYTES)
+@@ -251,6 +304,9 @@
+ 	fg->sram = devm_ioremap_resource(&pdev->dev, res);
+ 	if (IS_ERR(fg->sram))
+ 		return PTR_ERR(fg->sram);
++	fg->cache = devm_ioremap(&pdev->dev, 0x600c4000, 0x158);
++	if (!fg->cache)
++		return -ENOMEM;
+ 	fg->iram = FG_BASE + FG_ALIAS;
+ 	fg->last_result = -ENODATA;
+ 	fg->code_bytes = esp32_flash_guard_template_end - esp32_flash_guard_template_start;
+@@ -259,12 +315,15 @@
+ 	    !fg->cache_bytes || fg->cache_bytes > FG_CONTROL - FG_CACHE_CODE)
+ 		return -E2BIG;
+ 	mutex_init(&fg->lock);
++	fg_read_errors(fg, fg->setup_before);
+ 	ret = fg_copy(fg, 0, esp32_flash_guard_template_start, fg->code_bytes);
+ 	if (!ret)
+ 		ret = fg_copy(fg, FG_CACHE_CODE, esp32_flash_cache_template_start, fg->cache_bytes);
+ 	if (ret)
+ 		return ret;
+ 	asm volatile("memw\n\tisync" ::: "memory");
++	fg_read_errors(fg, fg->setup_after);
++	memset_io(fg->sram + FG_CONTROL, 0, sizeof(struct fg_control));
+ 	platform_set_drvdata(pdev, fg);
+ 	return devm_device_add_group(&pdev->dev, &fg_group);
+ }
+--- a/drivers/mtd/devices/esp32s3-flash-guard-cache.S
++++ b/drivers/mtd/devices/esp32s3-flash-guard-cache.S
+@@ -248,12 +248,37 @@
+     FG_SNAPSHOT FGC_BEFORE, 0x60, 0x64, 0xa0, 0x154
+     FG_SNAPSHOT (FGC_BEFORE + 16), 0, 4, 0x4c, 0x150
+     FG_ERRORS FGC_ERRORS_BEFORE
++    movi a6, 1
++    s32i a6, a2, FGC_SNAPSHOTS
+     l32i a7, a2, FGC_ERRORS_BEFORE
+-    l32i a8, a2, (FGC_ERRORS_BEFORE + 4)
++    FG_BNEZ a7, .Lprecondition
++    l32i a7, a2, (FGC_ERRORS_BEFORE + 8)
++    FG_BNEZ a7, .Lprecondition
++    l32i a7, a2, (FGC_ERRORS_BEFORE + 4)
++    beqz a7, .Lerrors_clean
++    /* Mode 3 alone may acknowledge the captured CPU0 IBUS_WR_ICACHE
++     * latch. Preserve its original value and read back all three status
++     * words. Pinned S3 cache_ll clears this latch through W1C at +0xec.
++     * Neither other bits nor an immediately recurring error are accepted.
++     */
++    l32i a8, a2, FGC_ACK_REQUEST
++    bbsi a8, 0, .Lack_requested
++    j .Lprecondition
++.Lack_requested:
++    movi a8, 2
++    beq a7, a8, .Lack_known
++    j .Lprecondition
++.Lack_known:
++    s32i a8, a2, FGC_ACKNOWLEDGED
++    FG_WRITE a8, 0xec
++    FG_ERRORS FGC_ERRORS_ACK
++    l32i a7, a2, FGC_ERRORS_ACK
++    l32i a8, a2, (FGC_ERRORS_ACK + 4)
+     or a7, a7, a8
+-    l32i a8, a2, (FGC_ERRORS_BEFORE + 8)
++    l32i a8, a2, (FGC_ERRORS_ACK + 8)
+     or a7, a7, a8
+     FG_BNEZ a7, .Lprecondition
++.Lerrors_clean:
+     FG_PREFLIGHT FGC_BEFORE, 0xa0, 0x94, 0x154
+     FG_PREFLIGHT (FGC_BEFORE + 16), 0x4c, 0x40, 0x150
+     l32i a7, a2, FGC_ABORT
+@@ -278,6 +303,8 @@
+     s32i a7, a2, (FGC_SUSPENDED + 12)
+     FG_READ a7, 0x130
+     s32i a7, a2, FGC_STATE_OFF
++    movi a6, 3
++    s32i a6, a2, FGC_SNAPSHOTS
+     movi a6, 3
+     s32i a6, a2, FGC_STAGE
+     memw
+@@ -332,6 +359,10 @@
+     FG_COMPARE (FGC_BEFORE + 24), (FGC_AFTER + 24), -9
+     FG_COMPARE (FGC_BEFORE + 28), (FGC_AFTER + 28), -5
+     FG_ERRORS FGC_ERRORS_AFTER
++    l32i a6, a2, FGC_SNAPSHOTS
++    movi a7, 4
++    or a6, a6, a7
++    s32i a6, a2, FGC_SNAPSHOTS
+     movi a6, 5
+     s32i a6, a2, FGC_STAGE
+     memw
+--- a/drivers/mtd/devices/esp32s3-flash-guard-layout.h
++++ b/drivers/mtd/devices/esp32s3-flash-guard-layout.h
+@@ -39,7 +39,11 @@
+ #define FGC_SUSPENDED 192
+ #define FGC_STATE_OFF 208
+ #define FGC_PEER_OFF 212
+-#define FGC_BYTES 216
++#define FGC_ACK_REQUEST 216
++#define FGC_ERRORS_ACK 220
++#define FGC_ACKNOWLEDGED 232
++#define FGC_SNAPSHOTS 236
++#define FGC_BYTES 240
+ 
+ #ifndef __ASSEMBLER__
+ struct fg_control {
+@@ -48,6 +52,8 @@
+ 	u32 irq_off[2], irq_saved[2], ps[2], nmi[2], windows[2];
+ 	u32 before[8], after[8], errors_before[3], errors_after[3];
+ 	u32 suspended[4], state_off, peer_off;
++	u32 ack_request, errors_ack[3], acknowledged;
++	u32 snapshots;
+ };
+ #endif
+ #endif
+--- a/drivers/mtd/devices/Kconfig
++++ b/drivers/mtd/devices/Kconfig
+@@ -234,4 +234,6 @@
+ 	  Tests a relocated SRAM/IRAM two-CPU rendezvous and internal stacks.
+ 	  Manual sysfs mode 1 tests SRAM only; mode 2 suspends/resumes caches
+ 	  while retaining tags, with both CPUs on internal stacks. No flash
+-	  programming, erase, or automatic cache test. Development hardware gate.
++	  programming or erase. Mode 3 additionally acknowledges only a saved
++	  CPU0 IBUS-write status latch (0x02), then requires a clean readback.
++	  Cache tests are manual. Development hardware gate.

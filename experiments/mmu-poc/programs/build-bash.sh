@@ -12,9 +12,25 @@ apply_program_patch "$source_dir" bash-pid-cache.patch
 apply_program_patch "$source_dir" bash-vfork.patch
 # Compiles the patched bgp_resize() out of jobs.c into a host fixture.
 python3 "$programs_dir/test-bash-pid-cache.py" "$source_dir" "$programs_out/bash-pid-cache-test"
-staging="$build_dir/build-buildroot-esp32s3_devkit_c1_16m/staging"
+staging="$build_dir/build-buildroot-arduino_nano_esp32/staging"
 export CPPFLAGS="-I$staging/usr/include"
-export CFLAGS="$CFLAGS -Oz -flto --sysroot=$staging"
+# -flto-partition=none is required, not a size tweak. With the pinned
+# crosstool-NG GCC 14.1.0, a bare `-flto` link of bash aborts inside the
+# compiler every time:
+#     lto1: internal compiler error: in return_token, at opts-common.cc:2158
+# The trigger is the make jobserver. The identical link succeeds under
+# `make -j1`, and fails under `make -j6`; a two-file program with the same
+# flags links fine under `make -j6`, so it needs a large object set before it
+# shows. lto-wrapper reaches for the jobserver to run its LTRANS jobs, and
+# something in that path aborts the option parser.
+# A single partition removes the need: lto-wrapper then runs the one job
+# itself and never asks the jobserver for slots. Verified on this tree --
+# `make -j6` with this flag links, and produces a smaller binary than the
+# serial LTO link (1373128 vs 1399196 bytes here), so it costs nothing.
+# `-flto=4` does NOT work: jobserver mode takes precedence over an explicit
+# partition count. See build/container-build.sh, which hits the same bug on
+# the fork/real make.
+export CFLAGS="$CFLAGS -Oz -flto -flto-partition=none --sysroot=$staging"
 export LDFLAGS="$LDFLAGS --sysroot=$staging -L$staging/usr/lib -Wl,-rpath-link,$staging/usr/lib"
 cd "$source_dir"
 if [[ -f Makefile ]]; then make clean; fi

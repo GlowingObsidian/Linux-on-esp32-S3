@@ -1,0 +1,66 @@
+Subject: [PATCH] esp32 wifi: permit measured TX CPU and high-resolution retry comparisons
+
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -663,6 +663,31 @@
+ static atomic_t wifi_tx_queue_full = ATOMIC_INIT(0);
+ static unsigned int wifi_iram_bytes;
+ 
++/* Controlled A/B settings: apply between traffic runs. Workqueue ownership
++ * and serialization remain unchanged; CPU0/legacy retry are boot defaults.
++ */
++static unsigned int wifi_tx_cpu;
++static bool wifi_retry_hires;
++static int wifi_tx_cpu_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned int cpu;
++	int ret = kstrtouint(val, 0, &cpu);
++
++	if (ret)
++		return ret;
++	if (cpu > 1 || !cpu_online(cpu))
++		return -EINVAL;
++	WRITE_ONCE(*(unsigned int *)kp->arg, cpu);
++	return 0;
++}
++static const struct kernel_param_ops wifi_tx_cpu_ops = {
++	.set = wifi_tx_cpu_set,
++	.get = param_get_uint,
++};
++module_param_cb(tx_cpu, &wifi_tx_cpu_ops, &wifi_tx_cpu, 0644);
++module_param_named(retry_hires, wifi_retry_hires, bool, 0644);
++
++
+ static int wifi_stats_get(char *buffer, const struct kernel_param *kp)
+ {
+ 	(void)kp;
+@@ -4519,10 +4544,16 @@
+ 		if (ret != 0x101 || time_after_eq(jiffies, deadline))
+ 			break;
+ 		started = wifi_time_start();
+-		wait_event_timeout(hw->tx_wait,
+-			READ_ONCE(hw->tx_stopping) ||
+-			atomic_read(&wifi_tx_done) != sequence,
+-			msecs_to_jiffies(2));
++		if (READ_ONCE(wifi_retry_hires))
++			wait_event_hrtimeout(hw->tx_wait,
++				READ_ONCE(hw->tx_stopping) ||
++				atomic_read(&wifi_tx_done) != sequence,
++				ms_to_ktime(2));
++		else
++			wait_event_timeout(hw->tx_wait,
++				READ_ONCE(hw->tx_stopping) ||
++				atomic_read(&wifi_tx_done) != sequence,
++				msecs_to_jiffies(2));
+ 		wifi_time_record(WIFI_TIME_TX_RETRY, started);
+ 	}
+ 	if (ret)
+@@ -4609,7 +4640,7 @@
+ 		/* Queue under the same lock as shutdown so flush cannot miss
+ 		 * a packet accepted immediately before stopping was set.
+ 		 */
+-		queue_work_on(0, system_long_wq, &hw->tx_work);
++		queue_work_on(READ_ONCE(wifi_tx_cpu), system_long_wq, &hw->tx_work);
+ 	}
+ 	spin_unlock_irqrestore(&hw->tx_q.lock, flags);
+ 	if (!ret)

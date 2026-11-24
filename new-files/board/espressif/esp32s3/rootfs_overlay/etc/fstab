@@ -7,10 +7,9 @@ devpts		/dev/pts	devpts	defaults,gid=5,mode=620,ptmxmode=0666	0	0
 # "tmpfs" is the tiny-shmem stub over ramfs, whose only mount parameter is
 # mode. A size= or nr_inodes= option is rejected at mount time and the
 # filesystem is not mounted at all -- verified on the board. A runaway write
-# to /tmp takes memory until the OOM killer acts; keep large files on /home.
+# to /tmp takes memory until the OOM killer acts. /home is on the read-only
+# rootfs now, so it is not somewhere to put large files either.
 tmpfs		/dev/shm	tmpfs	mode=0777	0	0
 tmpfs		/tmp		tmpfs	mode=1777	0	0
 tmpfs		/run		tmpfs	mode=0755,nosuid,nodev	0	0
 sysfs		/sys		sysfs	defaults	0	0
-mtd:etc		/etc		jffs2	nofail		0	0
-mtd:home	/home		jffs2	nofail		0	0

@@ -1,0 +1,486 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: paulneja <207793167+paulneja@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 09:00:00 -0300
+Subject: [PATCH 69/69] fbtft: st7789v panel geometry, settable at runtime
+
+The 240x240 ST7789 module is a 240x240 window onto a 240x320 controller.
+Which 240 of the 320 rows are wired to glass is a property of the module's
+own wiring, and nothing in fbtft or in the devicetree can express it. This
+adds the knobs needed to find out what this particular module wants -- and
+to change the answer without reflashing the board.
+
+Four things are unknown until the panel is in front of us:
+
+  1. The row offset. The dominant convention is bottom-aligned, visible
+     rows 80..319, which is what Adafruit's library hardcodes for every
+     240x240 module (`_rowstart = 320 - height`). A top-aligned module
+     wants 0. There is no way to tell from the datasheet.
+
+  2. The MADCTL value. fb_st7789v.c's set_var() sends 0x00 at rotation 0;
+     Adafruit sends 0xC0 (MX|MY) for the same module. Changing the offset
+     without the matching MADCTL, or the reverse, produces a shifted or
+     mirrored image with no way to attribute which change caused it.
+
+  3. Whether colour inversion is right. init_display() ends with an
+     unconditional MIPI_DCS_ENTER_INVERT_MODE (HSD20_IPS is 1), which is
+     correct for the HSD20 IPS glass the driver was written for and is
+     also what Adafruit does -- but it is a one-line flip if it is wrong,
+     and an inverted panel is otherwise indistinguishable from a broken
+     one.
+
+  4. The column offset, for the same reason as (1) at the other rotation.
+     Zero for every module seen so far; here so that a module that needs
+     one does not need a second patch.
+
+So each is a devicetree property with a working default, and each is also
+a writable sysfs attribute beside the existing `debug` file. The node
+carries the values that should be right; the sysfs files are for finding
+out which ones are, from the serial console, with `echo`, without
+rebuilding and reflashing a kernel that takes hours under emulation.
+
+The devicetree properties are bare names, matching every other fbtft
+property: fbtft_property_value() is device_property_read_u32(dev, name,
+&val) and there is no vendor prefix anywhere in fbtft_properties_read().
+
+Offsets are applied in set_addr_win(), which is the mechanism fb_ili9163.c
+already uses for the same problem (its __OFFSET is 32 or 0 depending on
+the glass). fbtft_update_display() calls set_addr_win(par, 0, start_line,
+xres - 1, end_line) and then passes the same start_line to write_vmem as a
+byte offset into screen_buffer, so shifting the window here shifts the
+image and nothing else -- the buffer, the length and the frame layout are
+untouched.
+
+The offset is added at rotate 0 and 90 and not at 180 and 270, following
+fb_ili9163.c: the MADCTL bits for the higher rotations flip the address
+counters, so the same physical rows are reached from the other end and
+adding the offset again would double it.
+
+The invert knob lives in fb_st7789v.c rather than beside the others,
+because hsd20_ips is that file's own variable. The core gets it there
+through a pair of optional hooks, display->sysfs_init and ->sysfs_exit,
+which fbtft_sysfs_init()/exit() call after creating the geometry knobs. A
+driver that sets neither gets no extra attributes, so nothing changes for
+the other fbtft drivers. The hook exists rather than a plain pointer to
+the flag because a pointer taken in a static initialiser is a compile-time
+constant, and GCC warns about that under -Waddress, which this tree builds
+with -Werror.
+
+The geometry writes take effect on the next redraw, and schedule one, so a
+write is visible immediately rather than at the next thing that happens to
+dirty a line. The invert write takes effect at the next init_display(),
+which is where the command is sent.
+
+Signed-off-by: paulneja <207793167+paulneja@users.noreply.github.com>
+---
+
+ drivers/staging/fbtft/fbtft.h       |  20 ++++++++++++++++++++
+ drivers/staging/fbtft/fbtft-core.c  |  15 +++++++++++++++
+ drivers/staging/fbtft/fbtft-sysfs.c | 119 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/staging/fbtft/fb_st7789v.c  | 109 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++-------
+ 4 files changed, 256 insertions(+), 7 deletions(-)
+
+--- a/drivers/staging/fbtft/fbtft.h
++++ b/drivers/staging/fbtft/fbtft.h
+@@ -106,6 +106,17 @@
+ struct fbtft_display {
+ 	unsigned int width;
+ 	unsigned int height;
++	unsigned int row_offset;
++	unsigned int col_offset;
++	unsigned int madctl;
++	/* Optional: a driver's own sysfs attributes, created and removed by
++	 * the core beside the geometry knobs. Lets a driver expose a knob
++	 * over its own file-static state without the core having to know
++	 * about it, and without taking that state's address in a static
++	 * initialiser (which GCC folds to a constant and warns about under
++	 * -Waddress). */
++	void (*sysfs_init)(struct device *dev);
++	void (*sysfs_exit)(struct device *dev);
+ 	unsigned int regwidth;
+ 	unsigned int buswidth;
+ 	unsigned int backlight;
+@@ -136,6 +147,9 @@
+ 	struct fbtft_display display;
+ 	unsigned int rotate;
+ 	bool bgr;
++	unsigned int row_offset;
++	unsigned int col_offset;
++	unsigned int madctl;
+ 	unsigned int fps;
+ 	int txbuflen;
+ 	u8 startbyte;
+@@ -229,6 +243,12 @@
+ 	bool first_update_done;
+ 	ktime_t update_time;
+ 	bool bgr;
++	unsigned int row_offset;
++	unsigned int col_offset;
++	unsigned int madctl;
++	bool madctl_forced;
++	void (*sysfs_init)(struct device *dev);
++	void (*sysfs_exit)(struct device *dev);
+ 	void *extra;
+ 	bool polarity;
+ };
+--- a/drivers/staging/fbtft/fbtft-core.c
++++ b/drivers/staging/fbtft/fbtft-core.c
+@@ -548,6 +548,12 @@
+ 		display->buswidth = pdata->display.buswidth;
+ 	if (pdata->display.regwidth)
+ 		display->regwidth = pdata->display.regwidth;
++	if (pdata->display.row_offset)
++		display->row_offset = pdata->display.row_offset;
++	if (pdata->display.col_offset)
++		display->col_offset = pdata->display.col_offset;
++	if (pdata->display.madctl)
++		display->madctl = pdata->display.madctl;
+ 
+ 	display->debug |= debug;
+ 	fbtft_expand_debug_value(&display->debug);
+@@ -644,6 +650,12 @@
+ 	par->gamma.num_values = display->gamma_len;
+ 	mutex_init(&par->gamma.lock);
+ 	info->pseudo_palette = par->pseudo_palette;
++	par->row_offset = display->row_offset;
++	par->col_offset = display->col_offset;
++	par->madctl = display->madctl;
++	par->madctl_forced = display->madctl != 0;
++	par->sysfs_init = display->sysfs_init;
++	par->sysfs_exit = display->sysfs_exit;
+ 
+ 	if (par->gamma.curves && gamma) {
+ 		if (fbtft_gamma_parse_str(par, par->gamma.curves, gamma,
+@@ -1100,6 +1112,9 @@
+ 
+ 	pdata->display.width = fbtft_property_value(dev, "width");
+ 	pdata->display.height = fbtft_property_value(dev, "height");
++	pdata->display.row_offset = fbtft_property_value(dev, "row-offset");
++	pdata->display.col_offset = fbtft_property_value(dev, "col-offset");
++	pdata->display.madctl = fbtft_property_value(dev, "madctl");
+ 	pdata->display.regwidth = fbtft_property_value(dev, "regwidth");
+ 	pdata->display.buswidth = fbtft_property_value(dev, "buswidth");
+ 	pdata->display.backlight = fbtft_property_value(dev, "backlight");
+--- a/drivers/staging/fbtft/fbtft-sysfs.c
++++ b/drivers/staging/fbtft/fbtft-sysfs.c
+@@ -1,4 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0
++#include <linux/fb.h>
++
+ #include "fbtft.h"
+ #include "internal.h"
+ 
+@@ -198,6 +200,113 @@
+ 	return sysfs_emit(buf, "%lu\n", par->debug);
+ }
+ 
++/*
++ * The geometry knobs. These exist because the panel's own wiring decides
++ * which 240 rows of the controller's 320 are on the glass, and nothing can
++ * read that out of the module -- it has to be tried. Writing one of these
++ * and redrawing is the whole experiment.
++ *
++ * A write schedules a full redraw so the effect is visible immediately at
++ * the console, rather than at the next thing that happens to dirty a line.
++ */
++static void fbtft_redraw(struct fbtft_par *par)
++{
++	par->fbtftops.mkdirty(par->info, 0, par->info->var.yres);
++}
++
++static ssize_t show_row_offset(struct device *device,
++			       struct device_attribute *attr, char *buf)
++{
++	struct fb_info *fb_info = dev_get_drvdata(device);
++	struct fbtft_par *par = fb_info->par;
++
++	return sysfs_emit(buf, "%u\n", par->row_offset);
++}
++
++static ssize_t store_row_offset(struct device *device,
++				struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	struct fb_info *fb_info = dev_get_drvdata(device);
++	struct fbtft_par *par = fb_info->par;
++	unsigned int val;
++	int ret;
++
++	ret = kstrtouint(buf, 10, &val);
++	if (ret)
++		return ret;
++
++	par->row_offset = val;
++	fbtft_redraw(par);
++	return count;
++}
++
++static struct device_attribute row_offset_device_attr =
++	__ATTR(row_offset, 0660, show_row_offset, store_row_offset);
++
++static ssize_t show_col_offset(struct device *device,
++			       struct device_attribute *attr, char *buf)
++{
++	struct fb_info *fb_info = dev_get_drvdata(device);
++	struct fbtft_par *par = fb_info->par;
++
++	return sysfs_emit(buf, "%u\n", par->col_offset);
++}
++
++static ssize_t store_col_offset(struct device *device,
++				struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	struct fb_info *fb_info = dev_get_drvdata(device);
++	struct fbtft_par *par = fb_info->par;
++	unsigned int val;
++	int ret;
++
++	ret = kstrtouint(buf, 10, &val);
++	if (ret)
++		return ret;
++
++	par->col_offset = val;
++	fbtft_redraw(par);
++	return count;
++}
++
++static struct device_attribute col_offset_device_attr =
++	__ATTR(col_offset, 0660, show_col_offset, store_col_offset);
++
++static ssize_t show_madctl(struct device *device,
++			   struct device_attribute *attr, char *buf)
++{
++	struct fb_info *fb_info = dev_get_drvdata(device);
++	struct fbtft_par *par = fb_info->par;
++
++	return sysfs_emit(buf, "%u\n", par->madctl_forced ? par->madctl : 0);
++}
++
++static ssize_t store_madctl(struct device *device,
++			    struct device_attribute *attr,
++			    const char *buf, size_t count)
++{
++	struct fb_info *fb_info = dev_get_drvdata(device);
++	struct fbtft_par *par = fb_info->par;
++	unsigned int val;
++	int ret;
++
++	ret = kstrtouint(buf, 0, &val);
++	if (ret)
++		return ret;
++	if (val > 0xff)
++		return -EINVAL;
++
++	par->madctl = val;
++	par->madctl_forced = true;
++	par->fbtftops.set_var(par);
++	return count;
++}
++
++static struct device_attribute madctl_device_attr =
++	__ATTR(madctl, 0660, show_madctl, store_madctl);
++
+ static struct device_attribute debug_device_attr =
+ 	__ATTR(debug, 0660, show_debug, store_debug);
+ 
+@@ -210,6 +319,11 @@
+ 		return;
+ 
+ 	device_create_file(dev, &debug_device_attr);
++	device_create_file(dev, &row_offset_device_attr);
++	device_create_file(dev, &col_offset_device_attr);
++	device_create_file(dev, &madctl_device_attr);
++	if (par->sysfs_init)
++		par->sysfs_init(dev);
+ 	if (par->gamma.curves && par->fbtftops.set_gamma)
+ 		device_create_file(dev, &gamma_device_attrs[0]);
+ }
+@@ -223,6 +337,11 @@
+ 		return;
+ 
+ 	device_remove_file(dev, &debug_device_attr);
++	device_remove_file(dev, &row_offset_device_attr);
++	device_remove_file(dev, &col_offset_device_attr);
++	device_remove_file(dev, &madctl_device_attr);
++	if (par->sysfs_exit)
++		par->sysfs_exit(dev);
+ 	if (par->gamma.curves && par->fbtftops.set_gamma)
+ 		device_remove_file(dev, &gamma_device_attrs[0]);
+ }
+--- a/drivers/staging/fbtft/fb_st7789v.c
++++ b/drivers/staging/fbtft/fb_st7789v.c
+@@ -28,8 +28,61 @@
+ 	"D0 05 0A 09 08 05 2E 44 45 0F 17 16 2B 33\n" \
+ 	"D0 05 0A 09 08 05 2E 43 45 0F 16 16 2B 33"
+ 
+-#define HSD20_IPS 1
++/*
++ * The HSD20 IPS glass this driver was written for wants colour inversion,
++ * and so do most ST7789 modules, so this stays the default. It is a
++ * variable rather than the original `#define HSD20_IPS 1` only so that
++ * the invert knob can turn it off without a rebuild -- an inverted panel
++ * is otherwise indistinguishable from a broken one.
++ */
++static bool hsd20_ips = true;
+ 
++/*
++ * The invert knob. init_display() sends MIPI_DCS_ENTER_INVERT_MODE when
++ * hsd20_ips is set, which is right for the HSD20 IPS glass the driver was
++ * written for and for most ST7789 modules -- but it is a one-line flip if
++ * this module disagrees, and an inverted panel is otherwise
++ * indistinguishable from a broken one. The next init_display() honours it.
++ *
++ * It is registered here rather than in fbtft-sysfs.c because hsd20_ips is
++ * this file's own variable: a generic hook would have to take its address
++ * in a static initialiser, and GCC folds that to a constant and warns
++ * under -Waddress, which this tree builds with -Werror.
++ */
++static ssize_t show_invert(struct device *device,
++			   struct device_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%d\n", hsd20_ips ? 1 : 0);
++}
++
++static ssize_t store_invert(struct device *device,
++			    struct device_attribute *attr,
++			    const char *buf, size_t count)
++{
++	unsigned int val;
++	int ret;
++
++	ret = kstrtouint(buf, 10, &val);
++	if (ret)
++		return ret;
++
++	hsd20_ips = val ? true : false;
++	return count;
++}
++
++static struct device_attribute invert_device_attr =
++	__ATTR(invert, 0660, show_invert, store_invert);
++
++static void st7789v_sysfs_init(struct device *dev)
++{
++	device_create_file(dev, &invert_device_attr);
++}
++
++static void st7789v_sysfs_exit(struct device *dev)
++{
++	device_remove_file(dev, &invert_device_attr);
++}
++
+ /**
+  * enum st7789v_command - ST7789V display controller commands
+  *
+@@ -156,7 +209,7 @@
+ 
+ 	/* set pixel format to RGB-565 */
+ 	write_reg(par, MIPI_DCS_SET_PIXEL_FORMAT, MIPI_DCS_PIXEL_FMT_16BIT);
+-	if (HSD20_IPS)
++	if (hsd20_ips)
+ 		write_reg(par, PORCTRL, 0x05, 0x05, 0x00, 0x33, 0x33);
+ 
+ 	else
+@@ -166,7 +219,7 @@
+ 	 * VGH = 13.26V
+ 	 * VGL = -10.43V
+ 	 */
+-	if (HSD20_IPS)
++	if (hsd20_ips)
+ 		write_reg(par, GCTRL, 0x75);
+ 	else
+ 		write_reg(par, GCTRL, 0x35);
+@@ -181,7 +234,7 @@
+ 	 * VAP =  4.1V + (VCOM + VCOM offset + 0.5 * VDV)
+ 	 * VAN = -4.1V + (VCOM + VCOM offset + 0.5 * VDV)
+ 	 */
+-	if (HSD20_IPS)
++	if (hsd20_ips)
+ 		write_reg(par, VRHS, 0x13);
+ 	else
+ 		write_reg(par, VRHS, 0x0B);
+@@ -190,7 +243,7 @@
+ 	write_reg(par, VDVS, 0x20);
+ 
+ 	/* VCOM = 0.9V */
+-	if (HSD20_IPS)
++	if (hsd20_ips)
+ 		write_reg(par, VCOMS, 0x22);
+ 	else
+ 		write_reg(par, VCOMS, 0x20);
+@@ -211,8 +264,8 @@
+ 
+ 	write_reg(par, MIPI_DCS_SET_DISPLAY_ON);
+ 
+-	if (HSD20_IPS)
+-		write_reg(par, MIPI_DCS_ENTER_INVERT_MODE);
++	write_reg(par, hsd20_ips ? MIPI_DCS_ENTER_INVERT_MODE :
++		  MIPI_DCS_EXIT_INVERT_MODE);
+ 
+ 	return 0;
+ }
+@@ -259,6 +312,42 @@
+ 	}
+ 
+ 	return ret;
++}
++
++/*
++ * set_addr_win() - the address window, shifted by the module's own offset
++ *
++ * The controller's GRAM is 240x320 and this module shows 240x240 of it.
++ * fbtft's own fbtft_set_addr_win() always starts the window at column 0,
++ * row 0, so a bottom-aligned module (visible rows 80..319) shows the top
++ * 80 rows of the frame off the glass and 80 rows of nothing at the
++ * bottom. Adding the offset here is the whole fix.
++ *
++ * The offset goes on at rotate 0 and 90 only, as in fb_ili9163.c: at 180
++ * and 270 the MADCTL bits flip the address counters, so the same physical
++ * rows are reached from the other end of the range and adding the offset
++ * again would put it on twice.
++ */
++static void set_addr_win(struct fbtft_par *par, int xs, int ys, int xe, int ye)
++{
++	switch (par->info->var.rotate) {
++	case 0:
++		ys += par->row_offset;
++		ye += par->row_offset;
++		break;
++	case 90:
++		xs += par->col_offset;
++		xe += par->col_offset;
++		break;
++	}
++
++	write_reg(par, MIPI_DCS_SET_COLUMN_ADDRESS,
++		  (xs >> 8) & 0xFF, xs & 0xFF, (xe >> 8) & 0xFF, xe & 0xFF);
++
++	write_reg(par, MIPI_DCS_SET_PAGE_ADDRESS,
++		  (ys >> 8) & 0xFF, ys & 0xFF, (ye >> 8) & 0xFF, ye & 0xFF);
++
++	write_reg(par, MIPI_DCS_WRITE_MEMORY_START);
+ }
+ 
+ /**
+@@ -289,6 +378,9 @@
+ 	default:
+ 		return -EINVAL;
+ 	}
++	if (par->madctl_forced)
++		madctl_par = par->madctl;
++
+ 	write_reg(par, MIPI_DCS_SET_ADDRESS_MODE, madctl_par);
+ 	return 0;
+ }
+@@ -373,8 +465,11 @@
+ 	.gamma_num = 2,
+ 	.gamma_len = 14,
+ 	.gamma = HSD20_IPS_GAMMA,
++	.sysfs_init = st7789v_sysfs_init,
++	.sysfs_exit = st7789v_sysfs_exit,
+ 	.fbtftops = {
+ 		.init_display = init_display,
++		.set_addr_win = set_addr_win,
+ 		.write_vmem = write_vmem,
+ 		.set_var = set_var,
+ 		.set_gamma = set_gamma,

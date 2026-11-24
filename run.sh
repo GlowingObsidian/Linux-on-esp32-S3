@@ -5,7 +5,7 @@ set -uo pipefail
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$REPO" || exit 1
 
-JOBS=${JOBS:-$( (nproc 2>/dev/null || echo 4) )}
+JOBS=${JOBS:-$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )}
 PORT=${PORT:-}
 ARTIFACTS=${ARTIFACTS:-}
 ASSUME_YES=0
@@ -13,6 +13,10 @@ QUIET=0
 ACTION=""
 LOGDIR=${LOGDIR:-$(dirname "$REPO")}
 BOARD_ID_HINT="usb-1a86"
+# The Arduino Nano ESP32 has no USB-serial bridge chip: it exposes the
+# ESP32-S3's own USB-Serial/JTAG unit, Espressif 303a:1001. Linux names that
+# under /dev/serial/by-id/ with the product string, macOS calls it usbmodem.
+BOARD_ID_HINT_JTAG="USB_JTAG_serial_debug_unit"
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -71,6 +75,15 @@ EOF
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# GNU coreutils spells it sha256sum, macOS (and anything with perl's shasum)
+# spells it shasum -a 256. Both accept -c against a SHA256SUMS file.
+sha256_cmd() {
+	if have sha256sum; then printf 'sha256sum'
+	elif have shasum; then printf 'shasum -a 256'
+	else return 1
+	fi
+}
+
 python_with() {
 	local candidate
 	for candidate in \
@@ -107,19 +120,26 @@ python_with_pyserial() {
 	return 1
 }
 
-disk_free_gb() {
-    local available_kb
-    available_kb=$(df -Pk "$REPO" | awk 'NR==2 {print $4}')
-    [[ "$available_kb" =~ ^[0-9]+$ ]] || return 1
-    echo $((available_kb / 1024 / 1024))
-}
+# GNU df takes -B; BSD df does not, so ask for 1K blocks and do the arithmetic.
+disk_free_gb() { df -Pk "$REPO" 2>/dev/null | awk 'NR==2 {printf "%d", $4 / 1048576}'; }
+
 detect_port() {
 	local p
 	if [ -n "$PORT" ]; then printf '%s\n' "$PORT"; return 0; fi
 	for p in /dev/serial/by-id/*"$BOARD_ID_HINT"*; do
 		[ -e "$p" ] && { printf '%s\n' "$p"; return 0; }
 	done
+	for p in /dev/serial/by-id/*"$BOARD_ID_HINT_JTAG"*; do
+		[ -e "$p" ] && { printf '%s\n' "$p"; return 0; }
+	done
 	for p in /dev/serial/by-id/*; do
+		[ -e "$p" ] && { printf '%s\n' "$p"; return 0; }
+	done
+	# macOS. cu.* rather than tty.*: the tty.* nodes block on open waiting for
+	# carrier detect, which never comes on a USB CDC device. The board's own
+	# USB-Serial/JTAG unit is a usbmodem; usbserial-/wchusbserial- are external
+	# adapters people wire to the UART pins, so they are the fallback.
+	for p in /dev/cu.usbmodem* /dev/cu.usbserial-* /dev/cu.wchusbserial*; do
 		[ -e "$p" ] && { printf '%s\n' "$p"; return 0; }
 	done
 	for p in /dev/ttyACM0 /dev/ttyACM1 /dev/ttyUSB0 /dev/ttyUSB1; do
@@ -131,7 +151,13 @@ detect_port() {
 port_holders() {
 	local target
 	target=$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")
-	fuser "$target" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' || true
+	# macOS has lsof but no fuser; most Linux systems have fuser in psmisc but
+	# not necessarily lsof. Either one gives the pids holding the device.
+	if have fuser; then
+		fuser "$target" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' || true
+	elif have lsof; then
+		lsof -t "$target" 2>/dev/null || true
+	fi
 }
 
 free_port() {
@@ -190,9 +216,10 @@ check_env() {
 	bold "== Environment =="
 	local problems=0 py free port
 
-	for c in git docker python3 sha256sum awk; do
+	for c in git docker python3 awk; do
 		if have "$c"; then info "ok       $c"; else red "  missing  $c"; problems=$((problems+1)); fi
 	done
+	if sha_cmd=$(sha256_cmd); then info "ok       $sha_cmd"; else red "  missing  sha256sum or shasum"; problems=$((problems+1)); fi
 
 	if docker info >/dev/null 2>&1; then
 		info "ok       docker responds"
@@ -284,15 +311,31 @@ do_build() {
 		warn "only ${free} GB free and the build takes about 21 GB"
 		ask "  Continue anyway?" || return 1
 	fi
-	clean_tree_or_fix || return 1
+	# reproduce.sh is Linux only: GNU df, a clean-tree requirement, and a
+	# git-archive snapshot of HEAD that would silently drop uncommitted work.
+	# The macOS wrapper handles all three, and additionally resumes from the
+	# stage markers instead of recompiling the toolchain every run.
+	local script="$REPO/build/reproduce.sh" emulated=0
+	if [ "$(uname -s)" = Darwin ]; then
+		script="$REPO/build/reproduce-macos.sh"
+		emulated=1
+		[ -x "$script" ] || die "$script is missing or not executable"
+	else
+		clean_tree_or_fix || return 1
+	fi
 	local log="$LOGDIR/esp32-build-$(date +%Y%m%d-%H%M%S).log"
 	info "jobs:  $JOBS"
 	info "log:   $log"
 	echo
 	bold "This downloads and compiles a cross toolchain, the kernel, the"
 	bold "firmware and the userspace from source. It takes a long time:"
-	bold "roughly 40 minutes on 8 jobs, longer on fewer, and it needs"
-	bold "about 21 GB. The build output scrolls below as it happens."
+	if [ "$emulated" = 1 ]; then
+		bold "under amd64 emulation on Apple Silicon, hours on the first run."
+		bold "Later runs resume from the stage markers and take minutes."
+	else
+		bold "roughly 40 minutes on 8 jobs, longer on fewer."
+	fi
+	bold "It needs about 21 GB. The build output scrolls below as it happens."
 	echo
 	[ "$QUIET" = 1 ] && info "(quiet: output only goes to the log)"
 	ask "  Start the build?" || { info "cancelled"; return 1; }
@@ -300,10 +343,10 @@ do_build() {
 	local started rc elapsed
 	started=$(date +%s)
 	if [ "$QUIET" = 1 ]; then
-		JOBS="$JOBS" bash "$REPO/build/reproduce.sh" > "$log" 2>&1
+		JOBS="$JOBS" bash "$script" > "$log" 2>&1
 		rc=$?
 	else
-		JOBS="$JOBS" bash "$REPO/build/reproduce.sh" 2>&1 | tee "$log"
+		JOBS="$JOBS" bash "$script" 2>&1 | tee "$log"
 		rc=${PIPESTATUS[0]}
 	fi
 	elapsed=$(( $(date +%s) - started ))
@@ -324,7 +367,7 @@ do_verify() {
 	local a; a=$(latest_artifacts) || { red "no artifacts; build first"; return 1; }
 	info "${a#$REPO/}"
 	[ -f "$a/SHA256SUMS" ] || { red "SHA256SUMS is missing"; return 1; }
-	if ( cd "$a" && sha256sum -c SHA256SUMS ) | sed 's/^/  /'; then
+	if ( cd "$a" && $(sha256_cmd) -c SHA256SUMS ) | sed 's/^/  /'; then
 		green "every artifact matches"
 		return 0
 	fi
@@ -427,28 +470,21 @@ do_test() {
 }
 
 do_recover() {
-	bold "== Restore /etc and /home to factory =="
-	local a port
-	a=$(latest_artifacts) || { red "no artifacts to take the partitions from"; return 1; }
-	port=$(detect_port) || { red "no board detected"; return 1; }
-	for f in etc.jffs2 home.jffs2; do
-		[ -f "$a/$f" ] || { red "$a/$f is missing"; return 1; }
-	done
-	red "this erases the current /etc and /home on the board"
-	ask "  Continue?" || return 1
-	free_port "$port" || return 1
-	# The hyphenated spellings are esptool 5 only, and build/Dockerfile pins
-	# 4.8.1, which rejects them -- so this failed against the very version the
-	# project builds with. The underscore forms work in both: esptool 5 takes
-	# them with a deprecation warning. The offsets are the etc and home
-	# partitions; flash.sh reads those from the CSV instead of hardcoding them.
-	local tool; tool=$(have esptool && echo esptool || echo esptool.py)
-	"$tool" --chip esp32s3 --port "$port" --baud 460800 \
-		--before default_reset --after hard_reset \
-		write_flash 0xd0000 "$a/etc.jffs2" 0xcc0000 "$a/home.jffs2"
-	local rc=$?
-	[ "$rc" -eq 0 ] && green "partitions restored; the board was reset" || red "the restore failed"
-	return "$rc"
+	bold "== Restore a board to factory =="
+	# There is nothing to restore any more. --recover used to rewrite the etc
+	# and home jffs2 partitions from the last build's artifacts, putting a
+	# used board back to a fresh-flash state without touching the kernel or
+	# the rootfs. Both partitions are gone: /etc and /home are inside the
+	# read-only cramfs, so there is no writable state on the board to put
+	# back, and the artifacts no longer contain etc.jffs2 or home.jffs2.
+	#
+	# A full reflash is what does it now, and that is what the message says
+	# rather than failing on a missing file.
+	yellow "there are no separate /etc or /home partitions to restore"
+	info "  /etc and /home are part of the read-only rootfs; the board keeps no"
+	info "  writable state, so a fresh flash is already a factory state."
+	info "  use --flash (or ./flash.sh) to write the whole image."
+	return 0
 }
 
 do_repro() {

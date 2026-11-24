@@ -54,7 +54,6 @@ def architecture(c):
     out.append(text(52, 98, 'Core 0', 17, c['fg'], 600))
     out.append(text(120, 98, 'ESP-IDF 5.1 and FreeRTOS', 15, c['muted']))
     for i, s in enumerate(['owns the WiFi radio and the 802.11 MAC',
-                           'NimBLE peripheral, Nordic UART service',
                            'writes the flash when Linux asks',
                            'boots first and starts Linux on core 1']):
         out.append(bullet(56, 140 + i * 34, s, c))
@@ -64,10 +63,10 @@ def architecture(c):
     out.append(box(702, 62, 470, 280, c['card'], c['accent']))
     out.append(text(726, 98, 'Core 1', 17, c['fg'], 600))
     out.append(text(794, 98, 'Linux 7.2.4, NOMMU, runs from flash', 15, c['muted']))
-    for i, s in enumerate(['esp32-ng driver: espsta0 and /dev/esp-ble',
+    for i, s in enumerate(['esp32-ng driver: espsta0',
                            'fork() by swapping memory banks',
                            'Bash, BusyBox, Dash, MicroPython, Make',
-                           'dropbear or telnetd, cron, nano, curl']):
+                           'dropbear, nano, curl']):
         out.append(bullet(730, 140 + i * 34, s, c))
     out.append(box(726, 290, 422, 32, c['accent_soft'], 'none', 6))
     out.append(text(740, 311, 'xipImage + cramfs, executed in place', 13, c['accent'], 500, mono=True))
@@ -77,7 +76,7 @@ def architecture(c):
     out.append(f'<path d="M 690 {y} l -9 -5 v 10 z" fill="{c["muted"]}"/>')
     out.append(f'<path d="M 510 {y} l 9 -5 v 10 z" fill="{c["muted"]}"/>')
     out.append(text(600, y - 14, 'shared-memory IPC', 14, c['fg'], 600, 'middle'))
-    out.append(text(600, y + 26, 'WiFi frames, BLE bytes,', 13, c['muted'], anchor='middle'))
+    out.append(text(600, y + 26, 'WiFi frames,', 13, c['muted'], anchor='middle'))
     out.append(text(600, y + 44, 'flash commands', 13, c['muted'], anchor='middle'))
 
     out.append(box(1, 392, 470, 230, c['card'], c['line'], 14))

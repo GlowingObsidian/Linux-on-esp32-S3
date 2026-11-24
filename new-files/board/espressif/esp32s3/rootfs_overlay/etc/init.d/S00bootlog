@@ -1,18 +1,29 @@
 #!/bin/sh
 #
-# Unmute the console at boot when `bootlog verbose` asked for it. Raising the
-# level only affects what comes next, so the buffer is replayed once for what
-# came before. S00 so the gap is as small as an init script can make it.
+# Put the console back where `bootlog verbose` left it, at boot. With no marker
+# this does nothing at all, so the level stays at the kernel's own default --
+# which is why `bootlog quiet` lasts only for the boot it was run on. Raising
+# the level only affects what comes next, so when the console was held back the
+# buffer is replayed once for what came before. S00 so the gap is as small as an
+# init script can make it.
 
 FLAG=${BOOTLOG_DIR:-/etc/bootlog}/verbose
 LEVEL=${BOOTLOG_LEVEL:-/proc/sys/kernel/printk}
+CMDLINE=${BOOTLOG_CMDLINE:-/proc/cmdline}
 
 case "$1" in
 	start)
 		[ -e "$FLAG" ] || exit 0
 		echo 8 > "$LEVEL" 2>/dev/null || exit 0
-		echo 'bootlog: verbose; replaying the log buffered before init'
-		dmesg || :
+		echo 'bootlog: verbose; console shows every level'
+		# Replay only if the console was actually held back. `quiet` on the
+		# kernel command line leaves everything before init in the buffer
+		# unprinted, and this is the only chance to show it. This image's
+		# command line carries no `quiet` (patches 0049 and 0060), so the
+		# boot already streamed live and dmesg here would print it twice.
+		if grep -qw quiet "$CMDLINE" 2>/dev/null; then
+			dmesg || :
+		fi
 		;;
 	stop)
 		;;

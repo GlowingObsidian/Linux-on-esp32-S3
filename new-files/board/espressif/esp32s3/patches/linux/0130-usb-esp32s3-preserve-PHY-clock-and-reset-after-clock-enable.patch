@@ -1,0 +1,50 @@
+Subject: [PATCH] usb: esp32s3: preserve PHY clock and reset after clock enable
+
+diff --git a/drivers/net/wireless/espressif/esp32-ng/esp_blob_phy.c b/drivers/net/wireless/espressif/esp32-ng/esp_blob_phy.c
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob_phy.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob_phy.c
+@@ -294,6 +294,7 @@
+  * it does not initialize g_phyFuns or calibrate the radio.
+  */
+ extern int register_chipv7_phy(const void *init_data, void *cal_data, int mode);
++extern void phy_bbpll_en_usb(bool en);
+ extern void *g_phyFuns;
+ #define PHY_RF_CAL_FULL 2
+ static DEFINE_MUTEX(phy_init_lock);
+@@ -374,6 +375,11 @@
+ 
+ 	mutex_lock(&phy_init_lock);
+ 	if (!phy_calibrated) {
++		/* IDF phy_init.c preserves the shared USB PLL output before
++		 * calibration. The vendor routine consumes this flag there.
++		 */
++		if (IS_ENABLED(CONFIG_PHY_ESP32S3_USB))
++			phy_bbpll_en_usb(true);
+ 		ret = register_chipv7_phy(phy_init_data, phy_rf_cal_data, PHY_RF_CAL_FULL);
+ 		if (!ret && !READ_ONCE(g_phyFuns))
+ 			ret = -EIO;
+diff --git a/drivers/usb/dwc2/platform.c b/drivers/usb/dwc2/platform.c
+--- a/drivers/usb/dwc2/platform.c
++++ b/drivers/usb/dwc2/platform.c
+@@ -113,6 +113,21 @@
+ 			goto err_dis_utmi_clk;
+ 	}
+ 
++	/* IDF enables the USB gate and pulses the peripheral reset before
++	 * configuring the PHY. Deasserting an inherited reset alone leaves
++	 * firmware state behind. Resume keeps ll_hw_enabled set and restores
++	 * saved controller state, so it must not receive this initial pulse.
++	 */
++	if (!hsotg->ll_hw_enabled &&
++	    of_device_is_compatible(hsotg->dev->of_node, "esp,esp32s3-usb")) {
++		ret = reset_control_assert(hsotg->reset);
++		if (ret)
++			goto err_dis_clk;
++		ret = reset_control_deassert(hsotg->reset);
++		if (ret)
++			goto err_dis_clk;
++	}
++
+ 	if (hsotg->uphy) {
+ 		ret = usb_phy_init(hsotg->uphy);
+ 	} else if (hsotg->plat && hsotg->plat->phy_init) {

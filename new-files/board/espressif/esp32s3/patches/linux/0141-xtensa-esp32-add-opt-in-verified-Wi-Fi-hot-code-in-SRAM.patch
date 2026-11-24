@@ -1,0 +1,204 @@
+Subject: [PATCH] xtensa esp32 add opt-in boot-relocated and verified Wi-Fi hot code in SRAM
+
+diff --git a/arch/xtensa/kernel/vmlinux.lds.S b/arch/xtensa/kernel/vmlinux.lds.S
+--- a/arch/xtensa/kernel/vmlinux.lds.S
++++ b/arch/xtensa/kernel/vmlinux.lds.S
+@@ -393,6 +393,9 @@
+     RELOCATE_ENTRY(_xip_text, .xiptext);
+ #endif
+ #endif
++#ifdef CONFIG_ESP32_WIFI_IRAM
++    RELOCATE_ENTRY(_esp32_wifi_iram, .esp32.wifi.iram);
++#endif
+ #ifdef CONFIG_XIP_KERNEL
+     RELOCATE_ENTRY(_xip_data, .data);
+     RELOCATE_ENTRY(_xip_init_data, .init.data);
+@@ -530,6 +533,34 @@
+ #define LAST .esp32.atomic.lock
+ #endif
+ #endif
++#ifdef CONFIG_ESP32_WIFI_IRAM
++#if MERGED_VECTORS
++#error ESP32 Wi-Fi IRAM requires the explicit boot relocation table
++#endif
++  /* SRAM1 data alias 0x3fca0000..0x3fcb0000. Firmware PT_LOADs end
++   * below this reservation; vectors, ROM globals and DMA pools are separate.
++   * Include the vendor's literal-bearing IRAM input sections together. */
++  .esp32.wifi.iram 0x40390000 :
++    AT(((LOADADDR(LAST) + SIZEOF(LAST)) + 3) & ~3)
++  {
++    _esp32_wifi_iram_start = ABSOLUTE(.);
++    *(.wifi0iram .wifi0iram.*)
++    *(.wifirxiram .wifirxiram.*)
++    *(.wifislpiram .wifislpiram.*)
++    *(.wifiorslpiram .wifiorslpiram.*)
++    *(.wifislprxiram .wifislprxiram.*)
++    *(.wifiextrairam .wifiextrairam.*)
++    *(.iram1 .iram1.*)
++    . = ALIGN(4);
++    _esp32_wifi_iram_end = ABSOLUTE(.);
++  }
++  _esp32_wifi_iram_load = LOADADDR(.esp32.wifi.iram);
++  ASSERT(SIZEOF(.esp32.wifi.iram) > 0, "Wi-Fi IRAM section is empty")
++  ASSERT(_esp32_wifi_iram_end <= 0x403a0000, "Wi-Fi IRAM exceeds its 64-KiB reservation")
++  ASSERT(CONFIG_VECTORS_ADDR + 0x1000 <= 0x40390000, "Wi-Fi IRAM overlaps vectors")
++#undef LAST
++#define LAST .esp32.wifi.iram
++#endif
+   . = (LOADADDR(LAST) + SIZEOF(LAST) + 3) & ~ 3;
+ 
+   .dummy1 : AT(ADDR(.dummy1)) { LONG(0) }
+diff --git a/drivers/net/wireless/espressif/esp32-ng/Kconfig b/drivers/net/wireless/espressif/esp32-ng/Kconfig
+--- a/drivers/net/wireless/espressif/esp32-ng/Kconfig
++++ b/drivers/net/wireless/espressif/esp32-ng/Kconfig
+@@ -27,6 +27,17 @@
+ 	  host them directly, instead of talking to ESP-IDF firmware on the
+ 	  other core over shared memory.
+ 
++config ESP32_WIFI_IRAM
++	bool "Place ESP32-S3 vendor Wi-Fi hot code in reserved internal SRAM"
++	depends on ESP32_WIFI_BLOB && XTENSA_SMP_ESP32 && XIP_KERNEL
++	default n
++	help
++	  Opt-in performance profile. Copy the vendor's marked IRAM sections
++	  at boot to 0x40390000 (data alias 0x3fca0000), with a 64-KiB limit.
++	  The board must provide the matching wifi-iram resource. Probe checks
++	  its ownership and compares every loaded word before starting Wi-Fi.
++	  This does not move the general Linux heap out of PSRAM.
++
+ config ESP32_WIFI_SPI
+ 	bool
+ 
+diff --git a/arch/xtensa/include/asm/sections.h b/arch/xtensa/include/asm/sections.h
+--- a/arch/xtensa/include/asm/sections.h
++++ b/arch/xtensa/include/asm/sections.h
+@@ -2,6 +2,14 @@
+ 
+ #ifndef _XTENSA_SECTIONS_H
+ #define _XTENSA_SECTIONS_H
++
++#ifdef CONFIG_ESP32_WIFI_IRAM
++extern char _esp32_wifi_iram_start[], _esp32_wifi_iram_end[];
++extern char _esp32_wifi_iram_load[];
++#define arch_is_kernel_text(addr) \
++	((addr) >= (unsigned long)_esp32_wifi_iram_start && \
++	 (addr) < (unsigned long)_esp32_wifi_iram_end)
++#endif
+ 
+ #include <asm-generic/sections.h>
+ 
+diff --git a/include/asm-generic/sections.h b/include/asm-generic/sections.h
+--- a/include/asm-generic/sections.h
++++ b/include/asm-generic/sections.h
+@@ -208,10 +208,14 @@
+  * Returns: true if the address is located in .text, false otherwise.
+  * Note: an internal helper, only check the range of _stext to _etext.
+  */
++#ifndef arch_is_kernel_text
++#define arch_is_kernel_text(addr) false
++#endif
++
+ static inline bool __is_kernel_text(unsigned long addr)
+ {
+-	return addr >= (unsigned long)_stext &&
+-	       addr < (unsigned long)_etext;
++	return (addr >= (unsigned long)_stext &&
++		addr < (unsigned long)_etext) || arch_is_kernel_text(addr);
+ }
+ 
+ /**
+@@ -229,7 +233,7 @@
+ 	return ((addr >= (unsigned long)_stext &&
+ 	         addr < (unsigned long)_end) ||
+ 		(addr >= (unsigned long)__init_begin &&
+-		 addr < (unsigned long)__init_end));
++		 addr < (unsigned long)__init_end)) || arch_is_kernel_text(addr);
+ }
+ 
+ #endif /* _ASM_GENERIC_SECTIONS_H_ */
+diff --git a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -31,6 +31,7 @@
+ 
+ #define pr_fmt(fmt) "esp32-wifi-blob: " fmt
+ 
++#include <asm/sections.h>
+ #include <linux/atomic.h>
+ #include <linux/bitmap.h>
+ #include <linux/unaligned.h>
+@@ -660,12 +661,13 @@
+ static atomic_t wifi_tx_done = ATOMIC_INIT(0);
+ static atomic_t wifi_tx_done_failed = ATOMIC_INIT(0);
+ static atomic_t wifi_tx_queue_full = ATOMIC_INIT(0);
++static unsigned int wifi_iram_bytes;
+ 
+ static int wifi_stats_get(char *buffer, const struct kernel_param *kp)
+ {
+ 	(void)kp;
+ 	return scnprintf(buffer, PAGE_SIZE,
+-		"sram_total=%zu sram_free=%zu tx_calls=%d tx_no_mem=%d tx_accepted=%d tx_failed=%d tx_done=%d tx_done_failed=%d tx_queue_full=%d tx_mode=static static_tx=%d cache_tx=%d cache_tx_enabled=%d\n",
++		"sram_total=%zu sram_free=%zu tx_calls=%d tx_no_mem=%d tx_accepted=%d tx_failed=%d tx_done=%d tx_done_failed=%d tx_queue_full=%d tx_mode=static static_tx=%d cache_tx=%d cache_tx_enabled=%d iram_bytes=%u\n",
+ 		osi_internal_pool ? gen_pool_size(osi_internal_pool) : 0,
+ 		osi_internal_pool ? gen_pool_avail(osi_internal_pool) : 0,
+ 		atomic_read(&wifi_tx_calls), atomic_read(&wifi_tx_no_mem),
+@@ -674,7 +676,7 @@
+ 		atomic_read(&wifi_tx_queue_full),
+ 		config_get_wifi_static_tx_buffer_num(),
+ 		config_get_wifi_cache_tx_buffer_num(),
+-		config_is_cache_tx_buf_enabled());
++		config_is_cache_tx_buf_enabled(), READ_ONCE(wifi_iram_bytes));
+ }
+ 
+ static const struct kernel_param_ops wifi_stats_ops = {
+@@ -4676,6 +4678,37 @@
+ module_param_cb(enable, &wifi_blob_enable_ops, &wifi_blob_enable, 0644);
+ MODULE_PARM_DESC(enable, "Run the Wi-Fi blob at probe (default: off)");
+ 
++#ifdef CONFIG_ESP32_WIFI_IRAM
++static int blob_verify_iram(struct platform_device *pdev)
++{
++	struct resource *res;
++	const u32 *dst = (const u32 *)_esp32_wifi_iram_start;
++	const u32 *src = (const u32 *)_esp32_wifi_iram_load;
++	unsigned long size = _esp32_wifi_iram_end - _esp32_wifi_iram_start;
++	unsigned long i;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "wifi-iram");
++	if (!res || res->start != 0x3fca0000 || resource_size(res) != 0x10000 ||
++	    (unsigned long)dst != 0x40390000 || !size || (size & 3) ||
++	    size > resource_size(res))
++		return -EINVAL;
++	if (!devm_request_mem_region(&pdev->dev, res->start, resource_size(res),
++				     "esp32-wifi-iram"))
++		return -EBUSY;
++	/* head.S must already have copied this entry, just like the vectors.
++	 * Use aligned words: the source is in the flash instruction window. */
++	for (i = 0; i < size / sizeof(u32); i++) {
++		if (READ_ONCE(dst[i]) != READ_ONCE(src[i])) {
++			dev_err(&pdev->dev, "Wi-Fi IRAM boot copy mismatch at word %lu\n", i);
++			return -EIO;
++		}
++	}
++	WRITE_ONCE(wifi_iram_bytes, size);
++	dev_info(&pdev->dev, "verified %lu Wi-Fi hot-code bytes in internal IRAM\n", size);
++	return 0;
++}
++#endif
++
+ static int esp32_wifi_blob_probe(struct platform_device *pdev)
+ {
+ 	struct esp_wifi_blob *hw;
+@@ -4683,6 +4716,12 @@
+ 	int ret, i;
+ 	struct resource *sram;
+ 	void __iomem *sram_base;
++
++#ifdef CONFIG_ESP32_WIFI_IRAM
++	ret = blob_verify_iram(pdev);
++	if (ret)
++		return ret;
++#endif
+ 
+ 	/* Fail before touching the radio if the board has no owned SRAM. */
+ 	sram = platform_get_resource_byname(pdev, IORESOURCE_MEM, "wifi-sram");

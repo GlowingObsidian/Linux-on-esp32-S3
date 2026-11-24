@@ -1,0 +1,634 @@
+From: Shreyan Dey <shreyan@example.com>
+Subject: [PATCH] misc: esp32-gdma: the S3's general DMA engine
+
+The ESP32-S3's general DMA engine has no driver in this tree. It is
+needed for the SPI panel: the PIO path copies every byte on the CPU,
+and the point of bringing up DMA is to take that copy off it.
+
+Before any of that, the engine has to be shown to move a byte at all,
+and that turned out to be blocked by something worth writing down.
+
+The engine's descriptor list must live in internal SRAM (TRM 3.4.1).
+The plan was a userspace program that mmaps that window, builds the
+descriptor there and pokes the registers. It does not work, and the
+reason is structural rather than a bug: on this NOMMU kernel mmap of
+a device window is bookkeeping. remap_pfn_range() checks that the
+address the driver returned equals the pfn, sets VM_IO|VM_PFNMAP and
+returns 0 -- it installs no translation, because there is no page
+table to install one into.
+
+Measured, with a probe that mmaps the window and reports:
+
+  3fc88000-3fd00000 rw-S 00000000 00:07 99  /dev/esp32-regs
+  wrote 0xa5c3e10d, read 0x00000000
+  0xa5c3e10d appears nowhere else in the window
+
+The VMA is exactly right and the store does not land anywhere. The
+kernel reaches the same address without difficulty, because ioremap()
+on this build is the identity (CONFIG_MMU is off). So the descriptor
+is built on the kernel side.
+
+This is also the right shape regardless of the mmap failure: a real
+DMA driver takes a buffer and a length, not a raw descriptor window,
+and the SPI driver that follows needs the same thing.
+
+The driver exposes /dev/esp32-gdma with one ioctl, ESP32_GDMA_MEMCPY,
+taking {src, dst, len}. It stages the data through internal SRAM,
+builds the 12-byte descriptor, starts channel 0 in memory-to-memory
+mode and polls for completion. It also releases the engine from reset
+and enables its clock at probe, which until now had to be done by two
+writes after every boot.
+
+Where the descriptor lives is not the driver's choice, and that is
+the second thing worth writing down. Internal SRAM on this board is
+core 0's memory: the ESP-IDF firmware runs out of it and Linux runs
+entirely out of PSRAM, so nothing on the Linux side can tell which
+part of the internal block is in use. Two addresses were tried and
+both were wrong for different reasons. 0x3fcfe000 is the L1 data
+cache's own SRAM rather than general-purpose RAM, so writes to it
+vanish. 0x3fc90000 reads back correctly and is inside core 0's
+.dram0.data and .dram0.bss; the engine wrote over live firmware data
+and core 0 took a StoreProhibited exception and reset the board.
+
+So the firmware reserves a block and hands it over. It takes the top
+64 KiB of its own DRAM segment with SOC_RESERVE_MEMORY_REGION, which
+removes it from core 0's heap before the allocator is built, and
+passes memmap=64Kmk72.shx3fccc700 on the kernel command line so memblock
+reserves the same range on the Linux side. By the time this driver
+probes, neither core can allocate there. The driver's DMA_SRAM_BASE
+is that address and is not a constant it may change on its own.
+
+Signed-off-by: Shreyan Dey <shreyan@example.com>
+
+---
+--- /dev/null
++++ b/drivers/misc/esp32-gdma.c
+@@ -0,0 +1,493 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * esp32-gdma -- the ESP32-S3's general DMA engine, for memory-to-memory.
++ *
++ * Why this exists, and why it is not a userspace program
++ * -----------------------------------------------------
++ * The plan was a userspace program: mmap the internal SRAM window where GDMA
++ * requires its descriptor list to live (TRM 3.4.1), build the descriptor
++ * there, poke the registers through /dev/esp32-regs, and watch the bytes
++ * move. That program exists -- dmatest.c -- and it does not work, for a
++ * reason that is worth writing down because it is not obvious and it is not
++ * fixable from userspace.
++ *
++ * On this kernel mmap() of a device window is bookkeeping and nothing more.
++ * There is no page table to install a translation into, so remap_pfn_range()
++ * on NOMMU does not map anything: it checks that the address the driver
++ * returned equals the pfn it was given, sets VM_IO|VM_PFNMAP, and returns 0
++ * (mm/nommu.c:1595). The kernel records the VMA and returns the address, and
++ * the store goes nowhere.
++ *
++ * Measured, not deduced. mmprobe.c mmaps the window and reports:
++ *
++ *   3fc88000-3fd00000 rw-S 00000000 00:07 99  /dev/esp32-regs
++ *   wrote 0xa5c3e10d, read 0x00000000
++ *   0xa5c3e10d appears nowhere else in the window
++ *
++ * The VMA is exactly right -- address, size, permissions, backing device --
++ * and the store does not land anywhere.
++ *
++ * The kernel itself has no such problem: ioremap() on this build is the
++ * identity (CONFIG_MMU is off, so include/asm-generic/io.h:1128 applies), and
++ * kernel accesses to the same address work. So the descriptor list has to be
++ * built on the kernel side. That is this driver.
++ *
++ * It is also the right shape regardless. A real DMA driver does not hand
++ * userspace a raw descriptor window; it takes a buffer and a length. The SPI
++ * driver that eventually uses this needs the descriptor built in the kernel
++ * too, so nothing here is a workaround for the mmap failure -- it is the
++ * thing that would have been built anyway.
++ *
++ * What it does
++ * ------------
++ * One ioctl, ESP32_GDMA_MEMCPY, taking {src, dst, len}. Both addresses are
++ * physical, because that is what the engine uses. The driver:
++ *
++ *   1. releases GDMA from reset and enables its clock in the system block
++ *      (SYSTEM_PERIP_RST_EN1_REG / SYSTEM_PERIP_CLK_EN1_REG, bit 6). Without
++ *      this the engine reads back as all zeroes -- GDMA_DATE returns
++ *      0x00000000 instead of 0x02101180 -- and every register write is
++ *      accepted and ignored. This is the permanent fix for what has until
++ *      now been two echo commands typed after every boot.
++ *   2. copies the caller's source buffer into the internal SRAM window,
++ *      builds the descriptor there, starts channel 0, polls for completion,
++ *      and copies the result back out.
++ *
++ * The copy in and out is deliberate for this first version. The engine must
++ * read and write internal SRAM, and userspace cannot give it a pointer into
++ * internal SRAM, so the driver stages the data. A later version takes
++ * addresses the caller already owns (a framebuffer, an SPI FIFO) and does no
++ * copying at all.
++ *
++ * The descriptor
++ * --------------
++ * 12 bytes, and the layout is not negotiable -- it is what the engine reads:
++ *
++ *   dw0     size[11:0] | length[23:12] | suc_eof[30] | owner[31]
++ *   buffer  the address the engine reads from or writes to
++ *   next    the next descriptor, or 0
++ *
++ * Bitfield order is compiler-dependent, so the word is built by hand rather
++ * than declared as a bitfield. Getting it wrong is the failure that looks
++ * like "the engine did nothing".
++ *
++ * Memory-to-memory
++ * ----------------
++ * GDMA_MEM_TRANS_EN_CH0 (bit 4 of IN_CONF0) is what makes the in channel read
++ * from memory instead of waiting for a peripheral to feed it. It exists on
++ * the IN channel only -- there is no OUT_MEM_TRANS_EN_CH0 in the S3's map,
++ * and bit 4 of OUT_CONF0 is GDMA_OUTDSCR_BURST_EN_CH0, a different thing.
++ * Setting the wrong one leaves the transfer waiting for a peripheral that
++ * never arrives.
++ */
++
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/fs.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++
++#include <uapi/linux/esp32-gdma.h>
++
++#define DRV_NAME	"esp32-gdma"
++
++/* The GDMA register block. */
++#define GDMA_BASE	0x6003F000UL
++#define GDMA_DATE	(GDMA_BASE + 0x40C)
++#define GDMA_DATE_VAL	0x02101180
++
++/* Channel 0. */
++#define GDMA_IN_CONF0		(GDMA_BASE + 0x000)
++#define GDMA_IN_INT_RAW		(GDMA_BASE + 0x008)
++#define GDMA_IN_INT_CLR		(GDMA_BASE + 0x014)
++#define GDMA_IN_LINK		(GDMA_BASE + 0x020)
++#define GDMA_OUT_CONF0		(GDMA_BASE + 0x060)
++#define GDMA_OUT_INT_RAW	(GDMA_BASE + 0x068)
++#define GDMA_OUT_INT_CLR	(GDMA_BASE + 0x074)
++#define GDMA_OUT_LINK		(GDMA_BASE + 0x080)
++
++/* IN_CONF0. */
++#define IN_RST			BIT(0)
++#define IN_MEM_TRANS_EN		BIT(4)
++/* OUT_CONF0. */
++#define OUT_RST			BIT(0)
++
++/* IN_LINK / OUT_LINK. */
++#define INLINK_START		BIT(22)
++#define INLINK_ADDR_MASK	0x000FFFFF
++#define OUTLINK_START		BIT(21)
++#define OUTLINK_ADDR_MASK	0x000FFFFF
++
++/* Interrupt raw bits. */
++#define IN_DONE			BIT(0)
++#define IN_SUC_EOF		BIT(1)
++#define IN_DSCR_ERR		BIT(3)
++#define OUT_DONE		BIT(0)
++#define OUT_EOF			BIT(1)
++#define OUT_DSCR_ERR		BIT(2)
++
++/* The system block: peripheral clock gates and reset lines. */
++#define SYS_BASE		0x600C0000UL
++#define SYSTEM_PERIP_CLK_EN1	(SYS_BASE + 0x01C)
++#define SYSTEM_PERIP_RST_EN1	(SYS_BASE + 0x024)
++#define SYSTEM_DMA_CLK_EN	BIT(6)
++#define SYSTEM_DMA_RST		BIT(6)
++
++/*
++ * The internal SRAM block the firmware has given to Linux, and why this is
++ * not a range the driver may choose for itself.
++ *
++ * GDMA's descriptor list must be in internal RAM (TRM 3.4.1). On this board
++ * internal RAM is core 0's memory: the ESP-IDF firmware runs out of it, and
++ * Linux runs entirely out of external PSRAM. Nothing on the Linux side can
++ * tell which parts of the internal block the firmware is using.
++ *
++ * That is not a theoretical hazard. The first version of this driver put its
++ * descriptors at 0x3fcfe000, which is the L1 data cache's own SRAM rather
++ * than general-purpose RAM, and every write to it vanished. The next attempt
++ * moved to 0x3fc90000 -- which reads back correctly, and is inside core 0's
++ * .dram0.data and .dram0.bss. The engine wrote over live firmware data and
++ * core 0 took a StoreProhibited exception and reset the board.
++ *
++ * So the range is not chosen here at all. The firmware reserves the top
++ * 64 KiB of its own DRAM segment with SOC_RESERVE_MEMORY_REGION, which takes
++ * it out of core 0's heap before the allocator is built, and tells Linux
++ * about it with memmap=64K$0x3fccc700 on the kernel command line. That makes
++ * memblock reserve the same range on the Linux side. By the time this driver
++ * runs, neither core can allocate here.
++ *
++ * The two constants are a pair with the firmware's LINUX_DMA_SRAM_START /
++ * LINUX_DMA_SRAM_END and with the memmap= in the device tree's bootargs.
++ * Changing one without the others reintroduces the overwrite.
++ *
++ * The block is 64 KiB. The first 4 KiB holds the two descriptors and the
++ * data page; the rest is headroom for the SPI path, which will want a
++ * scatter-gather list and a ring of buffers rather than one page.
++ */
++#define DMA_SRAM_BASE	0x3FCCC700UL
++#define DMA_SRAM_END	0x3FCDC700UL
++#define WORK_BASE	DMA_SRAM_BASE
++#define DESC_IN		(WORK_BASE + 0x000)
++#define DESC_OUT	(WORK_BASE + 0x010)
++#define DATA_ADDR	(WORK_BASE + 0x1000)
++#define WORK_SIZE	0x1000
++
++/*
++ * The largest transfer this version will stage. One page, because the data
++ * area is one page and because a mem-to-mem test does not need more. The
++ * engine's own limit is 4095 bytes per descriptor (the size field is 12 bits).
++ */
++#define MAX_XFER	PAGE_SIZE
++
++struct gdma_desc {
++	u32 dw0;
++	u32 buffer;
++	u32 next;
++} __attribute__((aligned(4)));
++
++#define DW0_SIZE(n)	((u32)((n) & 0xFFF))
++#define DW0_LENGTH(n)	((u32)(((n) & 0xFFF) << 12))
++#define DW0_SUC_EOF	BIT(30)
++#define DW0_OWNER	BIT(31)
++
++static void __iomem *gdma;
++static void __iomem *sys;
++static void __iomem *sram;
++static struct device *gdma_dev;
++static DEFINE_MUTEX(gdma_lock);
++
++/*
++ * Release the engine from reset and turn its clock on. Idempotent, and it
++ * runs once at probe so the two echo commands are no longer needed.
++ */
++static void gdma_power_up(void)
++{
++	u32 v;
++
++	/* Release reset first: a clocked block held in reset does nothing. */
++	v = readl(sys + (SYSTEM_PERIP_RST_EN1 - SYS_BASE));
++	v &= ~SYSTEM_DMA_RST;
++	writel(v, sys + (SYSTEM_PERIP_RST_EN1 - SYS_BASE));
++
++	v = readl(sys + (SYSTEM_PERIP_CLK_EN1 - SYS_BASE));
++	v |= SYSTEM_DMA_CLK_EN;
++	writel(v, sys + (SYSTEM_PERIP_CLK_EN1 - SYS_BASE));
++}
++
++/*
++ * Write into the SRAM window through the kernel's mapping. The window is a
++ * plain physical range the kernel can address directly on this NOMMU build,
++ * but it is not described as memory in the device tree, so it is reached with
++ * ioremap() rather than a normal pointer.
++ */
++static void sram_wr(u32 off, u32 val)
++{
++	writel(val, sram + off);
++}
++
++/*
++ * Run one memory-to-memory transfer. src and dst are offsets into the work
++ * page; the caller has already staged the data there.
++ *
++ * Returns 0 on success, or a negative errno.
++ */
++static int gdma_memcpy_run(u32 src_off, u32 dst_off, u32 len)
++{
++	u32 raw;
++	int i;
++	int ret = 0;
++
++	/* Reset both channels and clear any stale interrupt. */
++	writel(IN_RST, gdma + (GDMA_IN_CONF0 - GDMA_BASE));
++	writel(OUT_RST, gdma + (GDMA_OUT_CONF0 - GDMA_BASE));
++	writel(0xFFFFFFFF, gdma + (GDMA_IN_INT_CLR - GDMA_BASE));
++	writel(0xFFFFFFFF, gdma + (GDMA_OUT_INT_CLR - GDMA_BASE));
++	writel(0, gdma + (GDMA_IN_CONF0 - GDMA_BASE));
++	writel(0, gdma + (GDMA_OUT_CONF0 - GDMA_BASE));
++
++	/*
++	 * Memory-to-memory, on the in channel only. See the header note.
++	 */
++	writel(IN_MEM_TRANS_EN, gdma + (GDMA_IN_CONF0 - GDMA_BASE));
++	writel(0, gdma + (GDMA_OUT_CONF0 - GDMA_BASE));
++
++	/*
++	 * Two descriptors, not one.
++	 *
++	 * The first version of this driver built a single descriptor and
++	 * rewrote its buffer field between starting the out channel and
++	 * starting the in channel, on the theory that the engine reads the
++	 * buffer field once at start. It does not: the FSM fetches the
++	 * descriptor asynchronously, so the out channel could fetch the
++	 * descriptor after the buffer field had been changed to the source.
++	 * That makes the out channel write the source page over itself, or
++	 * over whatever the stale address happened to name -- and on this
++	 * board that reached core 0's memory and took the firmware down with
++	 * an IllegalInstruction and a watchdog reset.
++	 *
++	 * So each channel gets its own descriptor, written before either
++	 * channel starts and never touched again. IN reads the source, OUT
++	 * writes the destination, and neither can see the other's address.
++	 *
++	 * owner=1 means "the engine may take this"; suc_eof means "this is
++	 * the last one"; size is the buffer capacity and length is how much
++	 * of it is valid.
++	 */
++	{
++		u32 dw0 = DW0_SIZE(len) | DW0_LENGTH(len) |
++			  DW0_SUC_EOF | DW0_OWNER;
++
++		/* IN: the engine reads from here. */
++		sram_wr(DESC_IN - WORK_BASE + 0, dw0);
++		sram_wr(DESC_IN - WORK_BASE + 4, DATA_ADDR + src_off);
++		sram_wr(DESC_IN - WORK_BASE + 8, 0);
++
++		/* OUT: the engine writes to here. */
++		sram_wr(DESC_OUT - WORK_BASE + 0, dw0);
++		sram_wr(DESC_OUT - WORK_BASE + 4, DATA_ADDR + dst_off);
++		sram_wr(DESC_OUT - WORK_BASE + 8, 0);
++	}
++
++	/*
++	 * Point each channel at its own descriptor and start it. The low 20
++	 * bits of the link register hold the descriptor address; the control
++	 * bits above it are written in the same store, because the field is
++	 * not self-clearing and a separate store would race the FSM.
++	 */
++	writel((DESC_OUT & OUTLINK_ADDR_MASK) | OUTLINK_START,
++	       gdma + (GDMA_OUT_LINK - GDMA_BASE));
++
++	writel((DESC_IN & INLINK_ADDR_MASK) | INLINK_START,
++	       gdma + (GDMA_IN_LINK - GDMA_BASE));
++
++	/* Poll for completion. */
++	for (i = 0; i < 100000; i++) {
++		raw = readl(gdma + (GDMA_IN_INT_RAW - GDMA_BASE));
++		if (raw & (IN_DONE | IN_SUC_EOF | IN_DSCR_ERR))
++			break;
++		raw = readl(gdma + (GDMA_OUT_INT_RAW - GDMA_BASE));
++		if (raw & (OUT_DONE | OUT_EOF | OUT_DSCR_ERR))
++			break;
++		cpu_relax();
++	}
++
++	if (i == 100000) {
++		dev_err(gdma_dev, "the engine never reported completion\n");
++		ret = -ETIMEDOUT;
++		goto out;
++	}
++
++	raw = readl(gdma + (GDMA_IN_INT_RAW - GDMA_BASE));
++	if (raw & IN_DSCR_ERR) {
++		dev_err(gdma_dev, "in channel descriptor error: 0x%08x\n", raw);
++		ret = -EIO;
++		goto out;
++	}
++
++	raw = readl(gdma + (GDMA_OUT_INT_RAW - GDMA_BASE));
++	if (raw & OUT_DSCR_ERR) {
++		dev_err(gdma_dev, "out channel descriptor error: 0x%08x\n", raw);
++		ret = -EIO;
++		goto out;
++	}
++
++out:
++	writel(0xFFFFFFFF, gdma + (GDMA_IN_INT_CLR - GDMA_BASE));
++	writel(0xFFFFFFFF, gdma + (GDMA_OUT_INT_CLR - GDMA_BASE));
++	writel(IN_RST, gdma + (GDMA_IN_CONF0 - GDMA_BASE));
++	writel(OUT_RST, gdma + (GDMA_OUT_CONF0 - GDMA_BASE));
++	return ret;
++}
++
++static long gdma_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	struct esp32_gdma_memcpy req;
++	void __user *uarg = (void __user *)arg;
++	int ret;
++
++	if (cmd != ESP32_GDMA_MEMCPY)
++		return -ENOTTY;
++
++	if (copy_from_user(&req, uarg, sizeof(req)))
++		return -EFAULT;
++
++	if (req.len == 0 || req.len > MAX_XFER)
++		return -EINVAL;
++
++	/* The engine needs the length to be a whole number of words. */
++	if (req.len & 3)
++		return -EINVAL;
++
++	if (mutex_lock_interruptible(&gdma_lock))
++		return -ERESTARTSYS;
++
++	/*
++	 * Stage the source into the internal SRAM work page. The engine can
++	 * only reach internal SRAM, and userspace cannot give it a pointer
++	 * there, so the data is copied in and the result copied back out.
++	 */
++	if (copy_from_user((void *)(sram + (DATA_ADDR - WORK_BASE)),
++			   (void __user *)(uintptr_t)req.src, req.len)) {
++		ret = -EFAULT;
++		goto out_unlock;
++	}
++
++	/* Clear the destination so a transfer that does nothing is visible. */
++	memset_io(sram + (DATA_ADDR - WORK_BASE) + WORK_SIZE / 2, 0, req.len);
++
++	ret = gdma_memcpy_run(0, WORK_SIZE / 2, req.len);
++	if (ret)
++		goto out_unlock;
++
++	if (copy_to_user((void __user *)(uintptr_t)req.dst,
++			 (void *)(sram + (DATA_ADDR - WORK_BASE) + WORK_SIZE / 2),
++			 req.len)) {
++		ret = -EFAULT;
++		goto out_unlock;
++	}
++
++	ret = 0;
++
++out_unlock:
++	mutex_unlock(&gdma_lock);
++	return ret;
++}
++
++static const struct file_operations gdma_fops = {
++	.owner		= THIS_MODULE,
++	.unlocked_ioctl	= gdma_ioctl,
++	.llseek		= noop_llseek,
++};
++
++static struct miscdevice gdma_misc = {
++	.minor	= MISC_DYNAMIC_MINOR,
++	.name	= DRV_NAME,
++	.fops	= &gdma_fops,
++	.mode	= 0600,
++};
++
++static int __init gdma_init(void)
++{
++	u32 date;
++	int ret;
++
++	gdma = ioremap(GDMA_BASE, 0x1000);
++	if (!gdma)
++		return -ENOMEM;
++
++	sys = ioremap(SYS_BASE, 0x1000);
++	if (!sys) {
++		ret = -ENOMEM;
++		goto err_gdma;
++	}
++
++	sram = ioremap(DMA_SRAM_BASE, DMA_SRAM_END - DMA_SRAM_BASE);
++	if (!sram) {
++		ret = -ENOMEM;
++		goto err_sys;
++	}
++
++	gdma_power_up();
++
++	/*
++	 * Register before the date check so the error path has a device to
++	 * report through, and so a failure to power up is visible in dmesg
++	 * rather than only as a missing /dev node.
++	 */
++	ret = misc_register(&gdma_misc);
++	if (ret)
++		goto err_sram;
++
++	gdma_dev = gdma_misc.this_device;
++
++	/*
++	 * The date register is the only identity this engine has -- the S3 has
++	 * no GDMA ID register. If it reads zero the block is still gated and
++	 * every register write is accepted and ignored, which is exactly the
++	 * failure that made the first userspace attempt look like a
++	 * register-addressing bug.
++	 */
++	date = readl(gdma + (GDMA_DATE - GDMA_BASE));
++	if (date != GDMA_DATE_VAL) {
++		dev_err(gdma_dev,
++			"GDMA_DATE reads 0x%08x, expected 0x%08x -- the block is not powered\n",
++			date, GDMA_DATE_VAL);
++		ret = -ENODEV;
++		goto err_misc;
++	}
++
++	dev_info(gdma_dev, "GDMA_DATE 0x%08x, engine up\n", date);
++	dev_info(gdma_dev, "descriptor window 0x%08lx-0x%08lx\n",
++		 (unsigned long)DMA_SRAM_BASE, (unsigned long)DMA_SRAM_END);
++
++	return 0;
++
++err_misc:
++	misc_deregister(&gdma_misc);
++err_sram:
++	iounmap(sram);
++err_sys:
++	iounmap(sys);
++err_gdma:
++	iounmap(gdma);
++	return ret;
++}
++
++static void __exit gdma_exit(void)
++{
++	misc_deregister(&gdma_misc);
++	iounmap(sram);
++	iounmap(sys);
++	iounmap(gdma);
++}
++
++module_init(gdma_init);
++module_exit(gdma_exit);
++
++MODULE_AUTHOR("Shreyan Dey");
++MODULE_DESCRIPTION("ESP32-S3 general DMA engine, memory-to-memory");
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/include/uapi/linux/esp32-gdma.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
++/*
++ * esp32-gdma -- userspace interface to the ESP32-S3 general DMA engine.
++ *
++ * The struct carries two userspace pointers and a length. The engine works in
++ * physical addresses, and on this NOMMU build a userspace pointer *is* the
++ * physical address, so they are passed through unchanged. That is a property
++ * of this build, not a general one -- a NOMMU kernel has no other kind of
++ * address, but a driver written for an MMU port would have to translate.
++ */
++#ifndef _UAPI_LINUX_ESP32_GDMA_H
++#define _UAPI_LINUX_ESP32_GDMA_H
++
++#include <linux/types.h>
++#include <linux/ioctl.h>
++
++/*
++ * Copy len bytes from src to dst, both userspace buffers, through the DMA
++ * engine. len must be a multiple of 4 and at most one page.
++ *
++ * The driver stages the data through internal SRAM, because that is the only
++ * memory the engine can reach on this board -- Linux's own memory is external
++ * PSRAM. So this is a copy, not a zero-copy mapping: it exists to prove the
++ * engine moves bytes, not to be the fast path.
++ */
++struct esp32_gdma_memcpy {
++	__u64 src;
++	__u64 dst;
++	__u32 len;
++	__u32 reserved;
++};
++
++#define ESP32_GDMA_IOC_MAGIC	'G'
++
++#define ESP32_GDMA_MEMCPY	_IOW('G', 0x00, struct esp32_gdma_memcpy)
++
++#endif /* _UAPI_LINUX_ESP32_GDMA_H */
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -651,7 +651,25 @@
+ 
+ 	  It is a development tool. A wrong write can hang the board. Say N
+ 	  unless you are bringing up a peripheral.
++
++config ESP32_GDMA
++	tristate "ESP32-S3 general DMA engine"
++	depends on OF && HAS_IOMEM
++	help
++	  The ESP32-S3's general DMA engine, driven memory-to-memory through
++	  one ioctl. It exists because the engine's descriptor list must live
++	  in internal SRAM (TRM 3.4.1), and on this NOMMU kernel a userspace
++	  mmap of that window does not reach it -- remap_pfn_range() installs
++	  nothing without a page table, so the store is lost and the read
++	  returns the old value. The kernel reaches the same address through
++	  ioremap(), so the descriptor is built here instead.
+ 
++	  It also releases the engine from reset and enables its clock, which
++	  until now had to be done by hand after every boot.
++
++	  This is the first half of the SPI DMA work: it proves the engine
++	  moves bytes before anything is pointed at a peripheral.
++
+ config ESP32_IPC
+ 	tristate "Espressif ESP32 firmware IPC support"
+ 	depends on OF && HAS_IOMEM
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -76,3 +76,4 @@
+ obj-$(CONFIG_MISC_RP1)		+= rp1/
+ obj-$(CONFIG_ESP32_IPC)		+= esp32-ipc.o
+ obj-$(CONFIG_ESP32_REGS)		+= esp32-regs.o
++obj-$(CONFIG_ESP32_GDMA)		+= esp32-gdma.o

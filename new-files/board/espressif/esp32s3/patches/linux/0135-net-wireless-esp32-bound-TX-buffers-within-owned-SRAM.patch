@@ -1,0 +1,19 @@
+Subject: [PATCH] net wireless esp32 bound TX buffers within owned SRAM
+
+diff --git a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -4856,7 +4856,12 @@
+ 	cfg.static_rx_buf_num = 10;
+ 	cfg.dynamic_rx_buf_num = 32;
+ 	cfg.tx_buf_type = 1;
+-	cfg.dynamic_tx_buf_num = 32;
++	/* A 1650-byte frame consumes 1696 bytes with our allocator header.
++	 * Thirty-two TX buffers alone need 54 KiB of the 64 KiB SRAM pool,
++	 * before ten static RX buffers and control state. Bound TX occupancy
++	 * while preserving the tested AMPDU and receive configuration.
++	 */
++	cfg.dynamic_tx_buf_num = 8;
+ 	cfg.ampdu_rx_enable = 1;
+ 	cfg.ampdu_tx_enable = 1;
+ 	cfg.rx_ba_win = 6;

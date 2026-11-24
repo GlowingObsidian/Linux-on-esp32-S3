@@ -14,7 +14,7 @@ install -m 755 "$experiment_dir/out/libfork.so.0" "$image_dir/tree/usr/lib/"
 cp -a "$programs_out/Python-3.12.5/Lib/encodings" "$image_dir/tree/usr/lib/python3.12/"
 install -m 644 "$programs_out/Python-3.12.5/LICENSE" "$image_dir/tree/usr/share/licenses/python/"
 "$host_dir/bin/mkcramfs" -X -q "$image_dir/tree" "$programs_out/rootfs-cpython.cramfs"
-test "$(wc -c < "$programs_out/rootfs-cpython.cramfs")" -le $((0x780000))
+test "$(wc -c < "$programs_out/rootfs-cpython.cramfs")" -le $((0x6f0000))
 "$host_dir/bin/cramfsck" "$programs_out/rootfs-cpython.cramfs"
 sha256sum "$programs_out/rootfs-cpython.cramfs"
 echo "$image_dir"

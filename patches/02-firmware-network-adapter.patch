@@ -1,33 +1,94 @@
 diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/CMakeLists.txt b/esp_hosted_ng/esp/esp_driver/network_adapter/main/CMakeLists.txt
-index a46af63..6b19b1d 100644
 --- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/CMakeLists.txt
 +++ b/esp_hosted_ng/esp/esp_driver/network_adapter/main/CMakeLists.txt
-@@ -1,4 +1,4 @@
+@@ -1,21 +1,24 @@
 -set(COMPONENT_SRCS "app_main.c" "slave_bt.c" "cmd.c" "stats.c" "linux_boot.c" "linux_ipc.c" "linux_flash.c")
-+set(COMPONENT_SRCS "app_main.c" "slave_bt.c" "cmd.c" "stats.c" "linux_boot.c" "linux_ipc.c" "linux_flash.c" "ble_prov.c")
++set(COMPONENT_SRCS "app_main.c" "cmd.c" "linux_boot.c" "ble_prov.c")
  set(COMPONENT_ADD_INCLUDEDIRS "./include")
  
  if(CONFIG_IDF_TARGET_ESP32S3)
+     list(APPEND COMPONENT_SRCS linux_ll_esp32s3.c)
+ endif()
+ 
+-if(CONFIG_JFFS2_READER)
+-    list(APPEND COMPONENT_SRCS tiny_jffs2_reader.c)
+-endif()
+-
+-if(CONFIG_ESP_SDIO_HOST_INTERFACE)
+-    list(APPEND COMPONENT_SRCS sdio_slave_api.c)
+-elseif(CONFIG_ESP_SPI_HOST_INTERFACE)
+-    list(APPEND COMPONENT_SRCS spi_slave_api.c)
+-elseif(CONFIG_ESP_SHMEM_HOST_INTERFACE)
+-    list(APPEND COMPONENT_SRCS shmem_slave_api.c)
+-endif()
++# No transport, and no jffs2 reader.
++#
++# Every one of these is an esp-hosted data path: sdio_slave_api.c,
++# spi_slave_api.c and shmem_slave_api.c each carry packets between this
++# chip and a separate host processor, and tiny_jffs2_reader.c reads
++# /etc/cmdline out of the etc partition for the kernel command line.
++#
++# This port has no separate host -- Linux is on this chip -- so there is
++# nothing on the other end of any of them. They also depend on
++# linux_ipc.c, which is gone with the rest of the IPC.
++#
++# The kernel command line now comes from the device tree's bootargs, and
++# /etc is part of the read-only rootfs, so the jffs2 reader has nothing
++# to read either.
+ 
+ 
+ register_component()
+
+diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/Kconfig.projbuild b/esp_hosted_ng/esp/esp_driver/network_adapter/main/Kconfig.projbuild
+--- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/Kconfig.projbuild
++++ b/esp_hosted_ng/esp/esp_driver/network_adapter/main/Kconfig.projbuild
+@@ -1,13 +1,15 @@
+ menu "Linux Bootloader Configuration"
+-	config JFFS2_READER
+-	    bool
++	# JFFS2_READER is gone with tiny_jffs2_reader.c. It read /etc/cmdline
++	# out of the etc partition; there is no etc partition any more, and
++	# /etc is part of the read-only rootfs. The kernel command line comes
++	# from the device tree's bootargs instead.
+ 
+ 	config LINUX_COMMAND_LINE
+-	    bool "Pass kernel command line from /etc/cmdline"
+-	    select JFFS2_READER
++	    bool "Pass kernel command line (unused; bootargs wins)"
+ 	    help
+-		Read 'cmdline' file from the JFFS2 on the 'etc' partition
+-		and pass it as the kernel command line.
++		Kept so an existing sdkconfig that sets it still parses.
++		Nothing reads it: linux_boot.c leaves the tag array's command
++		line empty and the kernel uses the device tree's bootargs.
+ 
+ 	choice LINUX_PSRAM_MAP_SIZE
+ 	    bool "PSRAM map size"
+
 diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/app_main.c b/esp_hosted_ng/esp/esp_driver/network_adapter/main/app_main.c
-index e7f35ad..ae920d3 100644
 --- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/app_main.c
 +++ b/esp_hosted_ng/esp/esp_driver/network_adapter/main/app_main.c
-@@ -43,9 +43,14 @@
+@@ -43,11 +43,16 @@
  #endif
  #endif
  #include "endian.h"
 +#include "esp_private/periph_ctrl.h"
 +#include "soc/periph_defs.h"
  
- #include "slave_bt.c"
- #include "stats.h"
+-#include "slave_bt.c"
+-#include "stats.h"
+-#include "linux_ipc.h"
 +#ifdef CONFIG_BT_ENABLED
 +#include "ble_prov.h"
 +#endif
- #include "linux_ipc.h"
  
++/* Defined in linux_boot.c. Does not return. */
++void linux_boot(void);
++
  static const char TAG[] = "FW_MAIN";
-@@ -81,6 +86,7 @@ interface_context_t *if_context = NULL;
+ 
+ #if CONFIG_ESP_WLAN_DEBUG
+@@ -81,6 +86,7 @@
  interface_handle_t *if_handle = NULL;
  
  QueueHandle_t to_host_queue[MAX_PRIORITY_QUEUES] = {NULL};
@@ -35,7 +96,7 @@ index e7f35ad..ae920d3 100644
  
  #if CONFIG_ESP_SPI_HOST_INTERFACE
  #ifdef CONFIG_IDF_TARGET_ESP32S2
-@@ -89,7 +95,11 @@ QueueHandle_t to_host_queue[MAX_PRIORITY_QUEUES] = {NULL};
+@@ -89,7 +95,11 @@
  #define TO_HOST_QUEUE_SIZE      20
  #endif
  #else
@@ -48,7 +109,7 @@ index e7f35ad..ae920d3 100644
  #endif
  
  #define ETH_DATA_LEN			1500
-@@ -100,6 +110,7 @@ uint8_t ap_mac[MAC_ADDR_LEN] = {0};
+@@ -100,6 +110,7 @@
  extern void wake_host();
  #endif
  
@@ -56,7 +117,7 @@ index e7f35ad..ae920d3 100644
  uint8_t get_capabilities(void)
  {
  	uint8_t cap = 0;
-@@ -245,6 +256,7 @@ esp_err_t wlan_ap_rx_callback(void *buffer, uint16_t len, void *eb)
+@@ -245,6 +256,7 @@
  		ESP_LOGE(TAG, "Slave -> Host: Failed to send buffer\n");
  		goto DONE;
  	}
@@ -64,7 +125,7 @@ index e7f35ad..ae920d3 100644
  
  	return ESP_OK;
  
-@@ -283,6 +295,7 @@ esp_err_t wlan_sta_rx_callback(void *buffer, uint16_t len, void *eb)
+@@ -283,6 +295,7 @@
  		ESP_LOGE(TAG, "Slave -> Host: Failed to send buffer\n");
  		goto DONE;
  	}
@@ -72,7 +133,7 @@ index e7f35ad..ae920d3 100644
  
  	return ESP_OK;
  
-@@ -316,7 +329,10 @@ void process_tx_pkt(interface_buffer_handle_t *buf_handle)
+@@ -316,7 +329,10 @@
  
  esp_err_t send_to_host(uint8_t prio_q_idx, interface_buffer_handle_t *buf_handle)
  {
@@ -84,7 +145,7 @@ index e7f35ad..ae920d3 100644
  }
  
  /* Send data to host */
-@@ -359,7 +375,10 @@ void send_task(void* pvParameters)
+@@ -359,7 +375,10 @@
  				process_tx_pkt(&buf_handle);
  			}
  		} else {
@@ -96,9 +157,27 @@ index e7f35ad..ae920d3 100644
  		}
  	}
  }
-@@ -514,6 +533,11 @@ void process_rx_pkt(interface_buffer_handle_t *buf_handle)
+@@ -457,8 +476,9 @@
+ 			break;
+ 		case CMD_RAW_TP_ESP_TO_HOST:
+ 		case CMD_RAW_TP_HOST_TO_ESP:
+-			ESP_LOGI(TAG, "RAW TP init command %s", CMD_RAW_TP_ESP_TO_HOST ? "slave to host" : "host to slave");
+-			process_raw_tp(if_type, payload, payload_len);
++			/* stats.c is gone: the raw-throughput test drove a
++			 * host<->slave benchmark and there is no host. */
++			ESP_LOGI(TAG, "RAW TP init command ignored, no host");
+ 			break;
+ 
+ 		default:
+@@ -512,8 +532,16 @@
+ 		}
+ #endif
  		else if (buf_handle->if_type == ESP_TEST_IF) {
- 			debug_update_raw_tp_rx_count(payload_len);
+-			debug_update_raw_tp_rx_count(payload_len);
++			/* stats.c is gone; this was its only caller. The
++			 * counter is what the raw-throughput test read back
++			 * over the host link, which no longer exists. */
++			(void)payload_len;
  		}
 +#ifdef CONFIG_BT_ENABLED
 +		else if (buf_handle->if_type == ESP_BLE_PROV_IF) {
@@ -108,43 +187,92 @@ index e7f35ad..ae920d3 100644
  	}
  	/* Free buffer handle */
  	if (buf_handle->free_buf_handle && buf_handle->priv_buffer_handle) {
-@@ -636,7 +660,6 @@ void app_main()
- 	}
+@@ -606,82 +634,7 @@
+ {
+ 	esp_err_t ret;
+ 	uint8_t prio_q_idx = 0;
+-	uint8_t mac[MAC_ADDR_LEN] = {0};
  
- #ifdef CONFIG_BT_ENABLED
+ 
+-	ret = esp_ipc_init();
+-	ESP_ERROR_CHECK(ret);
+-
+-	void esp_linux_flash_init(void);
+-	esp_linux_flash_init();
+-
+-	debug_log_firmware_version();
+-
+-	/*Initialize NVS*/
+-	ret = nvs_flash_init();
+-
+-	if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+-		ESP_ERROR_CHECK(nvs_flash_erase());
+-		ret = nvs_flash_init();
+-	}
+-	ESP_ERROR_CHECK( ret );
+-
+-	ret = initialise_wifi();
+-	ESP_ERROR_CHECK( ret );
+-
+-	init_sem = xSemaphoreCreateBinary();
+-	if (init_sem == NULL) {
+-		ESP_LOGE(TAG, "Failed to create init semaphore\n");
+-		return;
+-	}
+-
+-#ifdef CONFIG_BT_ENABLED
 -	initialise_bluetooth();
- 
- 	ret = esp_read_mac(mac, ESP_MAC_BT);
- 	if (ret) {
-@@ -669,8 +692,16 @@ void app_main()
- 	for (prio_q_idx=0; prio_q_idx<MAX_PRIORITY_QUEUES; prio_q_idx++) {
- 		to_host_queue[prio_q_idx] = xQueueCreate(TO_HOST_QUEUE_SIZE, sizeof(interface_buffer_handle_t));
- 		assert(to_host_queue[prio_q_idx] != NULL);
-+		if (!to_host_wakeup) {
-+			to_host_wakeup = xSemaphoreCreateBinary();
-+			assert(to_host_wakeup != NULL);
-+		}
- 	}
- 
-+#ifdef CONFIG_BT_ENABLED
-+	ble_prov_init();
-+#endif
-+
- 	assert(xTaskCreate(recv_task , "recv_task" , TASK_DEFAULT_STACK_SIZE , NULL , TASK_DEFAULT_PRIO, NULL) == pdTRUE);
- 	assert(xTaskCreate(send_task , "send_task" , TASK_DEFAULT_STACK_SIZE, NULL , TASK_DEFAULT_PRIO , NULL) == pdTRUE);
- 
-@@ -682,6 +713,8 @@ void app_main()
- 
- 	ESP_LOGI(TAG,"Initial set up done");
- 
-+	periph_module_enable(PERIPH_RSA_MODULE);
-+
- 	void linux_boot(void);
+-
+-	ret = esp_read_mac(mac, ESP_MAC_BT);
+-	if (ret) {
+-		ESP_LOGE(TAG,"Failed to read BT Mac addr\n");
+-	} else {
+-		ESP_LOGI(TAG, "ESP Bluetooth MAC addr: %2x-%2x-%2x-%2x-%2x-%2x\n",
+-				mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+-	}
+-#endif
+-
+-	if_context = interface_insert_driver(event_handler);
+-#if CONFIG_ESP_SPI_HOST_INTERFACE || CONFIG_ESP_SHMEM_HOST_INTERFACE
+-	datapath = 1;
+-#endif
+-
+-	if (!if_context || !if_context->if_ops) {
+-		ESP_LOGE(TAG, "Failed to insert driver\n");
+-		return;
+-	}
+-
+-	if_handle = if_context->if_ops->init();
+-
+-	if (!if_handle) {
+-		ESP_LOGE(TAG, "Failed to initialize driver\n");
+-		return;
+-	}
+-
+-	sleep(1);
+-
+-	for (prio_q_idx=0; prio_q_idx<MAX_PRIORITY_QUEUES; prio_q_idx++) {
+-		to_host_queue[prio_q_idx] = xQueueCreate(TO_HOST_QUEUE_SIZE, sizeof(interface_buffer_handle_t));
+-		assert(to_host_queue[prio_q_idx] != NULL);
+-	}
+-
+-	assert(xTaskCreate(recv_task , "recv_task" , TASK_DEFAULT_STACK_SIZE , NULL , TASK_DEFAULT_PRIO, NULL) == pdTRUE);
+-	assert(xTaskCreate(send_task , "send_task" , TASK_DEFAULT_STACK_SIZE, NULL , TASK_DEFAULT_PRIO , NULL) == pdTRUE);
+-
+-	create_debugging_tasks();
+-
+-	while (!datapath) {
+-		usleep(100*1000);
+-	}
+-
+-	ESP_LOGI(TAG,"Initial set up done");
+-
+-	void linux_boot(void);
  	linux_boot();
  }
+
 diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/ble_prov.c b/esp_hosted_ng/esp/esp_driver/network_adapter/main/ble_prov.c
 new file mode 100644
-index 0000000..9659b15
 --- /dev/null
 +++ b/esp_hosted_ng/esp/esp_driver/network_adapter/main/ble_prov.c
 @@ -0,0 +1,277 @@
@@ -425,11 +553,11 @@ index 0000000..9659b15
 +}
 +
 +#endif
+
 diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/cmd.c b/esp_hosted_ng/esp/esp_driver/network_adapter/main/cmd.c
-index 68001e1..0d90181 100644
 --- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/cmd.c
 +++ b/esp_hosted_ng/esp/esp_driver/network_adapter/main/cmd.c
-@@ -71,6 +71,8 @@ int esp_wifi_register_wpa_cb_internal(struct wpa_funcs *cb);
+@@ -71,6 +71,8 @@
  int esp_wifi_unregister_wpa_cb_internal(void);
  extern esp_err_t wlan_sta_rx_callback(void *buffer, uint16_t len, void *eb);
  
@@ -438,7 +566,27 @@ index 68001e1..0d90181 100644
  extern int wpa_parse_wpa_ie(const u8 *wpa_ie, size_t wpa_ie_len, wifi_wpa_ie_t *data);
  static inline void WPA_PUT_LE16(u8 *a, u16 val)
  {
-@@ -691,6 +693,7 @@ esp_err_t initialise_wifi(void)
+@@ -665,6 +667,19 @@
+ {
+ 	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+ 
++	/*
++	 * Linux owns the radio. This function is left in place, and left
++	 * callable, so the rest of the firmware still links and any caller
++	 * gets a truthful answer rather than a silent success -- but it
++	 * does not call esp_wifi_init(). The Espressif libraries are linked
++	 * into the kernel and run there; a second copy initialised here
++	 * would be a second driver on one MAC.
++	 */
++	ESP_LOGI(TAG, "initialise_wifi: skipped, Linux owns the radio");
++	return ESP_OK;
++
++	/* Not reached. Kept so the diff shows what used to happen. */
++
+ 	cfg.nvs_enable = 0;
+ 	esp_err_t result = esp_wifi_init(&cfg);
+ 	if (result != ESP_OK) {
+@@ -691,6 +706,7 @@
  	wpa_cb.wpa3_parse_sae_msg = rx_sae_msg;
  	wpa_cb.wpa_config_done = config_done;
  	wpa_cb.wpa_config_parse_string  = wpa_config_parse_string;
@@ -446,11 +594,120 @@ index 68001e1..0d90181 100644
  
  	esp_wifi_register_wpa_cb_internal(&wpa_cb);
  
+@@ -706,8 +722,25 @@
+ {
+ 	/*esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_SCAN_DONE,
+ 	  &esp_scan_done_event_handler);*/
+-	esp_wifi_stop();
+-	esp_wifi_deinit();
++
++	/*
++	 * Nothing to undo, because nothing here was ever initialised --
++	 * initialise_wifi() above deliberately does not call esp_wifi_init().
++	 *
++	 * Calling esp_wifi_stop()/esp_wifi_deinit() on a driver that was
++	 * never installed is what took core 0 down: with the driver's state
++	 * block uninitialised, esp_wifi_stop() followed a stale pointer out
++	 * of it and the core died with a LoadStoreError, EXCVADDR landing
++	 * in the Linux kernel's .rodata. Both calls return
++	 * ESP_ERR_WIFI_NOT_INIT here, so they are simply not made.
++	 *
++	 * The event loop and the handler registered in
++	 * process_init_interface() are the only things this core did set up,
++	 * and they are torn down below.
++	 */
++	esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID,
++					      instance_any_id);
++	instance_any_id = NULL;
+ }
+ 
+ int process_start_scan(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
+@@ -1385,11 +1418,18 @@
+ 	if (if_type == ESP_STA_IF) {
+ 		if (sta_init_flag && esp_wifi_get_mode(&wifi_mode)==0)
+ 			esp_wifi_deauthenticate_internal(WIFI_REASON_AUTH_LEAVE);
+-		esp_wifi_disconnect();
+ 	}
+-	esp_wifi_scan_stop();
+-	esp_wifi_stop();
+ 
++	/*
++	 * Every call below needs a driver this core does not have.
++	 * esp_wifi_disconnect(), esp_wifi_scan_stop() and esp_wifi_stop()
++	 * all answer ESP_ERR_WIFI_NOT_INIT when esp_wifi_init() was never
++	 * called, and esp_wifi_stop() is the one that walks the
++	 * uninitialised state block and faults. Linux owns the radio and
++	 * is the side that stops it; this core has nothing to stop.
++	 */
++	ESP_LOGI(TAG, "deinit interface: skipped, Linux owns the radio");
++
+ 	buf_handle.if_type = if_type;
+ 	buf_handle.if_num = 0;
+ 	buf_handle.payload_len = sizeof(struct command_header);
+@@ -1435,6 +1475,27 @@
+ 
+ 	if (!sta_init_flag) {
+ 
++		/*
++		 * This core does not bring the radio up. Linux does, from
++		 * esp32_wifi_blob_probe(): it calls esp_wifi_init_internal(),
++		 * esp_wifi_set_mode() and esp_wifi_start() on the blob, which
++		 * is the same Espressif code linked into the kernel.
++		 *
++		 * What used to be here -- esp_wifi_get_mode(), the mode OR,
++		 * esp_wifi_set_mode(), esp_wifi_start() -- all needs a driver
++		 * initialised on THIS core, and initialise_wifi() no longer
++		 * provides one. esp_wifi_get_mode() returns ESP_ERR_WIFI_NOT_INIT
++		 * (0x3001), the old code logged "Failed to get wifi mode" and
++		 * jumped to DONE, and DONE called deinitialize_wifi(), which
++		 * called esp_wifi_stop() on that same uninitialised driver and
++		 * took core 0 down with a LoadStoreError.
++		 *
++		 * So the interface is acknowledged instead of initialised. The
++		 * host needs the response to finish its own bring-up, and it is
++		 * the host that owns the radio state from here on.
++		 */
++		ESP_LOGI(TAG, "init interface: radio is Linux's; acknowledging only");
++
+ 		/* Register to get events from wifi driver */
+ 		ESP_ERROR_CHECK(esp_event_loop_create_default());
+ 		ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+@@ -1442,30 +1503,6 @@
+ 					&wifi_event_handler,
+ 					NULL,
+ 					&instance_any_id));
+-
+-		ret = esp_wifi_get_mode(&mode);
+-		if (ret) {
+-			ESP_LOGE(TAG,"Failed to get wifi mode");
+-			goto DONE;
+-		}
+-
+-		if (if_type == ESP_STA_IF) {
+-			mode |= WIFI_MODE_STA;
+-		} else {
+-			mode |= WIFI_MODE_AP;
+-		}
+-
+-		ret = esp_wifi_set_mode(mode);
+-		if (ret) {
+-			ESP_LOGE(TAG, "Failed to set wifi mode\n");
+-			goto DONE;
+-		}
+-
+-		ret = esp_wifi_start();
+-		if (ret) {
+-			ESP_LOGE(TAG, "Failed to start wifi\n");
+-			goto DONE;
+-		}
+ 	}
+ 
+ 	buf_handle.if_type = if_type;
+
 diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/include/adapter.h b/esp_hosted_ng/esp/esp_driver/network_adapter/main/include/adapter.h
-index ed95897..860c42e 100644
 --- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/include/adapter.h
 +++ b/esp_hosted_ng/esp/esp_driver/network_adapter/main/include/adapter.h
-@@ -56,6 +56,7 @@ enum ESP_INTERFACE_TYPE {
+@@ -56,6 +56,7 @@
  	ESP_HCI_IF,
  	ESP_INTERNAL_IF,
  	ESP_TEST_IF,
@@ -458,9 +715,9 @@ index ed95897..860c42e 100644
  	ESP_MAX_IF,
  };
  
+
 diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/include/ble_prov.h b/esp_hosted_ng/esp/esp_driver/network_adapter/main/include/ble_prov.h
 new file mode 100644
-index 0000000..1dd3f92
 --- /dev/null
 +++ b/esp_hosted_ng/esp/esp_driver/network_adapter/main/include/ble_prov.h
 @@ -0,0 +1,17 @@
@@ -481,35 +738,3593 @@ index 0000000..1dd3f92
 +void ble_prov_from_linux(const uint8_t *payload, uint16_t len);
 +
 +#endif
+
+diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/include/sdio_slave_api.h b/esp_hosted_ng/esp/esp_driver/network_adapter/main/include/sdio_slave_api.h
+deleted file mode 100644
+--- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/include/sdio_slave_api.h
++++ /dev/null
+@@ -1,25 +0,0 @@
+-// SPDX-License-Identifier: Apache-2.0
+-// Copyright 2015-2021 Espressif Systems (Shanghai) PTE LTD
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-//
+-
+-#ifndef __SDIO_SLAVE_API_H
+-#define __SDIO_SLAVE_API_H
+-
+-#ifdef CONFIG_IDF_TARGET_ESP32
+-#elif defined CONFIG_IDF_TARGET_ESP32S2
+-    #error "SDIO is not supported for ESP32S2. Please use SPI"
+-#endif
+-
+-#endif
+
+diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/include/slave_bt.h b/esp_hosted_ng/esp/esp_driver/network_adapter/main/include/slave_bt.h
+deleted file mode 100644
+--- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/include/slave_bt.h
++++ /dev/null
+@@ -1,126 +0,0 @@
+-// SPDX-License-Identifier: Apache-2.0
+-// Copyright 2015-2021 Espressif Systems (Shanghai) PTE LTD
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-//
+-//
+-#ifndef __SLAVE_BT_H__
+-#define __SLAVE_BT_H__
+-
+-#ifdef CONFIG_BT_ENABLED
+-
+-#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 0, 0)
+-    #include "driver/periph_ctrl.h"
+-    #define DISABLE_INTR_ON_GPIO GPIO_PIN_INTR_DISABLE
+-#else
+-    #include "esp_private/periph_ctrl.h"
+-    #define DISABLE_INTR_ON_GPIO GPIO_INTR_DISABLE
+-#endif
+-
+-
+-#if CONFIG_IDF_TARGET_ESP32
+-
+-    #if defined(CONFIG_BTDM_CONTROLLER_MODE_BLE_ONLY)
+-        #define BLUETOOTH_BLE    1
+-    #elif defined(CONFIG_BTDM_CONTROLLER_MODE_BR_EDR_ONLY)
+-        #define BLUETOOTH_BT     2
+-    #elif defined(CONFIG_BTDM_CONTROLLER_MODE_BTDM)
+-        #define BLUETOOTH_BT_BLE 3
+-    #endif
+-
+-    #if defined(CONFIG_BTDM_CONTROLLER_HCI_MODE_VHCI)
+-        #define BLUETOOTH_HCI    4
+-    #elif CONFIG_BT_HCI_UART_NO
+-        #define BLUETOOTH_UART   CONFIG_BT_HCI_UART_NO
+-    #elif CONFIG_BTDM_CTRL_HCI_UART_NO
+-        #define BLUETOOTH_UART   CONFIG_BTDM_CTRL_HCI_UART_NO
+-    #endif
+-
+-#elif (defined(CONFIG_IDF_TARGET_ESP32C2) || defined(CONFIG_IDF_TARGET_ESP32C6))
+-
+-    #define BLUETOOTH_BLE      1
+-
+-    #if defined(CONFIG_BT_LE_HCI_INTERFACE_USE_RAM)
+-        #define BLUETOOTH_HCI    4
+-        #elif defined(CONFIG_BT_LE_HCI_INTERFACE_USE_UART)
+-        #define BLUETOOTH_UART   CONFIG_BT_LE_HCI_UART_PORT
+-    #endif
+-
+-#elif defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32S3)
+-
+-   /* only BLE for chipsets other than ESP32 */
+-    #define BLUETOOTH_BLE      1
+-
+-    #if defined(CONFIG_BT_CTRL_HCI_MODE_VHCI)
+-        #define BLUETOOTH_HCI    4
+-    #elif CONFIG_BT_CTRL_HCI_MODE_UART_H4
+-        #define BLUETOOTH_UART   1
+-    #endif
+-
+-#endif
+-
+-#ifdef BLUETOOTH_UART
+-	#include "driver/uart.h"
+-	#if defined(CONFIG_IDF_TARGET_ESP32)
+-		#define BT_TX_PIN		5
+-		#define BT_RX_PIN		18
+-		#define BT_RTS_PIN		19
+-		#define BT_CTS_PIN		23
+-
+-	#elif defined(CONFIG_IDF_TARGET_ESP32C3)
+-
+-		#define BT_TX_PIN		5
+-		#define BT_RX_PIN		18
+-		#define BT_RTS_PIN		19
+-		#define BT_CTS_PIN		8
+-
+-	#elif defined(CONFIG_IDF_TARGET_ESP32S3)
+-
+-		#define BT_TX_PIN		17
+-		#define BT_RX_PIN		18
+-		#define BT_RTS_PIN		19
+-		#define BT_CTS_PIN		20
+-
+-	#elif defined(CONFIG_IDF_TARGET_ESP32C2)
+-
+-		#define BT_TX_PIN         5
+-		#define BT_RX_PIN         18
+-		//#define BT_RTS_PIN        9
+-		//#define BT_CTS_PIN        8
+-
+-	#elif defined(CONFIG_IDF_TARGET_ESP32C6)
+-
+-		#define BT_TX_PIN		5
+-		#define BT_RX_PIN		12
+-		//#define BT_RTS_PIN		9
+-		//#define BT_CTS_PIN		13
+-
+-	#endif
+-
+-	#if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32S3)
+-		#define UART_RX_THRS		(120)
+-		#define GPIO_OUTPUT_PIN_SEL	((1ULL<<BT_TX_PIN) | (1ULL<<BT_RTS_PIN))
+-		#define GPIO_INPUT_PIN_SEL	((1ULL<<BT_RX_PIN) | (1ULL<<BT_CTS_PIN))
+-
+-	#endif
+-#elif BLUETOOTH_HCI
+-	void process_hci_rx_pkt(uint8_t *payload, uint16_t payload_len);
+-#endif
+-
+-void deinitialize_bluetooth(void);
+-esp_err_t initialise_bluetooth(void);
+-uint8_t get_bluetooth_capabilities(void);
+-
+-#endif /* CONFIG_BT_ENABLED */
+-
+-#endif /* __SLAVE_BT_H__ */
+
+diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/include/stats.h b/esp_hosted_ng/esp/esp_driver/network_adapter/main/include/stats.h
+deleted file mode 100644
+--- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/include/stats.h
++++ /dev/null
+@@ -1,82 +0,0 @@
+-// SPDX-License-Identifier: Apache-2.0
+-// Copyright 2015-2022 Espressif Systems (Shanghai) PTE LTD
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-//
+-
+-#ifndef __STATS__H__
+-#define __STATS__H__
+-
+-#include <stdint.h>
+-#include "adapter.h"
+-#include "endian.h"
+-#include "freertos/FreeRTOS.h"
+-#include "freertos/semphr.h"
+-
+-#define SEC_TO_MSEC(x)                 (x*1000)
+-#define MSEC_TO_USEC(x)                (x*1000)
+-#define SEC_TO_USEC(x)                 (x*1000*1000)
+-
+-
+-/* Stats CONFIG:
+- *
+- * 1. CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+- *    These are debug stats to show the CPU utilization by all tasks
+- *    This is set through sdkconfig
+- */
+-
+-#ifdef CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+-  /* Stats to show task wise CPU utilization */
+-  #define STATS_TICKS                  pdMS_TO_TICKS(1000*2)
+-  #define ARRAY_SIZE_OFFSET            5
+-
+-void debug_runtime_stats_task(void* pvParameters);
+-#endif
+-
+-/* TEST_RAW_TP is disabled on production.
+- * This is only to test the throughout over transport
+- * like SPI or SDIO. In this testing, dummy task will
+- * push the packets over transport.
+- * Currently this testing is possible on one direction
+- * at a time
+- */
+-
+-
+-#include "esp_timer.h"
+-#include "interface.h"
+-
+-/* Raw throughput is supported only one direction
+- * at a time
+- * i.e. ESP to Host OR
+- * Host to ESP
+- */
+-
+-#define TEST_RAW_TP__BUF_SIZE        1460
+-#define TEST_RAW_TP__TIMEOUT         SEC_TO_USEC(1)
+-
+-typedef struct {
+-	esp_timer_handle_t timer;
+-	size_t cur_interval;
+-	int64_t t_start;
+-	SemaphoreHandle_t done;
+-} test_args_t;
+-
+-void debug_update_raw_tp_rx_count(uint16_t len);
+-
+-
+-void debug_log_firmware_version(void);
+-void create_debugging_tasks(void);
+-void debug_get_raw_tp_conf(uint32_t raw_tp_type);
+-void debug_set_wifi_logging(void);
+-int process_raw_tp(uint8_t if_type, uint8_t *payload, uint16_t payload_len);
+-#endif  /*__STATS__H__*/
+
+diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_boot.c b/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_boot.c
+--- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_boot.c
++++ b/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_boot.c
+@@ -7,14 +7,22 @@
+    CONDITIONS OF ANY KIND, either express or implied.
+ */
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include "sdkconfig.h"
+ #include "esp_system.h"
++#include "esp_rom_sys.h"
+ #include "esp_partition.h"
+ #include "esp_log.h"
+ #include "freertos/FreeRTOS.h"
+ #include "freertos/task.h"
+-#include "tiny_jffs2_reader.h"
++#include "esp_timer.h"
++#include "hal/wdt_hal.h"
++#if CONFIG_IDF_TARGET_ESP32S3
++#include "hal/systimer_ll.h"
++#include "soc/soc_caps.h"
++#endif
++#include "soc/timer_group_struct.h"
+ #include "bootparam.h"
+ #include "linux_ll.h"
+ 
+@@ -32,28 +40,6 @@
+ 
+ #define CMDLINE_MAX 260
+ 
+-#ifdef CONFIG_LINUX_COMMAND_LINE
+-static void parse_cmdline(const void *ptr, uint32_t size, struct bp_tag tag[])
+-{
+-	struct jffs2_image img = {
+-		.data = (void *)ptr,
+-		.sz = size,
+-	};
+-	uint32_t cmdline_inode = jffs2_lookup(&img, 1, "cmdline");
+-
+-	if (cmdline_inode) {
+-		char *cmdline = (char *)tag[1].data;
+-		size_t rd = jffs2_read(&img, cmdline_inode, cmdline, CMDLINE_MAX - 1);
+-
+-		if (rd != -1) {
+-			tag[1].id = BP_TAG_COMMAND_LINE;
+-			cmdline[rd] = 0;
+-			ESP_LOGI(__func__, "found /etc/cmdline [%d] = '%s'\n", rd, cmdline);
+-		}
+-	}
+-}
+-#endif
+-
+ static char IRAM_ATTR space_for_vectors[4096] __attribute__((aligned(4096)));
+ 
+ #define N_TAGS (3 + CMDLINE_MAX / sizeof(struct bp_tag))
+@@ -68,37 +54,134 @@
+ 	const esp_partition_t *part;
+ 	const uint8_t *flash_base = (void *)0x42000000;
+ 	const void *linux = NULL;
+-	const void *etc = NULL;
++
++	/* Complete IDF partition-table mmap/munmap before Linux owns the MMU.
++	 * A lazy lookup after init_linux_mmap() invalidates a live XIP page. */
++	part = find_partition("linux");
++	if (!part)
++		abort();
++	linux = flash_base + part->address;
++
++	/*
++	 * Everything from here to the jump is the last thing IDF does.
++	 *
++	 * Upstream esp-hosted never needed this: it handed the other core to
++	 * a host, and this core kept running the radio firmware, so the RTOS
++	 * stayed alive on both sides. This port gives the core itself away,
++	 * which means FreeRTOS has to stop first -- otherwise Linux starts
++	 * with a live tick timer, enabled interrupts and a scheduler-owned
++	 * stack, and any of the three can fire into it before its own vectors
++	 * and timer are up.
++	 *
++	 * NuttX does the same three things at the same point in its
++	 * __esp32s3_start: up_irq_disable(), switch to its own stack, then
++	 * enter the kernel. The order matters -- the timer must be stopped
++	 * while interrupts are still maskable, and the stack switch must
++	 * happen before anything else runs on the new stack.
++	 */
++
++	/* Stop esp_timer's alarm. It owns SYSTIMER_ALARM_ESPTIMER (2), and
++	 * deinitialising it disables that alarm and frees its interrupt.
++	 *
++	 * It does NOT stop the FreeRTOS tick, which is a different alarm --
++	 * SYSTIMER_ALARM_OS_TICK_CORE0 (0) -- and keeps firing regardless.
++	 * Stop the remaining SYSTIMER alarms explicitly below, then mask CPU
++	 * interrupts for the final MMU setup and jump.
++	 */
++	esp_timer_deinit();
++#if CONFIG_IDF_TARGET_ESP32S3
++	/* The RTOS tick is separate from esp_timer. Stop its alarm sources
++	 * and clear pending levels before Linux takes over the interrupt matrix.
++	 * Keep the SYSTIMER counter and its clock running. */
++	for (unsigned int alarm = 0; alarm < SOC_SYSTIMER_ALARM_NUM; ++alarm) {
++		systimer_ll_enable_alarm(&SYSTIMER, alarm, false);
++		systimer_ll_enable_alarm_int(&SYSTIMER, alarm, false);
++		systimer_ll_clear_alarm_int(&SYSTIMER, alarm);
++	}
++#endif
++
++	/* Disable the two Timer Group watchdogs. They are the reason this
++	 * board used to reset about ten seconds after Linux came up, with
++	 * rst:0x8 (TG1WDT_SYS_RST).
++	 *
++	 * IDF arms both at startup and feeds them from FreeRTOS: MWDT1 in
++	 * Timer Group 1 is the interrupt watchdog (CONFIG_ESP_INT_WDT), and
++	 * MWDT0 in Timer Group 0 is the task watchdog
++	 * (CONFIG_ESP_TASK_WDT_INIT). Their stage 1 is
++	 * WDT_STAGE_ACTION_RESET_SYSTEM, and it fires whether or not the
++	 * interrupt is masked -- so the rsil below does not save us from
++	 * them the way it does from the tick. Once FreeRTOS stops, nothing
++	 * feeds them and the chip resets itself.
++	 *
++	 * This is the same pair of calls IDF makes in esp_restart_noos()
++	 * (esp_system/port/soc/esp32s3/system_internal.c) when it wants the
++	 * chip to stop watching it. NuttX never has the problem: MWDT0,
++	 * MWDT1 and RWDT are all default n in its Kconfig, so nothing ever
++	 * arms them, and it explicitly disables the RTC watchdog the second
++	 * stage bootloader leaves on.
++	 *
++	 * RWDT is left alone. CONFIG_BOOTLOADER_WDT_ENABLE is not set, so
++	 * the bootloader never armed it, and IDF's own init_disable_rtc_wdt
++	 * turns it off regardless.
++	 */
++	{
++		wdt_hal_context_t wdt0 = { .inst = WDT_MWDT0, .mwdt_dev = &TIMERG0 };
++		wdt_hal_context_t wdt1 = { .inst = WDT_MWDT1, .mwdt_dev = &TIMERG1 };
++
++		wdt_hal_write_protect_disable(&wdt0);
++		wdt_hal_disable(&wdt0);
++		wdt_hal_write_protect_enable(&wdt0);
++
++		wdt_hal_write_protect_disable(&wdt1);
++		wdt_hal_disable(&wdt1);
++		wdt_hal_write_protect_enable(&wdt1);
++	}
++
++	/* Raise INTLEVEL and disable every ordinary CPU interrupt. RSIL
++	 * returns the old PS: writing it back here would undo the mask.
++	 * NMI/debug are outside INTENABLE; both watchdogs are disabled above. */
++	__asm__ __volatile__("rsil a2, 3\n\t"
++			     "movi a3, 0\n\t"
++			     "wsr a3, intenable\n\t"
++			     "rsync" ::: "a2", "a3", "memory");
+ 
+ 	init_linux_mmap();
++#ifdef CONFIG_LINUX_COMMAND_LINE
++	/* Linux mounts its own writable /etc. The handoff does not read it;
++	 * the kernel command line comes from the device tree's bootargs.
++	 * The tag array keeps its default, with no command-line override. */
++#endif
++	esp_rom_printf("linux ptr = %p\n", linux);
++	esp_rom_printf("vectors ptr = %p\n", space_for_vectors);
+ 
+-	part = find_partition("linux");
+-	if (part) {
+-		linux = flash_base + part->address;
+-	}
+-#ifdef CONFIG_LINUX_COMMAND_LINE
+-	part = find_partition("etc");
+-	if (part) {
+-		etc = flash_base + part->address;
+-		parse_cmdline(etc, part->size, tag);
+-	}
+-#endif
+-	printf("linux ptr = %p\n", linux);
+-	printf("vectors ptr = %p\n", space_for_vectors);
+-
+-	extern int g_abort_on_ipc;
+-	g_abort_on_ipc = 1;
+-
+-	asm volatile ("mov a2, %1 ; jx %0" :: "r"(linux), "r"(tag) : "a2");
+-}
+-
+-static void linux_task(void *p)
+-{
+-	map_flash_and_go();
+-	esp_restart();
++	/* Publish the boot tags and MMU stores before the non-returning jump. */
++	asm volatile ("memw ; mov a2, %1 ; jx %0" :: "r"(linux), "r"(tag)
++		      : "a2", "memory");
++	__builtin_unreachable();
+ }
+ 
+ void linux_boot(void)
+ {
+-	xTaskCreatePinnedToCore(linux_task, "linux_task", 4096, NULL, 5, NULL, 1);
++	/*
++	 * Called directly, not from a task.
++	 *
++	 * linux_task existed to give map_flash_and_go() a stack and a context
++	 * to abandon. app_main has both, and map_flash_and_go() ends in an
++	 * unconditional jump -- jx linux -- so nothing returns to a scheduler
++	 * either way. The task bought nothing and left a pinned task that
++	 * never exited.
++	 *
++	 * Upstream pinned it to core 1 so core 0 could keep running the radio
++	 * firmware while the other core booted the host. There is no radio
++	 * firmware here.
++	 *
++	 * Core 0 is the right core for a different reason: with
++	 * CONFIG_FREERTOS_UNICORE=y, core 1 is held stopped by IDF's
++	 * single-core path and never enters FreeRTOS at all, so core 0 is the
++	 * only core with a live IDF context to hand off from.
++	 *
++	 * Linux SMP head.S uses PRID to distinguish CPU0 from the secondary
++	 * entry. Linux releases CPU1 itself after its vectors and state exist.
++	 */
++	map_flash_and_go();
+ }
+diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_flash.c b/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_flash.c
+deleted file mode 100644
+--- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_flash.c
++++ /dev/null
+@@ -1,82 +0,0 @@
+-#include "sdkconfig.h"
+-#include <stdlib.h>
+-#include <stdio.h>
+-#include <string.h>
+-#include "esp.h"
+-#include "esp_flash.h"
+-#include "interface.h"
+-#include "endian.h"
+-#include "soc/periph_defs.h"
+-#include "stats.h"
+-#include "linux_ipc.h"
+-#include "linux_ll.h"
+-
+-#define ESP_IPC_FLASH_ADDR	2
+-
+-enum {
+-	ESP32_IPC_FLASH_STATE_IDLE,
+-	ESP32_IPC_FLASH_STATE_READY,
+-	ESP32_IPC_FLASH_STATE_DONE,
+-};
+-
+-enum {
+-	ESP_IPC_FLASH_CMD_ERASE,
+-	ESP_IPC_FLASH_CMD_READ,
+-	ESP_IPC_FLASH_CMD_WRITE,
+-};
+-
+-struct esp32_ipc_flash_cmd {
+-	void *data;
+-	uint32_t addr;
+-	uint32_t size;
+-	uint32_t remote_state;
+-
+-	uint32_t local_state;
+-	uint32_t result;
+-	uint32_t code;
+-};
+-
+-extern int g_spi_flash_skip_ipc;
+-
+-static void esp_flash_rx(void *p, void *data)
+-{
+-	if (!data) {
+-		esp_ipc_tx(ESP_IPC_FLASH_ADDR, 0,
+-			   malloc(sizeof(struct esp32_ipc_flash_cmd)));
+-	} else {
+-		volatile struct esp32_ipc_flash_cmd *cmd = data;
+-		esp_err_t ret;
+-
+-		cmd->local_state = ESP32_IPC_FLASH_STATE_READY;
+-		while (cmd->remote_state != ESP32_IPC_FLASH_STATE_READY) {
+-			asm volatile ("memw" ::: "memory");
+-		}
+-		g_spi_flash_skip_ipc = 1;
+-		switch (cmd->code) {
+-		case ESP_IPC_FLASH_CMD_ERASE:
+-			ret = esp_flash_erase_region(NULL, cmd->addr, cmd->size);
+-			break;
+-
+-		case ESP_IPC_FLASH_CMD_READ:
+-			ret = linux_flash_read(cmd->data, cmd->addr, cmd->size);
+-			break;
+-
+-		case ESP_IPC_FLASH_CMD_WRITE:
+-			ret = esp_flash_write(NULL, cmd->data, cmd->addr, cmd->size);
+-			break;
+-
+-		default:
+-			ret = ESP_FAIL;
+-			break;
+-		}
+-		g_spi_flash_skip_ipc = 0;
+-		cmd->result = (ret == ESP_OK) ? 0 : 1;
+-		cmd->local_state = ESP32_IPC_FLASH_STATE_DONE;
+-	}
+-}
+-
+-void esp_linux_flash_init(void)
+-{
+-	esp_ipc_register_rx(ESP_IPC_FLASH_ADDR, NULL,
+-			    esp_flash_rx, NULL);
+-}
+
+diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_ipc.c b/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_ipc.c
+deleted file mode 100644
+--- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_ipc.c
++++ /dev/null
+@@ -1,251 +0,0 @@
+-#include "sdkconfig.h"
+-#include <stdlib.h>
+-#include <stdio.h>
+-#include <string.h>
+-#include "esp.h"
+-#include "esp_intr_alloc.h"
+-#include "esp_log.h"
+-#include "endian.h"
+-#include "rom/ets_sys.h"
+-#include "freertos/FreeRTOS.h"
+-#include "freertos/task.h"
+-#include "soc/periph_defs.h"
+-#include "stats.h"
+-#include "linux_ipc.h"
+-
+-static const char TAG[] = "linux_ipc";
+-
+-struct esp_ipc_hw_queue
+-{
+-	volatile uint32_t write;
+-	volatile uint32_t read;
+-	uint32_t offset;
+-	uint32_t mask;
+-};
+-
+-struct esp_ipc_queue_entry {
+-	uint32_t addr;
+-	void *info;
+-};
+-
+-struct esp_ipc_sw_queue_entry {
+-	uint32_t addr;
+-	void *buf;
+-};
+-
+-struct esp_ipc_client {
+-	void *p;
+-	void (*rx)(void *p, void *data);
+-	void (*tx_done)(void *p, void *data);
+-};
+-
+-#define ESP_IPC_CLIENTS_MAX		4
+-#define ESP_IPC_PRIORITIES_MAX		3
+-
+-#define ESP_SHMEM_READ_HW_Q		1
+-#define ESP_SHMEM_WRITE_HW_Q		0
+-
+-#define ESP_SHMEM_IRQ_FROM_HOST_REG	(4 * CONFIG_ESP_SHMEM_IRQ_FROM_HOST_IDX)
+-#define ESP_SHMEM_IRQ_TO_HOST_REG	(4 * CONFIG_ESP_SHMEM_IRQ_TO_HOST_IDX)
+-
+-#define IPC_HW_TX_QUEUE_SIZE		64
+-#define IPC_SW_TX_QUEUE_SIZE		20
+-
+-static struct esp_ipc_hw_queue hw_queue[2];
+-static struct esp_ipc_queue_entry queue_data[2][IPC_HW_TX_QUEUE_SIZE];
+-
+-static uint32_t tx_postprocessed;
+-
+-static SemaphoreHandle_t hw_queue_rx_semaphore;
+-static SemaphoreHandle_t hw_queue_tx_semaphore;
+-static QueueHandle_t shmem_tx_queue[ESP_IPC_PRIORITIES_MAX];
+-static QueueHandle_t shmem_tx_postprocess_queue;
+-
+-static struct esp_ipc_client client[ESP_IPC_CLIENTS_MAX];
+-
+-static void esp_shmem_write_irq(uint32_t reg, uint32_t v)
+-{
+-	*(volatile uint32_t*)(0x600c0030 + reg) = v;
+-}
+-
+-static void esp_shmem_hw_queue_write(void)
+-{
+-	struct esp_ipc_hw_queue *hw_q = hw_queue + ESP_SHMEM_WRITE_HW_Q;
+-	volatile struct esp_ipc_queue_entry *data = (void *)hw_queue + hw_q->offset;
+-	bool changed = false;
+-
+-	for (;;) {
+-		struct esp_ipc_sw_queue_entry entry;
+-		uint32_t r = hw_q->read;
+-		uint32_t w = hw_q->write;
+-		uint32_t p = tx_postprocessed;
+-		BaseType_t ret = 0;
+-		int i;
+-
+-		while (p != r) {
+-			ret = xQueueReceive(shmem_tx_postprocess_queue, &entry, 0);
+-
+-			if (!ret) {
+-				ESP_LOGE(TAG, "%s: xQueueReceive failed for postprocessing queue", __func__);
+-				break;
+-			}
+-			if (client[entry.addr].tx_done)
+-				client[entry.addr].tx_done(client[entry.addr].p, entry.buf);
+-			++p;
+-		}
+-		tx_postprocessed = p;
+-
+-		if (w - r == hw_q->mask)
+-			break;
+-
+-		for (i = 0; i < ESP_IPC_PRIORITIES_MAX; ++i) {
+-			if (uxQueueMessagesWaiting(shmem_tx_queue[i])) {
+-				ret = xQueueReceive(shmem_tx_queue[i], &entry, portMAX_DELAY);
+-				break;
+-			}
+-		}
+-		if (i == ESP_IPC_PRIORITIES_MAX)
+-			break;
+-		if (!ret) {
+-			ESP_LOGE(TAG, "%s: xQueueReceive failed for tx queue", __func__);
+-			break;
+-		}
+-
+-		data[w & hw_q->mask].addr = entry.addr;
+-		data[w & hw_q->mask].info = entry.buf;
+-		hw_q->write = ++w;
+-		changed = true;
+-		ESP_LOGD(TAG, "%s: write_queue->write = %"PRId32, __func__, w);
+-
+-		ret = xQueueSend(shmem_tx_postprocess_queue, &entry, 0);
+-		if (!ret) {
+-			ESP_LOGE(TAG, "%s: xQueueSend failed", __func__);
+-			break;
+-		}
+-	}
+-
+-	if (changed)
+-		esp_shmem_write_irq(ESP_SHMEM_IRQ_TO_HOST_REG, 1);
+-}
+-
+-static bool esp_shmem_hw_queue_read(void)
+-{
+-	struct esp_ipc_hw_queue *hw_q = hw_queue + ESP_SHMEM_READ_HW_Q;
+-	volatile struct esp_ipc_queue_entry *data = (void *)hw_queue + hw_q->offset;
+-	uint32_t r, w;
+-
+-	r = hw_q->read;
+-	w = hw_q->write;
+-
+-	if (r == w)
+-		return false;
+-
+-	while (r != w) {
+-		uint32_t addr;
+-		void *info;
+-
+-		addr = data[r & hw_q->mask].addr;
+-		info = data[r & hw_q->mask].info;
+-
+-		if (addr < ESP_IPC_CLIENTS_MAX && client[addr].rx) {
+-			client[addr].rx(client[addr].p, info);
+-		} else {
+-			ESP_LOGE(TAG, "got IPC for an unknown address %"PRId32, addr);
+-		}
+-
+-		hw_q->read = ++r;
+-		ESP_LOGD(TAG, "%s: read_queue->read = %"PRId32" write = %"PRId32, __func__, r, w);
+-	}
+-	return true;
+-}
+-
+-static void esp_shmem_tx_task(void *p)
+-{
+-	for (;;) {
+-		esp_shmem_hw_queue_write();
+-		xSemaphoreTake(hw_queue_tx_semaphore, portMAX_DELAY);
+-	}
+-}
+-
+-static void esp_shmem_rx_task(void *p)
+-{
+-	for (;;) {
+-		if (!esp_shmem_hw_queue_read())
+-			xSemaphoreTake(hw_queue_rx_semaphore, portMAX_DELAY);
+-	}
+-}
+-
+-static void esp_shmem_isr(void *p)
+-{
+-	esp_shmem_write_irq(ESP_SHMEM_IRQ_FROM_HOST_REG, 0);
+-	xSemaphoreGiveFromISR(hw_queue_rx_semaphore, NULL);
+-}
+-
+-esp_err_t esp_ipc_register_rx(uint32_t addr, void *p,
+-			      void (*rx)(void *p, void *data),
+-			      void (*tx_done)(void *p, void *data))
+-{
+-	if (addr < ESP_IPC_CLIENTS_MAX) {
+-		client[addr].p = p;
+-		client[addr].rx = rx;
+-		client[addr].tx_done = tx_done;
+-		return ESP_OK;
+-	}
+-	return ESP_FAIL;
+-}
+-
+-esp_err_t esp_ipc_tx(uint32_t addr, uint32_t priority, void *buf)
+-{
+-	struct esp_ipc_sw_queue_entry entry = {
+-		.addr = addr,
+-		.buf = buf,
+-	};
+-
+-	if (priority >= ESP_IPC_PRIORITIES_MAX)
+-		return ESP_FAIL;
+-	if (xQueueSend(shmem_tx_queue[priority], &entry, portMAX_DELAY) != pdTRUE)
+-		return ESP_FAIL;
+-	xSemaphoreGive(hw_queue_tx_semaphore);
+-
+-	return ESP_OK;
+-}
+-
+-esp_err_t esp_ipc_init(void)
+-{
+-	int i;
+-
+-	ESP_LOGD(TAG, "%s", __func__);
+-
+-	hw_queue_rx_semaphore = xSemaphoreCreateBinary();
+-	hw_queue_tx_semaphore = xSemaphoreCreateBinary();
+-
+-	for (i = 0; i < ESP_IPC_PRIORITIES_MAX; ++i) {
+-		shmem_tx_queue[i] = xQueueCreate(IPC_SW_TX_QUEUE_SIZE,
+-						 sizeof(struct esp_ipc_sw_queue_entry));
+-		assert(shmem_tx_queue[i] != NULL);
+-	}
+-	shmem_tx_postprocess_queue = xQueueCreate(IPC_HW_TX_QUEUE_SIZE,
+-						  sizeof(struct esp_ipc_sw_queue_entry));
+-	assert(shmem_tx_postprocess_queue != NULL);
+-
+-	for (i = 0; i < 2; ++i) {
+-		hw_queue[i].offset = (uint32_t)(queue_data + i) - (uint32_t)hw_queue;
+-		hw_queue[i].mask = IPC_HW_TX_QUEUE_SIZE - 1;
+-	}
+-
+-	assert(xTaskCreate(esp_shmem_rx_task, "ipc_rx_task" ,
+-			   TASK_DEFAULT_STACK_SIZE, NULL, TASK_DEFAULT_PRIO, NULL) == pdTRUE);
+-	assert(xTaskCreate(esp_shmem_tx_task, "ipc_tx_task" ,
+-			   TASK_DEFAULT_STACK_SIZE, NULL, TASK_DEFAULT_PRIO, NULL) == pdTRUE);
+-
+-	intr_matrix_set(0, ETS_FROM_CPU_INTR0_SOURCE +
+-			CONFIG_ESP_SHMEM_IRQ_TO_HOST_IDX, 6);
+-	esp_intr_alloc(ETS_FROM_CPU_INTR0_SOURCE +
+-		       CONFIG_ESP_SHMEM_IRQ_FROM_HOST_IDX,
+-		       ESP_INTR_FLAG_SHARED,
+-		       esp_shmem_isr, NULL, NULL);
+-
+-	*(volatile void **)(0x600c0004) = hw_queue;
+-
+-	return ESP_OK;
+-}
+
+diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_ipc.h b/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_ipc.h
+deleted file mode 100644
+--- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_ipc.h
++++ /dev/null
+@@ -1,8 +0,0 @@
+-#include <stdint.h>
+-#include "esp.h"
+-
+-esp_err_t esp_ipc_register_rx(uint32_t addr, void *p,
+-			      void (*rx)(void *p, void *data),
+-			      void (*tx_done)(void *p, void *data));
+-esp_err_t esp_ipc_tx(uint32_t addr, uint32_t priority, void *buf);
+-esp_err_t esp_ipc_init(void);
+
 diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_ll_esp32s3.c b/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_ll_esp32s3.c
-index e19c62a..09905e8 100644
 --- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_ll_esp32s3.c
 +++ b/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_ll_esp32s3.c
-@@ -6,6 +6,7 @@
+@@ -2,44 +2,70 @@
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <string.h>
++#include "esp_attr.h"
+ #include "esp_system.h"
++#include "esp_rom_sys.h"
  #include "linux_ll.h"
  #include "hal/cache_hal.h"
  #include "hal/mmu_ll.h"
 +#include "esp_log.h"
++#include "rom/cache.h"
  
  static uint32_t first_free_mmu = ~0;
  
-@@ -26,6 +27,11 @@ void init_linux_mmap(void)
+-void init_linux_mmap(void)
++void IRAM_ATTR init_linux_mmap(void)
+ {
+ 	volatile uint32_t *dst = (uint32_t *)DR_REG_MMU_TABLE;
+ 	bool first = true;
++	uint32_t i_autoload, d_autoload;
+ 	int i;
+ 
++	/* Check the firmware's contiguous flash prefix before changing anything.
++	 * IDF PSRAM mappings and unused entries become Linux's flash window. */
+ 	for (i = 0; i < 0x100; ++i) {
+ 		if (dst[i] & 0xc000) {
+ 			if (first) {
+ 				first = false;
+ 				first_free_mmu = i;
+ 			}
+-			dst[i] = i;
+ 		} else if (!first) {
  			abort();
  		}
  	}
-+	printf("MMU: first_free_mmu=%u (firmware uses entries 0..%u)\n",
-+	       (unsigned)first_free_mmu, (unsigned)first_free_mmu - 1);
-+	printf("MMU: kernel e0x14=0x%04x rootfs e0x54=0x%04x\n",
-+	       (unsigned)dst[0x14], (unsigned)dst[0x54]);
++	if (first)
++		abort();
++
++	/* CPU1 is stopped, CPU0's IRQs/timer alarms are disabled, and this
++	 * function, literals and stack are internal. Preserve dirty PSRAM under
++	 * the old mapping, then discard both caches' old virtual-address tags.
++	 * Cache_Disable_* also waits for idle and invalidates that cache. */
++	Cache_WriteBack_All();
++	i_autoload = Cache_Disable_ICache();
++	d_autoload = Cache_Disable_DCache();
++
++	for (i = first_free_mmu; i < 0x100; ++i)
++		dst[i] = i;
 +
  #ifdef CONFIG_LINUX_PSRAM_8M
- 	for (i = 0x100; i < 0x180; ++i) {
+-	for (i = 0x100; i < 0x180; ++i) {
++	for (i = 0x100; i < 0x180; ++i)
  		dst[i] = 0x4000;
+-	}
+-	for (i = 0x180; i < 0x200; ++i) {
++	for (i = 0x180; i < 0x200; ++i)
+ 		dst[i] = 0x8000 + (i & 0x7f);
+-	}
+ #endif
+ #ifdef CONFIG_LINUX_PSRAM_16M
+-	/* linearly map PSRAM to the range +16M..+32M */
+-	for (i = 0x100; i < 0x200; ++i) {
++	/* Linearly map PSRAM to the range +16M..+32M. */
++	for (i = 0x100; i < 0x200; ++i)
+ 		dst[i] = 0x8000 + (i & 0xff);
+-	}
+ #endif
++	__asm__ __volatile__("memw" ::: "memory");
++	Cache_Enable_DCache(d_autoload);
++	Cache_Enable_ICache(i_autoload);
++
++	/* Both caches must resume before reading external diagnostic literals. */
++	esp_rom_printf("MMU: first_free_mmu=%u (firmware uses entries 0..%u)\n",
++	       (unsigned)first_free_mmu, (unsigned)first_free_mmu - 1);
++	esp_rom_printf("MMU: kernel e0x14=0x%04x rootfs e0x54=0x%04x\n",
++	       (unsigned)dst[0x14], (unsigned)dst[0x54]);
+ }
+ 
+ int linux_flash_read(void *data, uint32_t addr, uint32_t size)
+diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/sdio_slave_api.c b/esp_hosted_ng/esp/esp_driver/network_adapter/main/sdio_slave_api.c
+deleted file mode 100644
+--- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/sdio_slave_api.c
++++ /dev/null
+@@ -1,468 +0,0 @@
+-// SPDX-License-Identifier: Apache-2.0
+-// Copyright 2015-2021 Espressif Systems (Shanghai) PTE LTD
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-#include <stdlib.h>
+-#include <stdio.h>
+-#include <string.h>
+-#include <unistd.h>
+-#include "freertos/FreeRTOS.h"
+-#include "freertos/event_groups.h"
+-#include "driver/gpio.h"
+-#include <rom/rtc.h>
+-#include "esp_log.h"
+-#include "interface.h"
+-#include "esp.h"
+-#include "sdio_slave_api.h"
+-#include "driver/sdio_slave.h"
+-#include "soc/sdio_slave_periph.h"
+-#include "endian.h"
+-#include "freertos/semphr.h"
+-#include "stats.h"
+-#include "soc/gpio_reg.h"
+-
+-static uint8_t sdio_slave_rx_buffer[RX_BUF_NUM][RX_BUF_SIZE];
+-
+-static interface_context_t context;
+-static interface_handle_t if_handle_g;
+-static const char TAG[] = "FW_SDIO_SLAVE";
+-
+-static interface_handle_t * sdio_init(void);
+-static int32_t sdio_write(interface_handle_t *handle, interface_buffer_handle_t *buf_handle);
+-static int sdio_read(interface_handle_t *if_handle, interface_buffer_handle_t *buf_handle);
+-static esp_err_t sdio_reset(interface_handle_t *handle);
+-static void sdio_deinit(interface_handle_t *handle);
+-
+-static uint8_t gpio_oob = CONFIG_HOST_WAKEUP_GPIO;
+-extern volatile uint8_t power_save_on;
+-extern SemaphoreHandle_t wakeup_sem;
+-
+-static if_ops_t if_ops = {
+-	.init = sdio_init,
+-	.write = sdio_write,
+-	.read = sdio_read,
+-	.reset = sdio_reset,
+-	.deinit = sdio_deinit,
+-};
+-
+-interface_context_t *interface_insert_driver(int (*event_handler)(uint8_t val))
+-{
+-	ESP_LOGI(TAG, "Using SDIO interface");
+-	memset(&context, 0, sizeof(context));
+-
+-	context.type = SDIO;
+-	context.if_ops = &if_ops;
+-	context.event_handler = event_handler;
+-
+-	return &context;
+-}
+-
+-int interface_remove_driver()
+-{
+-	memset(&context, 0, sizeof(context));
+-	return 0;
+-}
+-
+-IRAM_ATTR static void event_cb(uint8_t val)
+-{
+-	if (val == ESP_RESET) {
+-		sdio_reset(&if_handle_g);
+-		return;
+-	}
+-
+-	if (val == ESP_POWER_SAVE_OFF) {
+-		sdio_reset(&if_handle_g);
+-	}
+-
+-	if (context.event_handler) {
+-		context.event_handler(val);
+-	}
+-
+-	if (val == ESP_POWER_SAVE_ON) {
+-		sdio_reset(&if_handle_g);
+-	}
+-}
+-
+-
+-static void sdio_read_done(void *handle)
+-{
+-	sdio_slave_recv_load_buf((sdio_slave_buf_handle_t) handle);
+-}
+-
+-static interface_handle_t * sdio_init(void)
+-{
+-	esp_err_t ret = ESP_OK;
+-	sdio_slave_buf_handle_t handle = {0};
+-	sdio_slave_config_t config = {
+-		.sending_mode       = SDIO_SLAVE_SEND_STREAM,
+-		.send_queue_size    = SDIO_SLAVE_QUEUE_SIZE,
+-		.recv_buffer_size   = RX_BUF_SIZE,
+-		.event_cb           = event_cb,
+-		/* Note: For small devkits there may be no pullups on the board.
+-		   This enables the internal pullups to help evaluate the driver
+-		   quickly. However the internal pullups are not sufficient and not
+-		   reliable, please make sure external pullups are connected to the
+-		   bus in your real design.
+-		   */
+-		//.flags              = SDIO_SLAVE_FLAG_INTERNAL_PULLUP,
+-		/* Note: Sometimes the SDIO card is detected but gets problem in
+-		 * Read/Write or handling ISR because of SDIO timing issues.
+-		 * In these cases, Please tune timing below using value from
+-		 * https://github.com/espressif/esp-idf/blob/release/v5.0/components/hal/include/hal/sdio_slave_types.h#L26-L38
+-		 * */
+-#if defined(CONFIG_IDF_TARGET_ESP32C6)
+-		.timing             = SDIO_SLAVE_TIMING_NSEND_PSAMPLE,
+-#endif
+-	};
+-#ifdef CONFIG_SDIO_DEFAULT_SPEED
+-	config.flags |= SDIO_SLAVE_FLAG_DEFAULT_SPEED;
+-#endif
+-
+-	/* Configuration for the OOB line */
+-	gpio_config_t io_conf={
+-		.intr_type=GPIO_INTR_DISABLE,
+-		.mode=GPIO_MODE_OUTPUT,
+-		.pin_bit_mask=(1 << gpio_oob)
+-	};
+-
+-	wakeup_sem = xSemaphoreCreateBinary();
+-	if (wakeup_sem == NULL) {
+-		ESP_LOGE(TAG, "Failed to create semaphore\n");
+-		return NULL;
+-	}
+-
+-	xSemaphoreGive(wakeup_sem);
+-
+-	ret = sdio_slave_initialize(&config);
+-	if (ret != ESP_OK) {
+-		return NULL;
+-	}
+-
+-	gpio_config(&io_conf);
+-
+-	for(int i = 0; i < RX_BUF_NUM; i++) {
+-		handle = sdio_slave_recv_register_buf(sdio_slave_rx_buffer[i]);
+-		assert(handle != NULL);
+-
+-		ret = sdio_slave_recv_load_buf(handle);
+-		if (ret != ESP_OK) {
+-			sdio_slave_deinit();
+-			return NULL;
+-		}
+-	}
+-
+-	sdio_slave_set_host_intena(SDIO_SLAVE_HOSTINT_SEND_NEW_PACKET |
+-			SDIO_SLAVE_HOSTINT_BIT0 |
+-			SDIO_SLAVE_HOSTINT_BIT1 |
+-			SDIO_SLAVE_HOSTINT_BIT2 |
+-			SDIO_SLAVE_HOSTINT_BIT3 |
+-			SDIO_SLAVE_HOSTINT_BIT4 |
+-			SDIO_SLAVE_HOSTINT_BIT5 |
+-			SDIO_SLAVE_HOSTINT_BIT6 |
+-			SDIO_SLAVE_HOSTINT_BIT7);
+-
+-	ret = sdio_slave_start();
+-	if (ret != ESP_OK) {
+-		sdio_slave_deinit();
+-		return NULL;
+-	}
+-
+-	memset(&if_handle_g, 0, sizeof(if_handle_g));
+-	if_handle_g.state = INIT;
+-
+-	return &if_handle_g;
+-}
+-
+-void oobTimerCallback( TimerHandle_t xTimer )
+-{
+-	xTimerDelete(xTimer, 0);
+-	WRITE_PERI_REG(GPIO_OUT_W1TC_REG, (1 << gpio_oob));
+-}
+-
+-void wake_host()
+-{
+-	TimerHandle_t xTimer = NULL;
+-	esp_err_t ret = ESP_OK;
+-	uint8_t retry = 1;
+-
+-	ESP_LOGI(TAG, "WAKE UP Host!!!!!\n");
+-
+-	while (retry) {
+-		WRITE_PERI_REG(GPIO_OUT_W1TS_REG, (1 << gpio_oob));
+-		xTimer = xTimerCreate("Timer", pdMS_TO_TICKS(10) , pdFALSE, 0, oobTimerCallback);
+-		if (xTimer == NULL) {
+-			ESP_LOGE(TAG, "Failed to create timer for SDIO OOB");
+-		}
+-		ret = xTimerStart(xTimer, 0);
+-		if (ret != pdPASS) {
+-			ESP_LOGE(TAG, "Failed to start timer for SDIO OOB");
+-		}
+-
+-		if (wakeup_sem) {
+-			/* wait for host resume */
+-			ret = xSemaphoreTake(wakeup_sem, pdMS_TO_TICKS(100));
+-
+-			if (ret == pdPASS) {
+-				/*                             usleep(100*1000);*/
+-				xSemaphoreGive(wakeup_sem);
+-				break;
+-			}
+-		}
+-
+-		retry--;
+-	}
+-}
+-
+-static int32_t sdio_write(interface_handle_t *handle, interface_buffer_handle_t *buf_handle)
+-{
+-	esp_err_t ret = ESP_OK;
+-	int32_t total_len = 0;
+-	uint8_t* sendbuf = NULL;
+-	uint16_t offset = 0;
+-	struct esp_payload_header *header = NULL;
+-
+-	if (!handle || !buf_handle) {
+-		ESP_LOGE(TAG , "Invalid arguments");
+-		return ESP_FAIL;
+-	}
+-
+-	if (handle->state != ACTIVE) {
+-		return ESP_FAIL;
+-	}
+-
+-	if (power_save_on) {
+-		return ESP_FAIL;
+-	}
+-
+-	if (!buf_handle->payload_len || !buf_handle->payload) {
+-		ESP_LOGE(TAG , "Invalid arguments, len:%d", buf_handle->payload_len);
+-		return ESP_FAIL;
+-	}
+-
+-	total_len = buf_handle->payload_len + sizeof (struct esp_payload_header);
+-
+-	sendbuf = heap_caps_malloc(total_len, MALLOC_CAP_DMA);
+-	if (sendbuf == NULL) {
+-		ESP_LOGE(TAG , "Malloc send buffer fail!");
+-		return ESP_FAIL;
+-	}
+-
+-	header = (struct esp_payload_header *) sendbuf;
+-
+-	memset (header, 0, sizeof(struct esp_payload_header));
+-
+-	/* Initialize header */
+-	header->if_type = buf_handle->if_type;
+-	header->if_num = buf_handle->if_num;
+-	header->len = htole16(buf_handle->payload_len);
+-	header->reserved2 = buf_handle->flag;
+-	offset = sizeof(struct esp_payload_header);
+-	header->offset = htole16(offset);
+-	header->packet_type = buf_handle->pkt_type;
+-
+-	memcpy(sendbuf + offset, buf_handle->payload, buf_handle->payload_len);
+-
+-#if CONFIG_ESP_SDIO_CHECKSUM
+-	header->checksum = htole16(compute_checksum(sendbuf,
+-				offset+buf_handle->payload_len));
+-#endif
+-
+-	ret = sdio_slave_transmit(sendbuf, total_len);
+-	if (ret != ESP_OK) {
+-		ESP_LOGE(TAG , "sdio slave transmit error, ret : 0x%x\r\n", ret);
+-		free(sendbuf);
+-		return ESP_FAIL;
+-	}
+-#if 0
+-	ESP_LOGE(TAG, "\nTo Host");
+-	ESP_LOG_BUFFER_HEXDUMP("s->h", buf_handle->payload,
+-	  buf_handle->payload_len, ESP_LOG_INFO);
+-#endif
+-	free(sendbuf);
+-
+-	return buf_handle->payload_len;
+-}
+-
+-esp_err_t send_bootup_event_to_host(uint8_t cap)
+-{
+-	struct esp_payload_header *header = NULL;
+-	struct esp_internal_bootup_event *event = NULL;
+-	struct fw_data * fw_p = NULL;
+-	interface_buffer_handle_t buf_handle = {0};
+-	uint8_t * pos = NULL;
+-	esp_err_t ret = ESP_OK;
+-	uint16_t len = 0;
+-
+-	memset(&buf_handle, 0, sizeof(buf_handle));
+-
+-	buf_handle.payload = heap_caps_malloc(RX_BUF_SIZE, MALLOC_CAP_DMA);
+-	assert(buf_handle.payload);
+-	memset(buf_handle.payload, 0, RX_BUF_SIZE);
+-
+-	header = (struct esp_payload_header *) buf_handle.payload;
+-
+-	header->if_type = ESP_INTERNAL_IF;
+-	header->if_num = 0;
+-	header->offset = htole16(sizeof(struct esp_payload_header));
+-
+-	event = (struct esp_internal_bootup_event*) (buf_handle.payload + sizeof(struct esp_payload_header));
+-
+-	event->header.event_code = ESP_INTERNAL_BOOTUP_EVENT;
+-	event->header.status = 0;
+-
+-	pos = event->data;
+-
+-	/* TLVs start */
+-
+-	/* TLV - Board type */
+-	*pos = ESP_BOOTUP_FIRMWARE_CHIP_ID;   pos++;len++;
+-	*pos = LENGTH_1_BYTE;                 pos++;len++;
+-	*pos = CONFIG_IDF_FIRMWARE_CHIP_ID;   pos++;len++;
+-
+-	/* TLV - Capability */
+-	*pos = ESP_BOOTUP_CAPABILITY;         pos++;len++;
+-	*pos = LENGTH_1_BYTE;                 pos++;len++;
+-	*pos = cap;                           pos++;len++;
+-
+-	/* TLV - FW data */
+-	*pos = ESP_BOOTUP_FW_DATA;            pos++; len++;
+-	*pos = sizeof(struct fw_data);        pos++; len++;
+-	fw_p = (struct fw_data *) pos;
+-	/* core0 sufficient now */
+-	ESP_LOGI(TAG, "last reset cause: %0xx", rtc_get_reset_reason(0));
+-	fw_p->last_reset_reason = htole32(rtc_get_reset_reason(0)); 
+-	fw_p->version.major1 = PROJECT_VERSION_MAJOR_1;
+-	fw_p->version.major2 = PROJECT_VERSION_MAJOR_2;
+-	fw_p->version.minor  = PROJECT_VERSION_MINOR;
+-	pos+=sizeof(struct fw_data);
+-	len+=sizeof(struct fw_data);
+-
+-	/* TLVs end */
+-	event->len = len;
+-	buf_handle.payload_len = len + sizeof(struct esp_internal_bootup_event) + sizeof(struct esp_payload_header);
+-
+-	/* payload len = Event len + sizeof(event len) */
+-	len += 1;
+-	event->header.len = htole16(len);
+-
+-	header->len = htole16(buf_handle.payload_len - sizeof(struct esp_payload_header));
+-
+-#if CONFIG_ESP_SDIO_CHECKSUM
+-	header->checksum = htole16(compute_checksum(buf_handle.payload, buf_handle.payload_len));
+-#endif
+-
+-	ret = sdio_slave_transmit(buf_handle.payload, buf_handle.payload_len);
+-	if (ret != ESP_OK) {
+-		ESP_LOGE(TAG , "sdio slave tx error, ret : 0x%x\r\n", ret);
+-		free(buf_handle.payload);
+-		return ESP_FAIL;
+-	}
+-
+-	free(buf_handle.payload);
+-	return ESP_OK;
+-}
+-
+-
+-static int sdio_read(interface_handle_t *if_handle, interface_buffer_handle_t *buf_handle)
+-{
+-	struct esp_payload_header *header = NULL;
+-#if CONFIG_ESP_SDIO_CHECKSUM
+-	uint16_t rx_checksum = 0, checksum = 0;
+-#endif
+-	uint16_t len = 0;
+-	size_t sdio_read_len = 0;
+-
+-
+-	if (!if_handle) {
+-		ESP_LOGE(TAG, "Invalid arguments to sdio_read");
+-		return ESP_FAIL;
+-	}
+-
+-	if (if_handle->state != ACTIVE) {
+-		return ESP_FAIL;
+-	}
+-
+-	sdio_slave_recv(&(buf_handle->sdio_buf_handle), &(buf_handle->payload),
+-			&(sdio_read_len), portMAX_DELAY);
+-	buf_handle->payload_len = sdio_read_len & 0xFFFF;
+-
+-	header = (struct esp_payload_header *) buf_handle->payload;
+-
+-	len = le16toh(header->len) + le16toh(header->offset);
+-
+-#if CONFIG_ESP_SDIO_CHECKSUM
+-	rx_checksum = le16toh(header->checksum);
+-	header->checksum = 0;
+-
+-	checksum = compute_checksum(buf_handle->payload, len);
+-
+-	if (checksum != rx_checksum) {
+-		sdio_read_done(buf_handle->sdio_buf_handle);
+-		return ESP_FAIL;
+-	}
+-#endif
+-
+-	buf_handle->if_type = header->if_type;
+-	buf_handle->if_num = header->if_num;
+-	buf_handle->free_buf_handle = sdio_read_done;
+-#if 0
+-	ESP_LOGE(TAG, "\nFrom Host");
+-	ESP_LOG_BUFFER_HEXDUMP("h->s", buf_handle->payload, len, ESP_LOG_INFO);
+-#endif
+-	return len;
+-}
+-
+-static esp_err_t sdio_reset(interface_handle_t *handle)
+-{
+-	esp_err_t ret = ESP_OK;
+-
+-	sdio_slave_stop();
+-
+-	ret = sdio_slave_reset();
+-	if (ret != ESP_OK)
+-		return ret;
+-
+-	ret = sdio_slave_start();
+-	if (ret != ESP_OK)
+-		return ret;
+-
+-	while (1) {
+-		sdio_slave_buf_handle_t handle = NULL;
+-
+-		/* Return buffers to driver */
+-		ret = sdio_slave_send_get_finished(&handle, 0);
+-		if (ret != ESP_OK)
+-			break;
+-
+-		if (handle) {
+-			ret = sdio_slave_recv_load_buf(handle);
+-			ESP_ERROR_CHECK(ret);
+-		}
+-	}
+-
+-	return ESP_OK;
+-}
+-
+-static void sdio_deinit(interface_handle_t *handle)
+-{
+-	if (wakeup_sem) {
+-		/* Dummy take and give sema before deleting it */
+-		xSemaphoreTake(wakeup_sem, portMAX_DELAY);
+-		xSemaphoreGive(wakeup_sem);
+-		vSemaphoreDelete(wakeup_sem);
+-		wakeup_sem = NULL;
+-	}
+-	sdio_slave_stop();
+-	sdio_slave_reset();
+-}
+
+diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/shmem_slave_api.c b/esp_hosted_ng/esp/esp_driver/network_adapter/main/shmem_slave_api.c
+deleted file mode 100644
+--- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/shmem_slave_api.c
++++ /dev/null
+@@ -1,318 +0,0 @@
+-// Copyright 2015-2021 Espressif Systems (Shanghai) PTE LTD
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-#include "sdkconfig.h"
+-#include <stdlib.h>
+-#include <stdio.h>
+-#include <string.h>
+-#include <unistd.h>
+-#include <rom/rtc.h>
+-#include "esp.h"
+-#include "esp_log.h"
+-#include "interface.h"
+-#include "endian.h"
+-#include "freertos/FreeRTOS.h"
+-#include "freertos/task.h"
+-#include "soc/periph_defs.h"
+-#include "stats.h"
+-#include "linux_ipc.h"
+-
+-static const char TAG[] = "FW_SHMEM";
+-
+-#define ESP_IPC_WIFI_ADDR	1
+-#define ESP_WIFI_RX_QUEUE_SIZE	20
+-
+-static interface_context_t context;
+-static interface_handle_t if_handle_g;
+-
+-static SemaphoreHandle_t read_semaphore;
+-static QueueHandle_t shmem_rx_queue[MAX_PRIORITY_QUEUES];
+-
+-static int32_t esp_shmem_write(interface_handle_t *handle, interface_buffer_handle_t *buf_handle)
+-{
+-	int32_t total_len = 0;
+-	uint16_t offset = 0;
+-	struct esp_payload_header *header = NULL;
+-	uint8_t *payload;
+-	uint32_t priority;
+-
+-	ESP_LOGD(TAG, "%s", __func__);
+-	if (!handle || !buf_handle) {
+-		ESP_LOGE(TAG , "Invalid arguments\n");
+-		return ESP_FAIL;
+-	}
+-
+-	if (!buf_handle->payload_len || !buf_handle->payload) {
+-		ESP_LOGE(TAG , "Invalid arguments, len:%d\n", buf_handle->payload_len);
+-		return ESP_FAIL;
+-	}
+-
+-	total_len = buf_handle->payload_len + sizeof (struct esp_payload_header);
+-
+-	if (total_len > RX_BUF_SIZE) {
+-		ESP_LOGE(TAG, "Max frame length exceeded %"PRId32".. drop it\n", total_len);
+-		return ESP_FAIL;
+-	}
+-
+-	header = malloc(total_len);
+-	if (!header) {
+-		ESP_LOGE(TAG, "couldn't allocate packet copy\n");
+-		return ESP_FAIL;
+-	}
+-	payload = (uint8_t *)header;
+-
+-	offset = sizeof(struct esp_payload_header);
+-	/* Initialize header */
+-	*header = (struct esp_payload_header){
+-		.if_type = buf_handle->if_type,
+-		.if_num = buf_handle->if_num,
+-		.flags = buf_handle->flag,
+-		.packet_type = buf_handle->pkt_type,
+-		.len = htole16(buf_handle->payload_len),
+-		.offset = htole16(offset),
+-	};
+-
+-	/* copy the data from caller */
+-	memcpy(payload + offset, buf_handle->payload, buf_handle->payload_len);
+-
+-	if (header->if_type == ESP_INTERNAL_IF)
+-		priority = PRIO_Q_HIGH;
+-	else if (header->if_type == ESP_HCI_IF)
+-		priority = PRIO_Q_MID;
+-	else
+-		priority = PRIO_Q_LOW;
+-
+-	if (esp_ipc_tx(ESP_IPC_WIFI_ADDR, priority, payload) != ESP_OK) {
+-		free(header);
+-		return ESP_FAIL;
+-	}
+-
+-	return buf_handle->payload_len;
+-}
+-
+-static void esp_shmem_buffer_done(void *p)
+-{
+-	ESP_LOGD(TAG, "%s", __func__);
+-	free(p);
+-}
+-
+-static void esp_shmem_rx(void *p, void *data)
+-{
+-	struct esp_payload_header *header = data;
+-
+-	if (!header) {
+-		uint8_t get_capabilities(void);
+-		send_bootup_event_to_host(get_capabilities());
+-	} else {
+-		uint16_t len = le16toh(header->len);
+-		uint16_t offset = le16toh(header->offset);
+-
+-		if (!len || (len > RX_BUF_SIZE)) {
+-			ESP_LOGE(TAG, "%s: bad len = %d", __func__, len);
+-		} else {
+-			/* Buffer is valid */
+-			void *copy = malloc(len + offset);
+-			interface_buffer_handle_t buf_handle = {
+-				.if_type = header->if_type,
+-				.if_num = header->if_num,
+-				.payload = copy,
+-				.payload_len = len + offset,
+-				.free_buf_handle = esp_shmem_buffer_done,
+-				.priv_buffer_handle = copy,
+-			};
+-			BaseType_t ret;
+-
+-			if (!copy) {
+-				ESP_LOGE(TAG, "%s: malloc failed", __func__);
+-			} else {
+-				memcpy(copy, header, len + offset);
+-
+-				if (header->if_type == ESP_INTERNAL_IF)
+-					ret = xQueueSend(shmem_rx_queue[PRIO_Q_HIGH], &buf_handle, portMAX_DELAY);
+-				else if (header->if_type == ESP_HCI_IF)
+-					ret = xQueueSend(shmem_rx_queue[PRIO_Q_MID], &buf_handle, portMAX_DELAY);
+-				else
+-					ret = xQueueSend(shmem_rx_queue[PRIO_Q_LOW], &buf_handle, portMAX_DELAY);
+-
+-				if (!ret) {
+-					ESP_LOGE(TAG, "%s: xQueueSend failed", __func__);
+-					free(copy);
+-				} else {
+-					xSemaphoreGive(read_semaphore);
+-				}
+-			}
+-		}
+-	}
+-}
+-
+-static int esp_shmem_read(interface_handle_t *if_handle, interface_buffer_handle_t *buf_handle)
+-{
+-	esp_err_t ret = ESP_OK;
+-
+-	ESP_LOGD(TAG, "%s", __func__);
+-	if (!if_handle) {
+-		ESP_LOGE(TAG, "Invalid arguments to esp_spi_read\n");
+-		return ESP_FAIL;
+-	}
+-
+-	while (1) {
+-		if (uxQueueMessagesWaiting(shmem_rx_queue[PRIO_Q_HIGH])) {
+-			ret = xQueueReceive(shmem_rx_queue[PRIO_Q_HIGH], buf_handle, portMAX_DELAY);
+-			break;
+-		} else if (uxQueueMessagesWaiting(shmem_rx_queue[PRIO_Q_MID])) {
+-			ret = xQueueReceive(shmem_rx_queue[PRIO_Q_MID], buf_handle, portMAX_DELAY);
+-			break;
+-		} else if (uxQueueMessagesWaiting(shmem_rx_queue[PRIO_Q_LOW])) {
+-			ret = xQueueReceive(shmem_rx_queue[PRIO_Q_LOW], buf_handle, portMAX_DELAY);
+-			break;
+-		} else {
+-			xSemaphoreTake(read_semaphore, portMAX_DELAY);
+-		}
+-	}
+-
+-	if (ret != pdTRUE) {
+-		return ESP_FAIL;
+-	}
+-	return buf_handle->payload_len;
+-}
+-
+-static esp_err_t esp_shmem_reset(interface_handle_t *handle)
+-{
+-	ESP_LOGD(TAG, "%s", __func__);
+-	esp_err_t ret = ESP_OK;
+-	return ret;
+-}
+-
+-esp_err_t send_bootup_event_to_host(uint8_t cap)
+-{
+-	struct esp_payload_header *header = NULL;
+-	struct esp_internal_bootup_event *event = NULL;
+-	struct fw_data * fw_p = NULL;
+-	uint8_t *payload;
+-	uint32_t payload_len;
+-	uint8_t * pos = NULL;
+-	uint16_t len = 0;
+-
+-	ESP_LOGD(TAG, "%s", __func__);
+-
+-	payload = malloc(RX_BUF_SIZE);
+-	assert(payload);
+-	memset(payload, 0, RX_BUF_SIZE);
+-
+-	header = (struct esp_payload_header *) payload;
+-
+-	header->if_type = ESP_INTERNAL_IF;
+-	header->if_num = 0;
+-	header->offset = htole16(sizeof(struct esp_payload_header));
+-
+-	event = (struct esp_internal_bootup_event*) (payload + sizeof(struct esp_payload_header));
+-
+-	event->header.event_code = ESP_INTERNAL_BOOTUP_EVENT;
+-	event->header.status = 0;
+-
+-	pos = event->data;
+-
+-	/* TLVs start */
+-
+-	/* TLV - Board type */
+-	*pos = ESP_BOOTUP_FIRMWARE_CHIP_ID;   pos++;len++;
+-	*pos = LENGTH_1_BYTE;                 pos++;len++;
+-	*pos = CONFIG_IDF_FIRMWARE_CHIP_ID;   pos++;len++;
+-
+-	/* TLV - Capability */
+-	*pos = ESP_BOOTUP_CAPABILITY;         pos++;len++;
+-	*pos = LENGTH_1_BYTE;                 pos++;len++;
+-	*pos = cap;                           pos++;len++;
+-
+-	/* TLV - FW data */
+-	*pos = ESP_BOOTUP_FW_DATA;            pos++; len++;
+-	*pos = sizeof(struct fw_data);        pos++; len++;
+-	fw_p = (struct fw_data *) pos;
+-
+-	/* core0 sufficient now */
+-	fw_p->last_reset_reason = htole32(rtc_get_reset_reason(0));
+-	fw_p->version.major1 = PROJECT_VERSION_MAJOR_1;
+-	fw_p->version.major2 = PROJECT_VERSION_MAJOR_2;
+-	fw_p->version.minor  = PROJECT_VERSION_MINOR;
+-	pos += sizeof(struct fw_data);
+-	len += sizeof(struct fw_data);
+-
+-	/* TLVs end */
+-	event->len = len;
+-	payload_len = len + sizeof(struct esp_internal_bootup_event) + sizeof(struct esp_payload_header);
+-	/*print_reset_reason(event->last_reset_reason);*/
+-
+-	/* payload len = Event len + sizeof(event len) */
+-	len += 1;
+-	event->header.len = htole16(len);
+-
+-	header->len = htole16(payload_len - sizeof(struct esp_payload_header));
+-
+-	return esp_ipc_tx(ESP_IPC_WIFI_ADDR, PRIO_Q_HIGH, payload);
+-}
+-
+-static void esp_shmem_tx_done(void *p, void *data)
+-{
+-	free(data);
+-}
+-
+-static interface_handle_t *esp_shmem_init(void)
+-{
+-	int i;
+-
+-	ESP_LOGD(TAG, "%s", __func__);
+-
+-	read_semaphore = xSemaphoreCreateBinary();
+-	for (i = 0; i < MAX_PRIORITY_QUEUES; ++i) {
+-		shmem_rx_queue[i] = xQueueCreate(ESP_WIFI_RX_QUEUE_SIZE,
+-						 sizeof(interface_buffer_handle_t));
+-		assert(shmem_rx_queue[i] != NULL);
+-	}
+-
+-	esp_ipc_register_rx(ESP_IPC_WIFI_ADDR, NULL,
+-			    esp_shmem_rx, esp_shmem_tx_done);
+-	return &if_handle_g;
+-}
+-
+-static void esp_shmem_deinit(interface_handle_t *handle)
+-{
+-	ESP_LOGD(TAG, "%s", __func__);
+-}
+-
+-if_ops_t if_ops = {
+-	.init = esp_shmem_init,
+-	.write = esp_shmem_write,
+-	.read = esp_shmem_read,
+-	.reset = esp_shmem_reset,
+-	.deinit = esp_shmem_deinit,
+-};
+-
+-interface_context_t *interface_insert_driver(int (*event_handler)(uint8_t val))
+-{
+-	ESP_LOGD(TAG, "Using SHMEM interface");
+-	memset(&context, 0, sizeof(context));
+-
+-	context.type = SHMEM;
+-	context.if_ops = &if_ops;
+-	context.event_handler = event_handler;
+-
+-	return &context;
+-}
+-
+-int interface_remove_driver()
+-{
+-	ESP_LOGD(TAG, "%s", __func__);
+-	memset(&context, 0, sizeof(context));
+-	return 0;
+-}
+
+diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/slave_bt.c b/esp_hosted_ng/esp/esp_driver/network_adapter/main/slave_bt.c
+deleted file mode 100644
+--- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/slave_bt.c
++++ /dev/null
+@@ -1,551 +0,0 @@
+-// SPDX-License-Identifier: Apache-2.0
+-// Copyright 2015-2021 Espressif Systems (Shanghai) PTE LTD
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-//
+-
+-#ifdef CONFIG_BT_ENABLED
+-#include <string.h>
+-#include "driver/gpio.h"
+-#include "driver/uart.h"
+-#include "soc/lldesc.h"
+-#include "esp_bt.h"
+-#include "esp_log.h"
+-#include "slave_bt.h"
+-
+-#if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32S3)
+-    #include "esp_private/gdma.h"
+-    #if BLUETOOTH_UART
+-        #include "hal/uhci_ll.h"
+-    #endif
+-#endif
+-
+-static const char BT_TAG[] = "FW_BT";
+-extern QueueHandle_t to_host_queue[MAX_PRIORITY_QUEUES];
+-
+-#if BLUETOOTH_HCI
+-/* ***** HCI specific part ***** */
+-
+-#define VHCI_MAX_TIMEOUT_MS 	2000
+-static SemaphoreHandle_t vhci_send_sem;
+-
+-static void controller_rcv_pkt_ready(void)
+-{
+-	if (vhci_send_sem)
+-		xSemaphoreGive(vhci_send_sem);
+-}
+-
+-static int host_rcv_pkt(uint8_t *data, uint16_t len)
+-{
+-	esp_err_t ret = ESP_OK;
+-	interface_buffer_handle_t buf_handle;
+-	uint8_t *buf = NULL;
+-
+-	buf = (uint8_t *) malloc(len);
+-
+-	if (!buf) {
+-		ESP_LOGE(BT_TAG, "HCI Send packet: memory allocation failed");
+-		return ESP_FAIL;
+-	}
+-
+-	memcpy(buf, data, len);
+-
+-	memset(&buf_handle, 0, sizeof(buf_handle));
+-
+-	buf_handle.if_type = ESP_HCI_IF;
+-	buf_handle.if_num = 0;
+-	buf_handle.payload_len = len;
+-	buf_handle.payload = buf;
+-	buf_handle.wlan_buf_handle = buf;
+-	buf_handle.free_buf_handle = free;
+-
+-#if CONFIG_ESP_BT_DEBUG
+-	ESP_LOG_BUFFER_HEXDUMP("bt_tx", data, len, ESP_LOG_INFO);
+-#endif
+-	ret = xQueueSend(to_host_queue[PRIO_Q_MID], &buf_handle, portMAX_DELAY);
+-
+-	if (ret != pdTRUE) {
+-		ESP_LOGE(BT_TAG, "HCI send packet: Failed to send buffer\n");
+-		free(buf);
+-		return ESP_FAIL;
+-	}
+-
+-	return 0;
+-}
+-
+-static esp_vhci_host_callback_t vhci_host_cb = {
+-	controller_rcv_pkt_ready,
+-	host_rcv_pkt
+-};
+-
+-void process_hci_rx_pkt(uint8_t *payload, uint16_t payload_len) {
+-	/* VHCI needs one extra byte at the start of payload */
+-	/* that is accomodated in esp_payload_header */
+-#if CONFIG_ESP_BT_DEBUG
+-	ESP_LOG_BUFFER_HEXDUMP("bt_rx", payload, payload_len, ESP_LOG_INFO);
+-#endif
+-	payload--;
+-	payload_len++;
+-
+-	if (!esp_vhci_host_check_send_available()) {
+-		ESP_LOGD(BT_TAG, "VHCI not available");
+-	}
+-
+-#if SOC_ESP_NIMBLE_CONTROLLER
+-	esp_vhci_host_send_packet(payload, payload_len);
+-#else
+-	if (vhci_send_sem) {
+-		if (xSemaphoreTake(vhci_send_sem, VHCI_MAX_TIMEOUT_MS) == pdTRUE) {
+-			esp_vhci_host_send_packet(payload, payload_len);
+-		} else {
+-			ESP_LOGI(BT_TAG, "VHCI sem timeout");
+-		}
+-	}
+-#endif
+-}
+-
+-#elif BLUETOOTH_UART
+-/* ***** UART specific part ***** */
+-
+-#if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32S3)
+-// Operation functions for HCI UART Transport Layer
+-static bool hci_uart_tl_init(void);
+-static void hci_uart_tl_deinit(void);
+-static void hci_uart_tl_recv_async(uint8_t *buf, uint32_t size, esp_bt_hci_tl_callback_t callback, void *arg);
+-static void hci_uart_tl_send_async(uint8_t *buf, uint32_t size, esp_bt_hci_tl_callback_t callback, void *arg);
+-static void hci_uart_tl_flow_on(void);
+-static bool hci_uart_tl_flow_off(void);
+-static void hci_uart_tl_finish_transfers(void);
+-
+-struct uart_txrxchannel {
+-	esp_bt_hci_tl_callback_t callback;
+-	void *arg;
+-	lldesc_t link;
+-};
+-
+-struct uart_env_tag {
+-	struct uart_txrxchannel tx;
+-	struct uart_txrxchannel rx;
+-};
+-
+-struct uart_env_tag uart_env;
+-
+-static volatile uhci_dev_t *s_uhci_hw = &UHCI0;
+-static gdma_channel_handle_t s_rx_channel;
+-static gdma_channel_handle_t s_tx_channel;
+-
+-static esp_bt_hci_tl_t s_hci_uart_tl_funcs = {
+-	._magic = ESP_BT_HCI_TL_MAGIC_VALUE,
+-	._version = ESP_BT_HCI_TL_VERSION,
+-	._reserved = 0,
+-	._open = (void *)hci_uart_tl_init,
+-	._close = (void *)hci_uart_tl_deinit,
+-	._finish_transfers = (void *)hci_uart_tl_finish_transfers,
+-	._recv = (void *)hci_uart_tl_recv_async,
+-	._send = (void *)hci_uart_tl_send_async,
+-	._flow_on = (void *)hci_uart_tl_flow_on,
+-	._flow_off = (void *)hci_uart_tl_flow_off,
+-};
+-
+-static bool hci_uart_tl_init(void)
+-{
+-	return true;
+-}
+-
+-static void hci_uart_tl_deinit(void)
+-{
+-}
+-
+-static IRAM_ATTR void hci_uart_tl_recv_async(uint8_t *buf, uint32_t size,
+-						esp_bt_hci_tl_callback_t callback, void *arg)
+-{
+-	assert(buf != NULL);
+-	assert(size != 0);
+-	assert(callback != NULL);
+-	uart_env.rx.callback = callback;
+-	uart_env.rx.arg = arg;
+-
+-	memset(&uart_env.rx.link, 0, sizeof(lldesc_t));
+-	uart_env.rx.link.buf = buf;
+-	uart_env.rx.link.size = size;
+-
+-	s_uhci_hw->pkt_thres.thrs = size;
+-
+-	gdma_start(s_rx_channel, (intptr_t)(&uart_env.rx.link));
+-}
+-
+-static IRAM_ATTR void hci_uart_tl_send_async(uint8_t *buf, uint32_t size,
+-						esp_bt_hci_tl_callback_t callback, void *arg)
+-{
+-	assert(buf != NULL);
+-	assert(size != 0);
+-	assert(callback != NULL);
+-
+-	uart_env.tx.callback = callback;
+-	uart_env.tx.arg = arg;
+-
+-	memset(&uart_env.tx.link, 0, sizeof(lldesc_t));
+-	uart_env.tx.link.length = size;
+-	uart_env.tx.link.buf = buf;
+-	uart_env.tx.link.eof = 1;
+-
+-	gdma_start(s_tx_channel, (intptr_t)(&uart_env.tx.link));
+-}
+-
+-static void hci_uart_tl_flow_on(void)
+-{
+-}
+-
+-static bool hci_uart_tl_flow_off(void)
+-{
+-	return true;
+-}
+-
+-static void hci_uart_tl_finish_transfers(void)
+-{
+-}
+-
+-static IRAM_ATTR bool hci_uart_tl_rx_eof_callback(gdma_channel_handle_t dma_chan,
+-								gdma_event_data_t *event_data, void *user_data)
+-{
+-	assert(dma_chan == s_rx_channel);
+-	assert(uart_env.rx.callback != NULL);
+-	esp_bt_hci_tl_callback_t callback = uart_env.rx.callback;
+-	void *arg = uart_env.rx.arg;
+-
+-	// clear callback pointer
+-	uart_env.rx.callback = NULL;
+-	uart_env.rx.arg = NULL;
+-
+-	// call handler
+-	callback(arg, ESP_BT_HCI_TL_STATUS_OK);
+-
+-	// send notification to Bluetooth Controller task
+-	esp_bt_h4tl_eif_io_event_notify(1);
+-
+-	return true;
+-}
+-
+-static IRAM_ATTR bool hci_uart_tl_tx_eof_callback(gdma_channel_handle_t dma_chan,
+-								gdma_event_data_t *event_data, void *user_data)
+-{
+-	assert(dma_chan == s_tx_channel);
+-	assert(uart_env.tx.callback != NULL);
+-	esp_bt_hci_tl_callback_t callback = uart_env.tx.callback;
+-	void *arg = uart_env.tx.arg;
+-
+-	// clear callback pointer
+-	uart_env.tx.callback = NULL;
+-	uart_env.tx.arg = NULL;
+-
+-	// call handler
+-	callback(arg, ESP_BT_HCI_TL_STATUS_OK);
+-
+-	// send notification to Bluetooth Controller task
+-	esp_bt_h4tl_eif_io_event_notify(1);
+-
+-	return true;
+-}
+-#endif
+-
+-#if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32S3)
+-static void init_uart(void)
+-{
+-	ESP_LOGD(BT_TAG, "Set-up BLE for ESP32-C3/ESP32-S3");
+-#if BLUETOOTH_UART == 1
+-	periph_module_enable(PERIPH_UART1_MODULE);
+-	periph_module_reset(PERIPH_UART1_MODULE);
+-#elif BLUETOOTH_UART == 2
+-	periph_module_enable(PERIPH_UART2_MODULE);
+-	periph_module_reset(PERIPH_UART2_MODULE);
+-#endif
+-
+-	periph_module_enable(PERIPH_UHCI0_MODULE);
+-	periph_module_reset(PERIPH_UHCI0_MODULE);
+-
+-	gpio_config_t io_output_conf = {
+-		.intr_type = GPIO_INTR_DISABLE,	//disable interrupt
+-		.mode = GPIO_MODE_OUTPUT,	// output mode
+-		.pin_bit_mask = GPIO_OUTPUT_PIN_SEL,	// bit mask of the output pins
+-		.pull_down_en = 0,	// disable pull-down mode
+-		.pull_up_en = 0,	// disable pull-up mode
+-	};
+-	gpio_config(&io_output_conf);
+-
+-	gpio_config_t io_input_conf = {
+-		.intr_type = GPIO_INTR_DISABLE,	//disable interrupt
+-		.mode = GPIO_MODE_INPUT,	// input mode
+-		.pin_bit_mask = GPIO_INPUT_PIN_SEL,  // bit mask of the input pins
+-		.pull_down_en = 0,	// disable pull-down mode
+-		.pull_up_en = 0,	// disable pull-down mode
+-	};
+-	gpio_config(&io_input_conf);
+-
+-	ESP_ERROR_CHECK( uart_set_pin(BLUETOOTH_UART, BT_TX_PIN,
+-				BT_RX_PIN, BT_RTS_PIN, BT_CTS_PIN) );
+-	ESP_LOGI(BT_TAG, "UART Pins: Tx:%u Rx:%u RTS:%u CTS:%u",
+-			BT_TX_PIN, BT_RX_PIN, BT_RTS_PIN, BT_CTS_PIN);
+-
+-	// configure UART1
+-	ESP_LOGI(BT_TAG, "baud rate for HCI uart :: %d\n",
+-					CONFIG_EXAMPLE_HCI_UART_BAUDRATE);
+-
+-	uart_config_t uart_config = {
+-		.baud_rate = CONFIG_EXAMPLE_HCI_UART_BAUDRATE,
+-
+-		.data_bits = UART_DATA_8_BITS,
+-		.parity = UART_PARITY_DISABLE,
+-		.stop_bits = UART_STOP_BITS_1,
+-		.flow_ctrl = UART_HW_FLOWCTRL_CTS_RTS,
+-		.rx_flow_ctrl_thresh = UART_RX_THRS,
+-		.source_clk = UART_SCLK_APB,
+-	};
+-	ESP_ERROR_CHECK(uart_param_config(BLUETOOTH_UART, &uart_config));
+-
+-	// install DMA driver
+-	gdma_channel_alloc_config_t tx_channel_config = {
+-		.flags.reserve_sibling = 1,
+-		.direction = GDMA_CHANNEL_DIRECTION_TX,
+-	};
+-	ESP_ERROR_CHECK(gdma_new_channel(&tx_channel_config, &s_tx_channel));
+-	gdma_channel_alloc_config_t rx_channel_config = {
+-		.direction = GDMA_CHANNEL_DIRECTION_RX,
+-		.sibling_chan = s_tx_channel,
+-	};
+-	ESP_ERROR_CHECK(gdma_new_channel(&rx_channel_config, &s_rx_channel));
+-
+-	gdma_connect(s_tx_channel, GDMA_MAKE_TRIGGER(GDMA_TRIG_PERIPH_UHCI, 0));
+-	gdma_connect(s_rx_channel, GDMA_MAKE_TRIGGER(GDMA_TRIG_PERIPH_UHCI, 0));
+-
+-	gdma_strategy_config_t strategy_config = {
+-		.auto_update_desc = false,
+-		.owner_check = false
+-	};
+-	gdma_apply_strategy(s_tx_channel, &strategy_config);
+-	gdma_apply_strategy(s_rx_channel, &strategy_config);
+-
+-	gdma_rx_event_callbacks_t rx_cbs = {
+-		.on_recv_eof = hci_uart_tl_rx_eof_callback
+-	};
+-	gdma_register_rx_event_callbacks(s_rx_channel, &rx_cbs, NULL);
+-
+-	gdma_tx_event_callbacks_t tx_cbs = {
+-		.on_trans_eof = hci_uart_tl_tx_eof_callback
+-	};
+-	gdma_register_tx_event_callbacks(s_tx_channel, &tx_cbs, NULL);
+-
+-	// configure UHCI
+-	uhci_ll_init(s_uhci_hw);
+-	uhci_ll_set_eof_mode(s_uhci_hw, UHCI_RX_LEN_EOF);
+-	// disable software flow control
+-	s_uhci_hw->escape_conf.val = 0;
+-	uhci_ll_attach_uart_port(s_uhci_hw, 1);
+-}
+-#elif CONFIG_IDF_TARGET_ESP32
+-static void init_uart(void)
+-{
+-	ESP_LOGD(BT_TAG, "Set-up BLE for ESP32");
+-#if BLUETOOTH_UART == 1
+-	periph_module_enable(PERIPH_UART1_MODULE);
+-	periph_module_reset(PERIPH_UART1_MODULE);
+-#elif BLUETOOTH_UART == 2
+-	periph_module_enable(PERIPH_UART2_MODULE);
+-	periph_module_reset(PERIPH_UART2_MODULE);
+-#endif
+-
+-	periph_module_enable(PERIPH_UHCI0_MODULE);
+-	periph_module_reset(PERIPH_UHCI0_MODULE);
+-
+-
+-	ESP_ERROR_CHECK( uart_set_pin(BLUETOOTH_UART, BT_TX_PIN,
+-		BT_RX_PIN, BT_RTS_PIN, BT_CTS_PIN) );
+-	ESP_LOGI(BT_TAG, "UART Pins: Tx:%u Rx:%u RTS:%u CTS:%u",
+-			BT_TX_PIN, BT_RX_PIN, BT_RTS_PIN, BT_CTS_PIN);
+-
+-}
+-#elif defined(CONFIG_IDF_TARGET_ESP32C2) || defined(CONFIG_IDF_TARGET_ESP32C6)
+-static void init_uart(void)
+-{
+-	ESP_LOGD(BT_TAG, "Set-up BLE for ESP32-C2/C6");
+-
+-#if defined(CONFIG_IDF_TARGET_ESP32C2)
+-	ESP_LOGI(BT_TAG, "UART Pins: Tx:%u Rx:%u", BT_TX_PIN, BT_RX_PIN);
+-#elif defined(CONFIG_IDF_TARGET_ESP32C6)
+-	ESP_LOGI(BT_TAG, "UART Pins: Tx:%u Rx:%u", BT_TX_PIN, BT_RX_PIN);
+-#endif
+-}
+-#endif
+-#endif
+-
+-#if BLUETOOTH_HCI
+-#if SOC_ESP_NIMBLE_CONTROLLER
+-#include "nimble/ble_hci_trans.h"
+-
+-typedef enum {
+-    DATA_TYPE_COMMAND = 1,
+-    DATA_TYPE_ACL     = 2,
+-    DATA_TYPE_SCO     = 3,
+-    DATA_TYPE_EVENT   = 4
+-} serial_data_type_t;
+-
+-/* Host-to-controller command. */
+-#define BLE_HCI_TRANS_BUF_CMD       3
+-
+-/* ACL_DATA_MBUF_LEADINGSPCAE: The leadingspace in user info header for ACL data */
+-#define ACL_DATA_MBUF_LEADINGSPCAE    4
+-
+-void esp_vhci_host_send_packet(uint8_t *data, uint16_t len)
+-{
+-    if (*(data) == DATA_TYPE_COMMAND) {
+-        struct ble_hci_cmd *cmd = NULL;
+-        cmd = (struct ble_hci_cmd *) ble_hci_trans_buf_alloc(BLE_HCI_TRANS_BUF_CMD);
+-        memcpy((uint8_t *)cmd, data + 1, len - 1);
+-        ble_hci_trans_hs_cmd_tx((uint8_t *)cmd);
+-    }
+-
+-    if (*(data) == DATA_TYPE_ACL) {
+-        struct os_mbuf *om = os_msys_get_pkthdr(len, ACL_DATA_MBUF_LEADINGSPCAE);
+-        assert(om);
+-        os_mbuf_append(om, &data[1], len - 1);
+-        ble_hci_trans_hs_acl_tx(om);
+-    }
+-}
+-
+-bool esp_vhci_host_check_send_available() {
+-    // not need to check in esp new controller
+-    return true;
+-}
+-
+-int ble_hs_hci_rx_evt(uint8_t *hci_ev, void *arg)
+-{
+-    uint16_t len = hci_ev[1] + 3;
+-    uint8_t *data = (uint8_t *)malloc(len);
+-    data[0] = 0x04;
+-    memcpy(&data[1], hci_ev, len - 1);
+-    ble_hci_trans_buf_free(hci_ev);
+-    vhci_host_cb.notify_host_recv(data, len);
+-    free(data);
+-    return 0;
+-}
+-
+-
+-int ble_hs_rx_data(struct os_mbuf *om, void *arg)
+-{
+-    uint16_t len = om->om_len + 1;
+-    uint8_t *data = (uint8_t *)malloc(len);
+-    data[0] = 0x02;
+-    os_mbuf_copydata(om, 0, len - 1, &data[1]);
+-    vhci_host_cb.notify_host_recv(data, len);
+-    free(data);
+-    os_mbuf_free_chain(om);
+-    return 0;
+-}
+-
+-#endif
+-#endif
+-
+-esp_err_t initialise_bluetooth(void)
+-{
+-	esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+-
+-
+-#ifdef BLUETOOTH_UART
+-#if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32S3)
+-	bt_cfg.hci_tl_funcs = &s_hci_uart_tl_funcs;
+-#endif
+-
+-	init_uart();
+-#endif
+-	ESP_ERROR_CHECK( esp_bt_controller_init(&bt_cfg) );
+-#if BLUETOOTH_BLE
+-	ESP_ERROR_CHECK( esp_bt_controller_enable(ESP_BT_MODE_BLE) );
+-#elif BLUETOOTH_BT
+-	ESP_ERROR_CHECK( esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT) );
+-#elif BLUETOOTH_BT_BLE
+-	ESP_ERROR_CHECK( esp_bt_controller_enable(ESP_BT_MODE_BTDM) );
+-#endif
+-
+-#if BLUETOOTH_HCI
+-	esp_err_t ret = ESP_OK;
+-
+-#if SOC_ESP_NIMBLE_CONTROLLER
+-	ble_hci_trans_cfg_hs((ble_hci_trans_rx_cmd_fn *)ble_hs_hci_rx_evt,NULL,
+-				(ble_hci_trans_rx_acl_fn *)ble_hs_rx_data,NULL);
+-#else
+-	ret = esp_vhci_host_register_callback(&vhci_host_cb);
+-#endif
+-
+-	if (ret != ESP_OK) {
+-		ESP_LOGE(BT_TAG, "Failed to register VHCI callback");
+-		return ret;
+-	}
+-
+-	vhci_send_sem = xSemaphoreCreateBinary();
+-	if (vhci_send_sem == NULL) {
+-		ESP_LOGE(BT_TAG, "Failed to create VHCI send sem");
+-		return ESP_ERR_NO_MEM;
+-	}
+-
+-	xSemaphoreGive(vhci_send_sem);
+-#endif
+-
+-	return ESP_OK;
+-}
+-
+-void deinitialize_bluetooth(void)
+-{
+-#if BLUETOOTH_HCI
+-	if (vhci_send_sem) {
+-		/* Dummy take and give sema before deleting it */
+-		xSemaphoreTake(vhci_send_sem, portMAX_DELAY);
+-		xSemaphoreGive(vhci_send_sem);
+-		vSemaphoreDelete(vhci_send_sem);
+-		vhci_send_sem = NULL;
+-	}
+-	esp_bt_controller_disable();
+-	esp_bt_controller_deinit();
+-#endif
+-}
+-
+-uint8_t get_bluetooth_capabilities(void)
+-{
+-	uint8_t cap = 0;
+-	ESP_LOGI(BT_TAG, "- BT/BLE");
+-#if BLUETOOTH_HCI
+-#if CONFIG_ESP_SPI_HOST_INTERFACE
+-	ESP_LOGI(BT_TAG, "   - HCI Over SPI");
+-	cap |= ESP_BT_SPI_SUPPORT;
+-#else
+-	ESP_LOGI(BT_TAG, "   - HCI Over SDIO");
+-	cap |= ESP_BT_SDIO_SUPPORT;
+-#endif
+-#elif BLUETOOTH_UART
+-	ESP_LOGI(BT_TAG, "   - HCI Over UART");
+-	cap |= ESP_BT_UART_SUPPORT;
+-#endif
+-
+-#if BLUETOOTH_BLE
+-	ESP_LOGI(BT_TAG, "   - BLE only");
+-	cap |= ESP_BLE_ONLY_SUPPORT;
+-#elif BLUETOOTH_BT
+-	ESP_LOGI(BT_TAG, "   - BR_EDR only");
+-	cap |= ESP_BR_EDR_ONLY_SUPPORT;
+-#elif BLUETOOTH_BT_BLE
+-	ESP_LOGI(BT_TAG, "   - BT/BLE dual mode");
+-	cap |= ESP_BLE_ONLY_SUPPORT | ESP_BR_EDR_ONLY_SUPPORT;
+-#endif
+-	return cap;
+-}
+-
+-
+-#endif
+
+diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/spi_slave_api.c b/esp_hosted_ng/esp/esp_driver/network_adapter/main/spi_slave_api.c
+deleted file mode 100644
+--- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/spi_slave_api.c
++++ /dev/null
+@@ -1,712 +0,0 @@
+-// SPDX-License-Identifier: Apache-2.0
+-// Copyright 2015-2021 Espressif Systems (Shanghai) PTE LTD
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//	 http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-#include "sdkconfig.h"
+-#include <stdlib.h>
+-#include <stdio.h>
+-#include <string.h>
+-#include <unistd.h>
+-#include <rom/rtc.h>
+-#include "esp.h"
+-#include "esp_log.h"
+-#include "interface.h"
+-#include "driver/spi_slave.h"
+-#include "driver/gpio.h"
+-#include "endian.h"
+-#include "freertos/task.h"
+-#include "stats.h"
+-#include "soc/gpio_reg.h"
+-
+-static const char TAG[] = "FW_SPI";
+-#define SPI_BITS_PER_WORD			8
+-#define SPI_MODE_0				0
+-#define SPI_MODE_1				1
+-#define SPI_MODE_2				2
+-#define SPI_MODE_3				3
+-
+-#define SPI_DMA_ALIGNMENT_BYTES	4
+-#define SPI_DMA_ALIGNMENT_MASK	(SPI_DMA_ALIGNMENT_BYTES-1)
+-#define IS_SPI_DMA_ALIGNED(VAL)	(!((VAL)& SPI_DMA_ALIGNMENT_MASK))
+-#define MAKE_SPI_DMA_ALIGNED(VAL)  (VAL += SPI_DMA_ALIGNMENT_BYTES - \
+-				((VAL)& SPI_DMA_ALIGNMENT_MASK))
+-
+-/* Chipset specific configurations */
+-#ifdef CONFIG_IDF_TARGET_ESP32
+-
+-	#if (CONFIG_ESP_SPI_CONTROLLER == 3)
+-		#define ESP_SPI_CONTROLLER	2
+-		#define GPIO_MOSI		23
+-		#define GPIO_MISO		19
+-		#define GPIO_SCLK		18
+-		#define GPIO_CS 		5
+-	#elif (CONFIG_ESP_SPI_CONTROLLER == 2)
+-		#define ESP_SPI_CONTROLLER	1
+-		#define GPIO_MISO		12
+-		#define GPIO_MOSI		13
+-		#define GPIO_SCLK		14
+-		#define GPIO_CS 		15
+-	#else
+-		#error "Please choose correct SPI controller"
+-	#endif
+-
+-	#define DMA_CHAN			ESP_SPI_CONTROLLER
+-
+-	#define SPI_CLK_MHZ			10
+-
+-#elif defined CONFIG_IDF_TARGET_ESP32S2
+-
+-	#define ESP_SPI_CONTROLLER		1
+-	#define GPIO_MOSI			11
+-	#define GPIO_MISO			13
+-	#define GPIO_SCLK			12
+-	#define GPIO_CS 			10
+-	#define DMA_CHAN			ESP_SPI_CONTROLLER
+-
+-	#define SPI_CLK_MHZ			30
+-
+-#elif defined CONFIG_IDF_TARGET_ESP32C3
+-
+-	#define ESP_SPI_CONTROLLER		1
+-	#define GPIO_MOSI			7
+-	#define GPIO_MISO			2
+-	#define GPIO_SCLK			6
+-	#define GPIO_CS 			10
+-	#define DMA_CHAN			SPI_DMA_CH_AUTO
+-
+-	#define SPI_CLK_MHZ			30
+-
+-#elif defined CONFIG_IDF_TARGET_ESP32S3
+-
+-	#define ESP_SPI_CONTROLLER		1
+-	#define GPIO_MOSI			11
+-	#define GPIO_MISO			13
+-	#define GPIO_SCLK			12
+-	#define GPIO_CS 			10
+-	#define DMA_CHAN			SPI_DMA_CH_AUTO
+-
+-	#define SPI_CLK_MHZ			30
+-
+-#elif defined CONFIG_IDF_TARGET_ESP32C2
+-
+-	#define ESP_SPI_CONTROLLER		1
+-	#define GPIO_MOSI			7
+-	#define GPIO_MISO			2
+-	#define GPIO_SCLK			6
+-	#define GPIO_CS 			10
+-	#define DMA_CHAN			SPI_DMA_CH_AUTO
+-
+-	#define SPI_CLK_MHZ			30
+-
+-#elif defined CONFIG_IDF_TARGET_ESP32C6
+-
+-	#define ESP_SPI_CONTROLLER		1
+-	#define GPIO_MOSI			7
+-	#define GPIO_MISO			2
+-	#define GPIO_SCLK			6
+-	#define GPIO_CS 			10
+-	#define DMA_CHAN			SPI_DMA_CH_AUTO
+-
+-	#define SPI_CLK_MHZ			26
+-
+-#endif
+-/* Max SPI slave CLK in IO_MUX tested in IDF:
+- * ESP32: 10MHz
+- * ESP32-C2/C3/S2/S3: 40MHz
+- * ESP32-C6: 26MHz
+- */
+-
+-#define SPI_QUEUE_SIZE			3
+-#ifdef CONFIG_IDF_TARGET_ESP32
+-	#define SPI_RX_QUEUE_SIZE	10
+-	#define SPI_TX_QUEUE_SIZE	10
+-#else
+-	#define SPI_RX_QUEUE_SIZE	20
+-	#define SPI_TX_QUEUE_SIZE	20
+-#endif
+-
+-static interface_context_t context;
+-static interface_handle_t if_handle_g;
+-static uint8_t gpio_handshake = CONFIG_ESP_SPI_GPIO_HANDSHAKE;
+-static uint8_t gpio_data_ready = CONFIG_ESP_SPI_GPIO_DATA_READY;
+-static QueueHandle_t spi_rx_queue[MAX_PRIORITY_QUEUES] = {NULL};
+-static QueueHandle_t spi_tx_queue[MAX_PRIORITY_QUEUES] = {NULL};
+-
+-static interface_handle_t * esp_spi_init(void);
+-static int32_t esp_spi_write(interface_handle_t *handle,
+-				interface_buffer_handle_t *buf_handle);
+-static int esp_spi_read(interface_handle_t *if_handle, interface_buffer_handle_t * buf_handle);
+-static esp_err_t esp_spi_reset(interface_handle_t *handle);
+-static void esp_spi_deinit(interface_handle_t *handle);
+-static void esp_spi_read_done(void *handle);
+-static void queue_next_transaction(void);
+-
+-if_ops_t if_ops = {
+-	.init = esp_spi_init,
+-	.write = esp_spi_write,
+-	.read = esp_spi_read,
+-	.reset = esp_spi_reset,
+-	.deinit = esp_spi_deinit,
+-};
+-
+-interface_context_t *interface_insert_driver(int (*event_handler)(uint8_t val))
+-{
+-	ESP_LOGI(TAG, "Using SPI interface");
+-	memset(&context, 0, sizeof(context));
+-
+-	context.type = SPI;
+-	context.if_ops = &if_ops;
+-	context.event_handler = event_handler;
+-
+-	return &context;
+-}
+-
+-int interface_remove_driver()
+-{
+-	memset(&context, 0, sizeof(context));
+-	return 0;
+-}
+-
+-esp_err_t send_bootup_event_to_host(uint8_t cap)
+-{
+-	struct esp_payload_header *header = NULL;
+-	struct esp_internal_bootup_event *event = NULL;
+-	struct fw_data * fw_p = NULL;
+-	interface_buffer_handle_t buf_handle = {0};
+-	uint8_t * pos = NULL;
+-	uint16_t len = 0;
+-
+-	memset(&buf_handle, 0, sizeof(buf_handle));
+-
+-	buf_handle.payload = heap_caps_malloc(RX_BUF_SIZE, MALLOC_CAP_DMA);
+-	assert(buf_handle.payload);
+-	memset(buf_handle.payload, 0, RX_BUF_SIZE);
+-
+-	header = (struct esp_payload_header *) buf_handle.payload;
+-
+-	header->if_type = ESP_INTERNAL_IF;
+-	header->if_num = 0;
+-	header->offset = htole16(sizeof(struct esp_payload_header));
+-
+-	event = (struct esp_internal_bootup_event*) (buf_handle.payload + sizeof(struct esp_payload_header));
+-
+-	event->header.event_code = ESP_INTERNAL_BOOTUP_EVENT;
+-	event->header.status = 0;
+-
+-	pos = event->data;
+-
+-	/* TLVs start */
+-
+-	/* TLV - Board type */
+-	*pos = ESP_BOOTUP_FIRMWARE_CHIP_ID;   pos++;len++;
+-	*pos = LENGTH_1_BYTE;                 pos++;len++;
+-	*pos = CONFIG_IDF_FIRMWARE_CHIP_ID;   pos++;len++;
+-
+-	/* TLV - Peripheral clock in MHz */
+-	*pos = ESP_BOOTUP_SPI_CLK_MHZ;        pos++;len++;
+-	*pos = LENGTH_1_BYTE;                 pos++;len++;
+-	*pos = SPI_CLK_MHZ;                   pos++;len++;
+-
+-	/* TLV - Capability */
+-	*pos = ESP_BOOTUP_CAPABILITY;         pos++;len++;
+-	*pos = LENGTH_1_BYTE;                 pos++;len++;
+-	*pos = cap;                           pos++;len++;
+-
+-	/* TLV - FW data */
+-	*pos = ESP_BOOTUP_FW_DATA;            pos++; len++;
+-	*pos = sizeof(struct fw_data);        pos++; len++;
+-	fw_p = (struct fw_data *) pos;
+-	/* core0 sufficient now */
+-	fw_p->last_reset_reason = htole32(rtc_get_reset_reason(0)); 
+-	fw_p->version.major1 = PROJECT_VERSION_MAJOR_1;
+-	fw_p->version.major2 = PROJECT_VERSION_MAJOR_2;
+-	fw_p->version.minor  = PROJECT_VERSION_MINOR;
+-	pos+=sizeof(struct fw_data);
+-	len+=sizeof(struct fw_data);
+-
+-	/* TLVs end */
+-	event->len = len;
+-	buf_handle.payload_len = len + sizeof(struct esp_internal_bootup_event) + sizeof(struct esp_payload_header);
+-	/*print_reset_reason(event->last_reset_reason);*/
+-
+-	/* payload len = Event len + sizeof(event len) */
+-	len += 1;
+-	event->header.len = htole16(len);
+-
+-	header->len = htole16(buf_handle.payload_len - sizeof(struct esp_payload_header));
+-
+-#if CONFIG_ESP_SPI_CHECKSUM
+-	header->checksum = htole16(compute_checksum(buf_handle.payload, buf_handle.payload_len));
+-#endif
+-
+-	xQueueSend(spi_tx_queue[PRIO_Q_HIGH], &buf_handle, portMAX_DELAY);
+-
+-	/* indicate waiting data on ready pin */
+-	WRITE_PERI_REG(GPIO_OUT_W1TS_REG, (1 << gpio_data_ready));
+-	/* process first data packet here to start transactions */
+-	queue_next_transaction();
+-
+-	return ESP_OK;
+-}
+-
+-
+-/* Invoked after transaction is queued and ready for pickup by master */
+-static void IRAM_ATTR spi_post_setup_cb(spi_slave_transaction_t *trans)
+-{
+-	/* ESP peripheral ready for spi transaction. Set hadnshake line high. */
+-	WRITE_PERI_REG(GPIO_OUT_W1TS_REG, (1 << gpio_handshake));
+-}
+-
+-/* Invoked after transaction is sent/received.
+- * Use this to set the handshake line low */
+-static void IRAM_ATTR spi_post_trans_cb(spi_slave_transaction_t *trans)
+-{
+-	/* Clear handshake line */
+-	WRITE_PERI_REG(GPIO_OUT_W1TC_REG, (1 << gpio_handshake));
+-}
+-
+-static uint8_t * get_next_tx_buffer(uint32_t *len)
+-{
+-	interface_buffer_handle_t buf_handle = {0};
+-	esp_err_t ret = ESP_OK;
+-	uint8_t *sendbuf = NULL;
+-	struct esp_payload_header *header = NULL;
+-
+-	/* Get or create new tx_buffer
+-	 *	1. Check if SPI TX queue has pending buffers. Return if valid buffer is obtained.
+-	 *	2. Create a new empty tx buffer and return */
+-
+-	/* Get buffer from SPI Tx queue */
+-	if(uxQueueMessagesWaiting(spi_tx_queue[PRIO_Q_HIGH]))
+-		ret = xQueueReceive(spi_tx_queue[PRIO_Q_HIGH], &buf_handle, portMAX_DELAY);
+-	else if(uxQueueMessagesWaiting(spi_tx_queue[PRIO_Q_MID]))
+-		ret = xQueueReceive(spi_tx_queue[PRIO_Q_MID], &buf_handle, portMAX_DELAY);
+-	else if(uxQueueMessagesWaiting(spi_tx_queue[PRIO_Q_LOW]))
+-		ret = xQueueReceive(spi_tx_queue[PRIO_Q_LOW], &buf_handle, portMAX_DELAY);
+-	else
+-		ret = pdFALSE;
+-
+-	if (ret == pdTRUE && buf_handle.payload) {
+-		if (len)
+-			*len = buf_handle.payload_len;
+-		/* Return real data buffer from queue */
+-		return buf_handle.payload;
+-	}
+-
+-	/* No real data pending, clear ready line and indicate host an idle state */
+-	WRITE_PERI_REG(GPIO_OUT_W1TC_REG, (1 << gpio_data_ready));
+-
+-	/* Create empty dummy buffer */
+-	sendbuf = heap_caps_malloc(RX_BUF_SIZE, MALLOC_CAP_DMA);
+-	if (!sendbuf) {
+-		ESP_LOGE(TAG, "Failed to allocate memory for dummy transaction");
+-		if (len)
+-			*len = 0;
+-		return NULL;
+-	}
+-
+-	memset(sendbuf, 0, RX_BUF_SIZE);
+-
+-	/* Initialize header */
+-	header = (struct esp_payload_header *) sendbuf;
+-
+-	/* Populate header to indicate it as a dummy buffer */
+-	header->if_type = 0xF;
+-	header->if_num = 0xF;
+-	header->len = 0;
+-
+-	if (len)
+-		*len = 0;
+-
+-	return sendbuf;
+-}
+-
+-static int process_spi_rx(interface_buffer_handle_t *buf_handle)
+-{
+-	int ret = 0;
+-	struct esp_payload_header *header = NULL;
+-	uint16_t len = 0, offset = 0;
+-#if CONFIG_ESP_SPI_CHECKSUM
+-	uint16_t rx_checksum = 0, checksum = 0;
+-#endif
+-
+-	/* Validate received buffer. Drop invalid buffer. */
+-
+-	if (!buf_handle || !buf_handle->payload) {
+-		ESP_LOGE(TAG, "%s: Invalid params", __func__);
+-		return -1;
+-	}
+-
+-	header = (struct esp_payload_header *) buf_handle->payload;
+-	len = le16toh(header->len);
+-	offset = le16toh(header->offset);
+-
+-	if (!len || (len > RX_BUF_SIZE)) {
+-		return -1;
+-	}
+-
+-#if CONFIG_ESP_SPI_CHECKSUM
+-	rx_checksum = le16toh(header->checksum);
+-	header->checksum = 0;
+-
+-	checksum = compute_checksum(buf_handle->payload, len+offset);
+-
+-	if (checksum != rx_checksum) {
+-		return -1;
+-	}
+-#endif
+-
+-	/* Buffer is valid */
+-	buf_handle->if_type = header->if_type;
+-	buf_handle->if_num = header->if_num;
+-	buf_handle->free_buf_handle = esp_spi_read_done;
+-	buf_handle->payload_len = le16toh(header->len) + offset;
+-	buf_handle->priv_buffer_handle = buf_handle->payload;
+-
+-	if (header->if_type == ESP_INTERNAL_IF)
+-		ret = xQueueSend(spi_rx_queue[PRIO_Q_HIGH], buf_handle, portMAX_DELAY);
+-	else if (header->if_type == ESP_HCI_IF)
+-		ret = xQueueSend(spi_rx_queue[PRIO_Q_MID], buf_handle, portMAX_DELAY);
+-	else
+-		ret = xQueueSend(spi_rx_queue[PRIO_Q_LOW], buf_handle, portMAX_DELAY);
+-
+-	if (ret != pdTRUE)
+-		return -1;
+-
+-	return 0;
+-}
+-
+-static void queue_next_transaction(void)
+-{
+-	spi_slave_transaction_t *spi_trans = NULL;
+-	esp_err_t ret = ESP_OK;
+-	uint32_t len = 0;
+-	uint8_t *tx_buffer = NULL;
+-
+-	tx_buffer = get_next_tx_buffer(&len);
+-	if (!tx_buffer) {
+-		/* Queue next transaction failed */
+-		ESP_LOGE(TAG , "Failed to queue new transaction\r\n");
+-		return;
+-	}
+-
+-	spi_trans = malloc(sizeof(spi_slave_transaction_t));
+-	assert(spi_trans);
+-
+-	memset(spi_trans, 0, sizeof(spi_slave_transaction_t));
+-
+-	/* Attach Rx Buffer */
+-	spi_trans->rx_buffer = heap_caps_malloc(RX_BUF_SIZE, MALLOC_CAP_DMA);
+-	assert(spi_trans->rx_buffer);
+-	memset(spi_trans->rx_buffer, 0, RX_BUF_SIZE);
+-
+-	/* Attach Tx Buffer */
+-	spi_trans->tx_buffer = tx_buffer;
+-
+-	/* Transaction len */
+-	spi_trans->length = RX_BUF_SIZE * SPI_BITS_PER_WORD;
+-
+-	ret = spi_slave_queue_trans(ESP_SPI_CONTROLLER, spi_trans, portMAX_DELAY);
+-
+-	if (ret != ESP_OK) {
+-		ESP_LOGI(TAG, "Failed to queue next SPI transfer\n");
+-		free(spi_trans->rx_buffer);
+-		spi_trans->rx_buffer = NULL;
+-		free((void *)spi_trans->tx_buffer);
+-		spi_trans->tx_buffer = NULL;
+-		free(spi_trans);
+-		spi_trans = NULL;
+-		return;
+-	}
+-}
+-
+-static void spi_transaction_post_process_task(void* pvParameters)
+-{
+-	spi_slave_transaction_t *spi_trans = NULL;
+-	esp_err_t ret = ESP_OK;
+-	interface_buffer_handle_t rx_buf_handle = {0};
+-
+-	for (;;) {
+-		memset(&rx_buf_handle, 0, sizeof(rx_buf_handle));
+-
+-		/* Await transmission result, after any kind of transmission a new packet
+-		 * (dummy or real) must be placed in SPI slave
+-		 */
+-		ret = spi_slave_get_trans_result(ESP_SPI_CONTROLLER, &spi_trans,
+-				portMAX_DELAY);
+-
+-		/* Queue new transaction to get ready as soon as possible */
+-		queue_next_transaction();
+-
+-		if (ret != ESP_OK) {
+-			ESP_LOGE(TAG , "spi transmit error, ret : 0x%x\r\n", ret);
+-			continue;
+-		}
+-
+-		if (!spi_trans) {
+-			ESP_LOGW(TAG , "spi_trans fetched NULL\n");
+-			continue;
+-		}
+-
+-		/*ESP_LOG_BUFFER_HEXDUMP(TAG, spi_trans->tx_buffer, 32, ESP_LOG_INFO);*/
+-
+-		/* Free any tx buffer, data is not relevant anymore */
+-		if (spi_trans->tx_buffer) {
+-			free((void *)spi_trans->tx_buffer);
+-			spi_trans->tx_buffer = NULL;
+-		}
+-
+-		/* Process received data */
+-		if (spi_trans->rx_buffer) {
+-			rx_buf_handle.payload = spi_trans->rx_buffer;
+-
+-			ret = process_spi_rx(&rx_buf_handle);
+-
+-			/* free rx_buffer if process_spi_rx returns an error
+-			 * In success case it will be freed later */
+-			if (ret != ESP_OK) {
+-				free((void *)spi_trans->rx_buffer);
+-				spi_trans->rx_buffer = NULL;
+-			}
+-		}
+-
+-		/* Free Transfer structure */
+-		free(spi_trans);
+-		spi_trans = NULL;
+-	}
+-}
+-
+-static interface_handle_t * esp_spi_init(void)
+-{
+-	esp_err_t ret = ESP_OK;
+-	uint8_t prio_q_idx = 0;
+-
+-	/* Configuration for the SPI bus */
+-	spi_bus_config_t buscfg={
+-		.mosi_io_num=GPIO_MOSI,
+-		.miso_io_num=GPIO_MISO,
+-		.sclk_io_num=GPIO_SCLK,
+-		.quadwp_io_num = -1,
+-		.quadhd_io_num = -1,
+-		.max_transfer_sz = RX_BUF_SIZE,
+-#if 0
+-		/*
+-		 * Moving ESP32 SPI slave interrupts in flash, Keeping it in IRAM gives crash,
+-		 * While performing flash erase operation.
+-		 */
+-		.intr_flags=ESP_INTR_FLAG_IRAM
+-#endif
+-	};
+-
+-	/* Configuration for the SPI slave interface */
+-	spi_slave_interface_config_t slvcfg={
+-		.mode=SPI_MODE_2,
+-		.spics_io_num=GPIO_CS,
+-		.queue_size=SPI_QUEUE_SIZE,
+-		.flags=0,
+-		.post_setup_cb=spi_post_setup_cb,
+-		.post_trans_cb=spi_post_trans_cb
+-	};
+-
+-	/* Configuration for the handshake line */
+-	gpio_config_t io_conf={
+-		.intr_type=GPIO_INTR_DISABLE,
+-		.mode=GPIO_MODE_OUTPUT,
+-		.pin_bit_mask=(1 << gpio_handshake)
+-	};
+-
+-	/* Configuration for data_ready line */
+-	gpio_config_t io_data_ready_conf={
+-		.intr_type=GPIO_INTR_DISABLE,
+-		.mode=GPIO_MODE_OUTPUT,
+-		.pin_bit_mask=(1 << gpio_data_ready)
+-	};
+-
+-	/* Configure handshake and data_ready lines as output */
+-	gpio_config(&io_conf);
+-	gpio_config(&io_data_ready_conf);
+-	WRITE_PERI_REG(GPIO_OUT_W1TC_REG, (1 << gpio_handshake));
+-	WRITE_PERI_REG(GPIO_OUT_W1TC_REG, (1 << gpio_data_ready));
+-
+-	/* Enable pull-ups on SPI lines
+-	 * so that no rogue pulses when no master is connected
+-	 */
+-	gpio_set_pull_mode(GPIO_MOSI, GPIO_PULLUP_ONLY);
+-	gpio_set_pull_mode(GPIO_SCLK, GPIO_PULLUP_ONLY);
+-	gpio_set_pull_mode(GPIO_CS, GPIO_PULLUP_ONLY);
+-
+-	/* Initialize SPI slave interface */
+-	ret=spi_slave_initialize(ESP_SPI_CONTROLLER, &buscfg, &slvcfg, DMA_CHAN);
+-	assert(ret==ESP_OK);
+-
+-	memset(&if_handle_g, 0, sizeof(if_handle_g));
+-	if_handle_g.state = INIT;
+-
+-	for (prio_q_idx=0; prio_q_idx<MAX_PRIORITY_QUEUES;prio_q_idx++) {
+-		spi_rx_queue[prio_q_idx] = xQueueCreate(SPI_RX_QUEUE_SIZE, sizeof(interface_buffer_handle_t));
+-		assert(spi_rx_queue[prio_q_idx] != NULL);
+-
+-		spi_tx_queue[prio_q_idx] = xQueueCreate(SPI_TX_QUEUE_SIZE, sizeof(interface_buffer_handle_t));
+-		assert(spi_tx_queue[prio_q_idx] != NULL);
+-	}
+-
+-	assert(xTaskCreate(spi_transaction_post_process_task , "spi_post_process_task" ,
+-			TASK_DEFAULT_STACK_SIZE, NULL , TASK_DEFAULT_PRIO, NULL) == pdTRUE);
+-
+-	usleep(500);
+-
+-	return &if_handle_g;
+-}
+-
+-static int32_t esp_spi_write(interface_handle_t *handle, interface_buffer_handle_t *buf_handle)
+-{
+-	esp_err_t ret = ESP_OK;
+-	int32_t total_len = 0;
+-	uint16_t offset = 0;
+-	struct esp_payload_header *header = NULL;
+-	interface_buffer_handle_t tx_buf_handle = {0};
+-
+-	if (!handle || !buf_handle) {
+-		ESP_LOGE(TAG , "Invalid arguments\n");
+-		return ESP_FAIL;
+-	}
+-
+-	if (!buf_handle->payload_len || !buf_handle->payload) {
+-		ESP_LOGE(TAG , "Invalid arguments, len:%d\n", buf_handle->payload_len);
+-		return ESP_FAIL;
+-	}
+-
+-	total_len = buf_handle->payload_len + sizeof (struct esp_payload_header);
+-
+-	/* make the adresses dma aligned */
+-	if (!IS_SPI_DMA_ALIGNED(total_len)) {
+-		MAKE_SPI_DMA_ALIGNED(total_len);
+-	}
+-
+-	if (total_len > RX_BUF_SIZE) {
+-		ESP_LOGE(TAG, "Max frame length exceeded %ld.. drop it\n", total_len);
+-		return ESP_FAIL;
+-	}
+-
+-	memset(&tx_buf_handle, 0, sizeof(tx_buf_handle));
+-
+-	tx_buf_handle.if_type = buf_handle->if_type;
+-	tx_buf_handle.if_num = buf_handle->if_num;
+-	tx_buf_handle.payload_len = total_len;
+-
+-	tx_buf_handle.payload = heap_caps_malloc(total_len, MALLOC_CAP_DMA);
+-	assert(tx_buf_handle.payload);
+-
+-	header = (struct esp_payload_header *) tx_buf_handle.payload;
+-
+-	memset (header, 0, sizeof(struct esp_payload_header));
+-
+-	/* Initialize header */
+-	header->if_type = buf_handle->if_type;
+-	header->if_num = buf_handle->if_num;
+-	header->len = htole16(buf_handle->payload_len);
+-	offset = sizeof(struct esp_payload_header);
+-	header->offset = htole16(offset);
+-	header->flags = buf_handle->flag;
+-	header->packet_type = buf_handle->pkt_type;
+-
+-	/* copy the data from caller */
+-	memcpy(tx_buf_handle.payload + offset, buf_handle->payload, buf_handle->payload_len);
+-
+-
+-#if CONFIG_ESP_SPI_CHECKSUM
+-	header->checksum = htole16(compute_checksum(tx_buf_handle.payload,
+-				offset+buf_handle->payload_len));
+-#endif
+-
+-	if (header->if_type == ESP_INTERNAL_IF)
+-		ret = xQueueSend(spi_tx_queue[PRIO_Q_HIGH], &tx_buf_handle, portMAX_DELAY);
+-	else if (header->if_type == ESP_HCI_IF)
+-		ret = xQueueSend(spi_tx_queue[PRIO_Q_MID], &tx_buf_handle, portMAX_DELAY);
+-	else
+-		ret = xQueueSend(spi_tx_queue[PRIO_Q_LOW], &tx_buf_handle, portMAX_DELAY);
+-
+-	if (ret != pdTRUE)
+-		return ESP_FAIL;
+-
+-	/* indicate waiting data on ready pin */
+-	WRITE_PERI_REG(GPIO_OUT_W1TS_REG, (1 << gpio_data_ready));
+-
+-	return buf_handle->payload_len;
+-}
+-
+-static void IRAM_ATTR esp_spi_read_done(void *handle)
+-{
+-	if (handle) {
+-		free(handle);
+-		handle = NULL;
+-	}
+-}
+-
+-static int esp_spi_read(interface_handle_t *if_handle, interface_buffer_handle_t *buf_handle)
+-{
+-	esp_err_t ret = ESP_OK;
+-
+-	if (!if_handle) {
+-		ESP_LOGE(TAG, "Invalid arguments to esp_spi_read\n");
+-		return ESP_FAIL;
+-	}
+-
+-	while (1) {
+-		if(uxQueueMessagesWaiting(spi_rx_queue[PRIO_Q_HIGH])) {
+-			ret = xQueueReceive(spi_rx_queue[PRIO_Q_HIGH], buf_handle, portMAX_DELAY);
+-			break;
+-		} else if(uxQueueMessagesWaiting(spi_rx_queue[PRIO_Q_MID])) {
+-			ret = xQueueReceive(spi_rx_queue[PRIO_Q_MID], buf_handle, portMAX_DELAY);
+-			break;
+-		} else if(uxQueueMessagesWaiting(spi_rx_queue[PRIO_Q_LOW])) {
+-			ret = xQueueReceive(spi_rx_queue[PRIO_Q_LOW], buf_handle, portMAX_DELAY);
+-			break;
+-		} else {
+-			vTaskDelay(1);
+-		}
+-	}
+-
+-	if (ret != pdTRUE) {
+-		return ESP_FAIL;
+-	}
+-	return buf_handle->payload_len;
+-}
+-
+-static esp_err_t esp_spi_reset(interface_handle_t *handle)
+-{
+-	esp_err_t ret = ESP_OK;
+-	ret = spi_slave_free(ESP_SPI_CONTROLLER);
+-	if (ESP_OK != ret) {
+-		ESP_LOGE(TAG, "spi slave bus free failed\n");
+-	}
+-	return ret;
+-}
+-
+-static void esp_spi_deinit(interface_handle_t *handle)
+-{
+-	esp_err_t ret = ESP_OK;
+-
+-	ret = spi_slave_free(ESP_SPI_CONTROLLER);
+-	if (ESP_OK != ret) {
+-		ESP_LOGE(TAG, "spi slave bus free failed\n");
+-		return;
+-	}
+-
+-	ret = spi_bus_free(ESP_SPI_CONTROLLER);
+-	if (ESP_OK != ret) {
+-		ESP_LOGE(TAG, "spi all bus free failed\n");
+-		return;
+-	}
+-}
+
+diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/stats.c b/esp_hosted_ng/esp/esp_driver/network_adapter/main/stats.c
+deleted file mode 100644
+--- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/stats.c
++++ /dev/null
+@@ -1,334 +0,0 @@
+-// SPDX-License-Identifier: Apache-2.0
+-// Copyright 2015-2022 Espressif Systems (Shanghai) PTE LTD
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-//
+-
+-#include "stats.h"
+-#include <unistd.h>
+-#include "esp_log.h"
+-#include "esp.h"
+-#include "slave_bt.h"
+-#include "cmd.h"
+-#include <string.h>
+-
+-static const char TAG[] = "stats";
+-
+-#ifdef CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+-/* These functions are only for debugging purpose
+- * Please do not enable in production environments
+- */
+-static esp_err_t log_real_time_stats(TickType_t xTicksToWait) {
+-    TaskStatus_t *start_array = NULL, *end_array = NULL;
+-    UBaseType_t start_array_size, end_array_size;
+-    uint32_t start_run_time, end_run_time;
+-    esp_err_t ret;
+-
+-    /*Allocate array to store current task states*/
+-    start_array_size = uxTaskGetNumberOfTasks() + ARRAY_SIZE_OFFSET;
+-    start_array = malloc(sizeof(TaskStatus_t) * start_array_size);
+-    if (start_array == NULL) {
+-        ret = ESP_ERR_NO_MEM;
+-        goto exit;
+-    }
+-    /*Get current task states*/
+-    start_array_size = uxTaskGetSystemState(start_array, start_array_size, &start_run_time);
+-    if (start_array_size == 0) {
+-        ret = ESP_ERR_INVALID_SIZE;
+-        goto exit;
+-    }
+-
+-    vTaskDelay(xTicksToWait);
+-
+-    /*Allocate array to store tasks states post delay*/
+-    end_array_size = uxTaskGetNumberOfTasks() + ARRAY_SIZE_OFFSET;
+-    end_array = malloc(sizeof(TaskStatus_t) * end_array_size);
+-    if (end_array == NULL) {
+-        ret = ESP_ERR_NO_MEM;
+-        goto exit;
+-    }
+-    /*Get post delay task states*/
+-    end_array_size = uxTaskGetSystemState(end_array, end_array_size, &end_run_time);
+-    if (end_array_size == 0) {
+-        ret = ESP_ERR_INVALID_SIZE;
+-        goto exit;
+-    }
+-
+-    /*Calculate total_elapsed_time in units of run time stats clock period.*/
+-    uint32_t total_elapsed_time = (end_run_time - start_run_time);
+-    if (total_elapsed_time == 0) {
+-        ret = ESP_ERR_INVALID_STATE;
+-        goto exit;
+-    }
+-
+-    ESP_LOGI(TAG, "| Task | Run Time | Percentage");
+-    /*Match each task in start_array to those in the end_array*/
+-    for (int i = 0; i < start_array_size; i++) {
+-        int k = -1;
+-        for (int j = 0; j < end_array_size; j++) {
+-            if (start_array[i].xHandle == end_array[j].xHandle) {
+-                k = j;
+-                /*Mark that task have been matched by overwriting their handles*/
+-                start_array[i].xHandle = NULL;
+-                end_array[j].xHandle = NULL;
+-                break;
+-            }
+-        }
+-        /*Check if matching task found*/
+-        if (k >= 0) {
+-            uint32_t task_elapsed_time = end_array[k].ulRunTimeCounter - start_array[i].ulRunTimeCounter;
+-            uint32_t percentage_time = (task_elapsed_time * 100UL) / (total_elapsed_time * portNUM_PROCESSORS);
+-            ESP_LOGI(TAG, "| %s | %d | %d%%", start_array[i].pcTaskName, task_elapsed_time, percentage_time);
+-        }
+-    }
+-
+-    /*Print unmatched tasks*/
+-    for (int i = 0; i < start_array_size; i++) {
+-        if (start_array[i].xHandle != NULL) {
+-            ESP_LOGI(TAG, "| %s | Deleted", start_array[i].pcTaskName);
+-        }
+-    }
+-    for (int i = 0; i < end_array_size; i++) {
+-        if (end_array[i].xHandle != NULL) {
+-            ESP_LOGI(TAG, "| %s | Created", end_array[i].pcTaskName);
+-        }
+-    }
+-    ret = ESP_OK;
+-
+-exit:    /*Common return path*/
+-	if (start_array)
+-		free(start_array);
+-	if (end_array)
+-		free(end_array);
+-    return ret;
+-}
+-
+-static void log_runtime_stats_task(void* pvParameters) {
+-    while (1) {
+-        ESP_LOGI(TAG, "\n\nGetting real time stats over %d ticks", STATS_TICKS);
+-        if (log_real_time_stats(STATS_TICKS) == ESP_OK) {
+-            ESP_LOGI(TAG, "Real time stats obtained");
+-        } else {
+-            ESP_LOGE(TAG, "Error getting real time stats");
+-        }
+-        vTaskDelay(pdMS_TO_TICKS(1000*2));
+-    }
+-}
+-#endif
+-
+-uint8_t raw_tp_tx_buf[TEST_RAW_TP__BUF_SIZE] = {0};
+-uint64_t test_raw_tp_rx_len;
+-
+-void debug_update_raw_tp_rx_count(uint16_t len)
+-{
+-	test_raw_tp_rx_len += len;
+-}
+-
+-static void raw_tp_timer_func(void* arg)
+-{
+-	static int32_t cur = 0;
+-	double actual_bandwidth = 0;
+-	int32_t div = 1024;
+-
+-	actual_bandwidth = (test_raw_tp_rx_len*8);
+-	ESP_LOGI(TAG, "%ld-%ld sec       %.2f kbits/sec", cur, cur + 1, actual_bandwidth/div);
+-	cur++;
+-	test_raw_tp_rx_len = 0;
+-}
+-
+-extern volatile uint8_t datapath;
+-static void raw_tp_tx_task(void* pvParameters)
+-{
+-	int ret;
+-	interface_buffer_handle_t buf_handle = {0};
+-
+-	for (;;) {
+-
+-		if (!datapath) {
+-			sleep(1);
+-			continue;
+-		}
+-
+-		buf_handle.if_type = ESP_TEST_IF;
+-		buf_handle.if_num = 0;
+-
+-		buf_handle.payload = raw_tp_tx_buf;
+-		buf_handle.payload_len = TEST_RAW_TP__BUF_SIZE;
+-
+-		ret = send_to_host(PRIO_Q_LOW, &buf_handle);
+-
+-		if (!ret) {
+-			ESP_LOGE(TAG, "Failed to send to queue");
+-			continue;
+-		}
+-		test_raw_tp_rx_len += (TEST_RAW_TP__BUF_SIZE+sizeof(struct esp_payload_header));
+-	}
+-}
+-
+-static void start_timer_to_display_raw_tp(void)
+-{
+-	test_args_t args = {0};
+-	esp_timer_handle_t raw_tp_timer = {0};
+-	esp_timer_create_args_t create_args = {
+-			.callback = &raw_tp_timer_func,
+-			.arg = &args,
+-			.name = "raw_tp_timer",
+-	};
+-
+-	ESP_ERROR_CHECK(esp_timer_create(&create_args, &raw_tp_timer));
+-
+-	args.timer = raw_tp_timer;
+-
+-	ESP_ERROR_CHECK(esp_timer_start_periodic(raw_tp_timer, TEST_RAW_TP__TIMEOUT));
+-}
+-
+-void create_debugging_tasks(void)
+-{
+-#ifdef CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+-	assert(xTaskCreate(log_runtime_stats_task, "log_runtime_stats_task",
+-				TASK_DEFAULT_STACK_SIZE, NULL, TASK_DEFAULT_PRIO, NULL) == pdTRUE);
+-#endif
+-}
+-
+-void init_raw_tp_test_task(void)
+-{
+-	assert(xTaskCreate(raw_tp_tx_task , "raw_tp_tx_task",
+-				TASK_DEFAULT_STACK_SIZE, NULL , TASK_DEFAULT_PRIO, NULL) == pdTRUE);
+-}
+-
+-void init_raw_tp_timer(void)
+-{
+-	start_timer_to_display_raw_tp();
+-}
+-
+-void debug_get_raw_tp_conf(uint32_t raw_tp_type) {
+-	if (raw_tp_type == CMD_RAW_TP_ESP_TO_HOST) {
+-		ESP_LOGI(TAG, "\n\n*** Raw Throughput testing: ESP --> Host started ***\n");
+-	} else if (raw_tp_type == CMD_RAW_TP_HOST_TO_ESP) {
+-		ESP_LOGI(TAG, "\n\n*** Raw Throughput testing: Host --> ESP started ***\n");
+-	}
+-}
+-
+-void debug_set_wifi_logging(void) {
+-    /* set WiFi log level and module */
+-#if CONFIG_ESP32_WIFI_DEBUG_LOG_ENABLE
+-    uint32_t g_wifi_log_level = WIFI_LOG_INFO;
+-    uint32_t g_wifi_log_module = 0;
+-    uint32_t g_wifi_log_submodule = 0;
+-#if CONFIG_ESP32_WIFI_DEBUG_LOG_DEBUG
+-    g_wifi_log_level = WIFI_LOG_DEBUG;
+-#endif
+-#if CONFIG_ESP32_WIFI_DEBUG_LOG_VERBOSE
+-    g_wifi_log_level = WIFI_LOG_VERBOSE;
+-#endif
+-#if CONFIG_ESP32_WIFI_DEBUG_LOG_MODULE_ALL
+-    g_wifi_log_module = WIFI_LOG_MODULE_ALL;
+-#endif
+-#if CONFIG_ESP32_WIFI_DEBUG_LOG_MODULE_WIFI
+-    g_wifi_log_module = WIFI_LOG_MODULE_WIFI;
+-#endif
+-#if CONFIG_ESP32_WIFI_DEBUG_LOG_MODULE_COEX
+-    g_wifi_log_module = WIFI_LOG_MODULE_COEX;
+-#endif
+-#if CONFIG_ESP32_WIFI_DEBUG_LOG_MODULE_MESH
+-    g_wifi_log_module = WIFI_LOG_MODULE_MESH;
+-#endif
+-#if CONFIG_ESP32_WIFI_DEBUG_LOG_SUBMODULE_ALL
+-    g_wifi_log_submodule |= WIFI_LOG_SUBMODULE_ALL;
+-#endif
+-#if CONFIG_ESP32_WIFI_DEBUG_LOG_SUBMODULE_INIT
+-    g_wifi_log_submodule |= WIFI_LOG_SUBMODULE_INIT;
+-#endif
+-#if CONFIG_ESP32_WIFI_DEBUG_LOG_SUBMODULE_IOCTL
+-    g_wifi_log_submodule |= WIFI_LOG_SUBMODULE_IOCTL;
+-#endif
+-#if CONFIG_ESP32_WIFI_DEBUG_LOG_SUBMODULE_CONN
+-    g_wifi_log_submodule |= WIFI_LOG_SUBMODULE_CONN;
+-#endif
+-#if CONFIG_ESP32_WIFI_DEBUG_LOG_SUBMODULE_SCAN
+-    g_wifi_log_submodule |= WIFI_LOG_SUBMODULE_SCAN;
+-#endif
+-    esp_wifi_internal_set_log_level(g_wifi_log_level);
+-    esp_wifi_internal_set_log_mod(g_wifi_log_module, g_wifi_log_submodule, true);
+-
+-#endif /* CONFIG_ESP32_WIFI_DEBUG_LOG_ENABLE*/
+-
+-}
+-
+-void debug_log_firmware_version(void)
+-{
+-	ESP_LOGI(TAG, "*********************************************************************");
+-	ESP_LOGI(TAG, "                ESP-Hosted Firmware version :: %d.%d.%d                        ",
+-			PROJECT_VERSION_MAJOR_1,PROJECT_VERSION_MAJOR_2,PROJECT_VERSION_MINOR);
+-
+-#if CONFIG_ESP_SPI_HOST_INTERFACE
+-  #if BLUETOOTH_UART
+-	ESP_LOGI(TAG, "                Transport used :: SPI + UART                    ");
+-  #else
+-	ESP_LOGI(TAG, "                Transport used :: SPI only                      ");
+-  #endif
+-#else
+-  #if BLUETOOTH_UART
+-	ESP_LOGI(TAG, "                Transport used :: SDIO + UART                   ");
+-  #else
+-	ESP_LOGI(TAG, "                Transport used :: SDIO only                     ");
+-  #endif
+-#endif
+-	ESP_LOGI(TAG, "*********************************************************************");
+-}
+-
+-int process_raw_tp(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
+-{
+-	interface_buffer_handle_t buf_handle = {0};
+-	esp_err_t ret = ESP_OK;
+-	struct command_header *header = (struct command_header *) payload;
+-	struct command_header *resp_header;
+-
+-	buf_handle.if_type = if_type;
+-	buf_handle.if_num = 0;
+-	buf_handle.payload_len = sizeof(struct command_header);
+-	buf_handle.pkt_type = PACKET_TYPE_COMMAND_RESPONSE;
+-
+-	buf_handle.payload = heap_caps_malloc(buf_handle.payload_len, MALLOC_CAP_DMA);
+-	assert(buf_handle.payload);
+-	memset(buf_handle.payload, 0, buf_handle.payload_len);
+-    resp_header = (struct command_header *) buf_handle.payload;
+-
+-	debug_get_raw_tp_conf(header->cmd_code);
+-	init_raw_tp_timer();
+-
+-	if (header->cmd_code == CMD_RAW_TP_ESP_TO_HOST) {
+-		init_raw_tp_test_task();
+-	}
+-
+-    resp_header->cmd_code = header->cmd_code;
+-	resp_header->len = 0;
+-	resp_header->cmd_status = CMD_RESPONSE_SUCCESS;
+-
+-	buf_handle.priv_buffer_handle = buf_handle.payload;
+-	buf_handle.free_buf_handle = free;
+-
+-	ret = send_command_response(&buf_handle);
+-	if (ret != pdTRUE) {
+-		ESP_LOGE(TAG, "Slave -> Host: Failed to send command response\n");
+-		goto DONE;
+-	}
+-
+-	return ESP_OK;
+-
+-DONE:
+-	if (buf_handle.payload)
+-		free(buf_handle.payload);
+-
+-	return ret;
+-}
+
+diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/tiny_jffs2_reader.c b/esp_hosted_ng/esp/esp_driver/network_adapter/main/tiny_jffs2_reader.c
+deleted file mode 100644
+--- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/tiny_jffs2_reader.c
++++ /dev/null
+@@ -1,232 +0,0 @@
+-#include <stdbool.h>
+-#include <stdint.h>
+-#include <string.h>
+-#include "tiny_jffs2_reader.h"
+-
+-#define JFFS2_MAGIC_BITMASK 0x1985
+-
+-#define JFFS2_NODETYPE_DIRENT 0xe001
+-#define JFFS2_NODETYPE_INODE 0xe002
+-
+-struct jffs2_node {
+-	uint16_t magic;
+-	uint16_t nodetype;
+-	uint32_t totlen;
+-	uint32_t hdr_crc;
+-};
+-
+-struct jffs2_dirent {
+-	uint32_t parent_inode;
+-	uint32_t version;
+-	uint32_t inode;
+-	uint32_t mctime;
+-	uint8_t name_size;
+-	uint8_t type;
+-	uint8_t unused[2];
+-	uint32_t node_crc;
+-	uint32_t name_crc;
+-	uint8_t name[];
+-};
+-
+-struct jffs2_inode {
+-	uint32_t inode;
+-	uint32_t version;
+-	uint32_t mode;
+-	uint16_t uid;
+-	uint16_t gid;
+-	uint32_t isize;
+-	uint32_t atime;
+-	uint32_t mtime;
+-	uint32_t ctime;
+-	uint32_t offset;
+-	uint32_t csize; /* compressed size */
+-	uint32_t dsize; /* uncompressed size */
+-	uint8_t compr;
+-	uint8_t usercompr;
+-	uint16_t flags;
+-	uint32_t data_crc;
+-	uint32_t node_crc;
+-	uint8_t data[];
+-};
+-
+-static void memcpy_insn(void *dst, const void *src, size_t sz)
+-{
+-	memcpy(dst, src, sz & -4);
+-	if (sz & 3) {
+-		uint32_t tmp = *(uint32_t *)(src + (sz & -4));
+-		memcpy(dst + (sz & -4), &tmp, sz & 3);
+-	}
+-}
+-
+-static int memcmp_insn(const void *a, const void *b, size_t sz)
+-{
+-	while (sz >= 4) {
+-		uint32_t va = *(uint32_t *)a;
+-		uint32_t vb = *(uint32_t *)b;
+-
+-		if (va != vb)
+-			return 1;
+-		a += 4;
+-		b += 4;
+-		sz -= 4;
+-	}
+-	if (sz) {
+-		uint32_t va = *(uint32_t *)a;
+-		uint32_t vb = *(uint32_t *)b;
+-
+-		return memcmp(&va, &vb, sz & 3);
+-	} else {
+-		return 0;
+-	}
+-}
+-
+-static void jffs2_traverse(struct jffs2_image *img, void *ctx,
+-			   bool (*f)(void *ctx, struct jffs2_node *node, void *data, size_t sz))
+-{
+-	uint32_t off = 0;
+-	uint32_t block_size = 0x10000;
+-
+-	while (off < img->sz) {
+-		struct jffs2_node node;
+-
+-		if (off + sizeof(node) > img->sz)
+-			return;
+-		memcpy(&node, img->data + off, sizeof(node));
+-		off += sizeof(node);
+-		if (node.magic == JFFS2_MAGIC_BITMASK) {
+-			uint32_t len = (node.totlen + 3) & -4;
+-
+-			if (!f(ctx, &node, img->data + off, node.totlen - sizeof(node)))
+-				break;
+-			off += len - sizeof(node);
+-		} else {
+-			off = (off + block_size - 1) & - block_size;
+-		}
+-	}
+-}
+-
+-struct jffs2_lookup_ctx {
+-	uint32_t parent;
+-	uint32_t inode_num;
+-	uint32_t version;
+-	const char *name;
+-	size_t name_size;
+-};
+-
+-static bool jffs2_lookup_cb(void *ctx, struct jffs2_node *node, void *data, size_t sz)
+-{
+-	struct jffs2_lookup_ctx *lookup = ctx;
+-
+-	if (node->nodetype == JFFS2_NODETYPE_DIRENT) {
+-		struct jffs2_dirent dirent;
+-
+-		memcpy(&dirent, data, sizeof(dirent));
+-
+-		if (dirent.parent_inode == lookup->parent &&
+-		    (dirent.version > lookup->version || lookup->version == 0) &&
+-		    dirent.name_size == lookup->name_size &&
+-		    memcmp_insn(data + sizeof(dirent), lookup->name, lookup->name_size) == 0) {
+-			lookup->inode_num = dirent.inode;
+-			lookup->version = dirent.version;
+-		}
+-	}
+-	return true;
+-}
+-
+-uint32_t jffs2_lookup(struct jffs2_image *img, uint32_t parent, const char *name)
+-{
+-	struct jffs2_lookup_ctx lookup = {
+-		.parent = parent,
+-		.name = name,
+-		.name_size = strlen(name),
+-	};
+-
+-	jffs2_traverse(img, &lookup, jffs2_lookup_cb);
+-	return lookup.inode_num;
+-}
+-
+-struct jffs2_read_ctx {
+-	uint32_t inode_num;
+-	void *buf;
+-	size_t sz;
+-	uint32_t version;
+-	struct jffs2_inode inode;
+-	uint32_t version_min;
+-	uint32_t version_trunc;
+-	uint32_t version_compr;
+-};
+-
+-static bool jffs2_read_pass1_cb(void *ctx, struct jffs2_node *node, void *data, size_t sz)
+-{
+-	struct jffs2_read_ctx *read = ctx;
+-
+-	if (node->nodetype == JFFS2_NODETYPE_INODE) {
+-		struct jffs2_inode inode;
+-
+-		memcpy(&inode, data, sizeof(inode));
+-
+-		if (inode.inode == read->inode_num) {
+-			if (!read->version_min || inode.version < read->version_min)
+-				read->version_min = inode.version;
+-			if (inode.isize == 0 && inode.version > read->version_trunc)
+-				read->version_trunc = inode.version;
+-			if (inode.compr && inode.version > read->version_compr)
+-				read->version_compr = inode.version;
+-			if (inode.version > read->inode.version)
+-				read->inode = inode;
+-		}
+-	}
+-	return true;
+-}
+-
+-static bool jffs2_read_pass2_cb(void *ctx, struct jffs2_node *node, void *data, size_t sz)
+-{
+-	struct jffs2_read_ctx *read = ctx;
+-
+-	if (node->nodetype == JFFS2_NODETYPE_INODE) {
+-		struct jffs2_inode inode;
+-
+-		memcpy(&inode, data, sizeof(inode));
+-
+-		if (inode.inode == read->inode_num &&
+-		    ((read->version == 0 && inode.version == read->version_min) ||
+-		     (read->version && inode.version > read->version))) {
+-			read->version = inode.version;
+-			if (inode.offset < read->sz) {
+-				uint32_t sz = inode.dsize;
+-
+-				if (sz > read->sz - inode.offset)
+-					sz = read->sz - inode.offset;
+-				memcpy_insn(read->buf + inode.offset, data + sizeof(inode), sz);
+-			}
+-		}
+-	}
+-	return true;
+-}
+-
+-size_t jffs2_read(struct jffs2_image *img, uint32_t inode, void *buf, size_t sz)
+-{
+-	struct jffs2_read_ctx read = {
+-		.inode_num = inode,
+-		.buf = buf,
+-		.sz = sz,
+-	};
+-
+-	jffs2_traverse(img, &read, jffs2_read_pass1_cb);
+-	/* inode data is not found */
+-	if (!read.version_min)
+-		return -1;
+-	if (read.version_trunc)
+-		read.version_min = read.version_trunc;
+-	/* compression is not supported ATM */
+-	if (read.version_compr > read.version_min)
+-		return -1;
+-	if (read.inode.isize < sz)
+-		read.sz = read.inode.isize;
+-	/* clear the buffer in case there are holes */
+-	memset(buf, 0, read.sz);
+-	jffs2_traverse(img, &read, jffs2_read_pass2_cb);
+-	if (read.version != read.inode.version)
+-		jffs2_traverse(img, &read, jffs2_read_pass2_cb);
+-	return read.sz;
+-}
+
+diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/tiny_jffs2_reader.h b/esp_hosted_ng/esp/esp_driver/network_adapter/main/tiny_jffs2_reader.h
+deleted file mode 100644
+--- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/tiny_jffs2_reader.h
++++ /dev/null
+@@ -1,15 +0,0 @@
+-#ifndef __TINY_JFFS2_READER_H
+-#define __TINY_JFFS2_READER_H
+-
+-#include <stddef.h>
+-#include <stdint.h>
+-
+-struct jffs2_image {
+-	void *data;
+-	size_t sz;
+-};
+-
+-uint32_t jffs2_lookup(struct jffs2_image *img, uint32_t parent, const char *name);
+-size_t jffs2_read(struct jffs2_image *img, uint32_t inode, void *buf, size_t sz);
+-
+-#endif
+
 diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/sdkconfig.defaults.esp32s3 b/esp_hosted_ng/esp/esp_driver/network_adapter/sdkconfig.defaults.esp32s3
-index 57f5958..97a07bd 100644
 --- a/esp_hosted_ng/esp/esp_driver/network_adapter/sdkconfig.defaults.esp32s3
 +++ b/esp_hosted_ng/esp/esp_driver/network_adapter/sdkconfig.defaults.esp32s3
-@@ -1446,7 +1446,7 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_MAX_CERTS=200
+@@ -1446,7 +1446,7 @@
  # CONFIG_MBEDTLS_CMAC_C is not set
  CONFIG_MBEDTLS_HARDWARE_AES=y
  CONFIG_MBEDTLS_AES_USE_INTERRUPT=y
@@ -518,43 +4333,3 @@ index 57f5958..97a07bd 100644
  CONFIG_MBEDTLS_MPI_USE_INTERRUPT=y
  CONFIG_MBEDTLS_HARDWARE_SHA=y
  CONFIG_MBEDTLS_ROM_MD5=y
-diff --git a/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_flash.c b/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_flash.c
---- a/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_flash.c
-+++ b/esp_hosted_ng/esp/esp_driver/network_adapter/main/linux_flash.c
-@@ -4,6 +4,7 @@
- #include <string.h>
- #include "esp.h"
- #include "esp_flash.h"
-+#include "esp32s3/rom/cache.h"
- #include "interface.h"
- #include "endian.h"
- #include "soc/periph_defs.h"
-@@ -38,6 +39,18 @@
- 
- extern int g_spi_flash_skip_ipc;
- 
-+/* The flash is identity-mapped for Linux at this base (see linux_boot.c). */
-+#define LINUX_FLASH_VADDR_BASE	0x42000000
-+
-+/* One flash cache serves both cores, and ESP-IDF's post-write invalidation
-+ * skips pages its MMU accounting does not know -- which is every partition
-+ * Linux mapped for itself. Invalidate the written range unconditionally;
-+ * the ROM call takes a virtual address and does not ask who mapped it. */
-+static void linux_flash_invalidate(uint32_t addr, uint32_t size)
-+{
-+	Cache_Invalidate_Addr(LINUX_FLASH_VADDR_BASE + addr, size);
-+}
-+
- static void esp_flash_rx(void *p, void *data)
- {
- 	if (!data) {
-@@ -70,6 +83,9 @@
- 			break;
- 		}
- 		g_spi_flash_skip_ipc = 0;
-+		if (cmd->code == ESP_IPC_FLASH_CMD_ERASE ||
-+		    cmd->code == ESP_IPC_FLASH_CMD_WRITE)
-+			linux_flash_invalidate(cmd->addr, cmd->size);
- 		cmd->result = (ret == ESP_OK) ? 0 : 1;
- 		cmd->local_state = ESP32_IPC_FLASH_STATE_DONE;
- 	}

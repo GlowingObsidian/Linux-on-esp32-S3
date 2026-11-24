@@ -1,27 +1,29 @@
-# Web, usuarios y sesiones
+# Usuarios y sesiones
 
 Sin sudo ni doas, por decisión del usuario. Bash sigue siendo la shell de
 usuario; `/bin/sh` sigue siendo BusyBox para los servicios. No se modifica
 el kernel ni se necesita hardware adicional.
 
-## Web y datos persistentes
+## Estado actual: /home es de sólo lectura
 
-El servidor busca `/home/www/index.html` y `/home/www/cgi-bin/`. Ya no hay
-`/www` en rootfs. Los archivos iniciales se conservan comprimidos en
-`/usr/share/esp32-home/www.tar.gz` para sembrar una partición home nueva:
-no se sirven desde ese archivo ni se pisan cambios del usuario al arrancar.
+**Todo lo que sigue sobre `/home` persistente ya no se aplica.** `/home` es
+ahora parte del rootfs cramfs de sólo lectura: no hay partición aparte, no se
+monta nada encima y no se puede escribir nada en él. `home-init`,
+`home-users-setup`, `S06home-users` y la siembra por gzip fueron eliminados.
+Lo que queda abajo se conserva como registro de lo que se probó cuando `/home`
+sí era una partición JFFS2 en escritura, y de cómo se comportaba.
 
-```sh
-nano /home/www/index.html
-web-server on
-web-server status
-web-server off
-```
+Para que `/home` volviera a ser escribible haría falta un camino de escritura
+a flash, y este port le da todo el flash a Linux en sólo lectura para poder
+entregarle el core 0 al kernel en lugar de dejarlo sirviendo escrituras.
 
-HTTP se ejecuta como `www-data`, no root. El HTML y CGI originales no cambian.
-Un CGI nuevo debe ser ejecutable y poder leer sus dependencias como www-data.
-No conceder escritura general sobre el contenido ni colocar secretos ahí.
-No se agrega autenticación HTTP ni una API de administración remota.
+## Datos persistentes
+
+**El servidor web ya no existe.** Esta versión de la imagen no compila
+`httpd`, no instala `usr/sbin/web-server`, no siembra `/home/www` y elimina
+la cuenta `www-data`, que sólo existía para que el servidor corriera. Las
+secciones de más abajo que lo mencionan quedan como registro de lo que se
+probó cuando sí estaba. Lo que sigue siendo cierto es la partición `/home`:
 
 `home-init` siembra únicamente archivos ausentes sobre `/home` JFFS2 montada
 en escritura. `S06home-users` lo ejecuta durante el arranque. Tras actualizar

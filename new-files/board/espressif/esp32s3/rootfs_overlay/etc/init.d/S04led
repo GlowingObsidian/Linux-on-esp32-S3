@@ -1,0 +1,217 @@
+#!/bin/sh
+#
+# Dark RGB LED at boot.
+#
+# The Nano's LED is common-anode: the three anodes are tied to 3V3 and each
+# cathode is a GPIO, so a pin held low lights its colour. Confirmed on this
+# board -- driving GPIO45 low lit it blue.
+#
+# The purple seen while the stock image boots is not firmware doing anything.
+# Nothing in this kernel, in the ESP-IDF firmware, or in any script in this
+# project touches these pins (no WS2812, no RMT, no 45/46/0 anywhere). It is
+# their reset state: GPIO45 and GPIO46 are strapping pins with internal
+# pull-downs, so they sit low and light red and blue at once, and GPIO0 has a
+# pull-up so it stays dark. Driving all three high is the entire fix.
+#
+# Letting go of the pins afterwards is safe, and this script does it: on this
+# chip there are two different ways to stop holding a line and only one of them
+# touches the pad. Freeing the line -- unexport here, close() on the chardev --
+# runs the kernel's release path, which clears its own bookkeeping and writes
+# nothing to the chip (this gpio_chip installs no .free hook), so the output
+# latch keeps the level and the LED stays dark. That is measured on this board,
+# not inferred. Clearing the *output enable* is the operation that hands a pad
+# back to its pull, and that is what `stop` does below; it is also what makes
+# `stop` light the LED rather than `start` releasing it.
+#
+# So `start` drives the three lines dark and then gives them back, leaving the
+# LED dark and the pins free for anything else -- `espctl gpio set LED_BLUE 1`
+# works straight after boot, with no service to stop first.
+#
+# The pin numbers come from the Nano's schematic, and they are the one thing
+# here that cannot be measured. There is no `leds` node to read: the device
+# tree's top level is #address-cells, #size-cells, aliases, chosen, clocks,
+# compatible, cpus, i2c0, interrupt-parent, memory@0, name, pic and soc, and
+# nothing else (checked on the running board). An ESP32-S3 has no board ID
+# EEPROM either. So these three numbers are stated once, here, and every other
+# value is discovered.
+
+# The level that means dark. One variable, because it is the only thing that
+# would change if a board revision ever moved the common pin to ground: flip it
+# to 0 and nothing else here needs to move.
+LED_OFF=1
+
+LED_RED_GPIO=46
+LED_GREEN_GPIO=0
+LED_BLUE_GPIO=45
+
+# The kernel registers three gpiochips and their numbering is not ours to
+# assume: the two 600c0018.clk_gpio / 600c001c.clk_gpio banks come first, so
+# the S3's own bank is "gpiochip2" today and could be "gpiochip3" after any
+# kernel change. Find it by label, then take its base from the sysfs node.
+#
+# sysfs rather than the /dev/gpiochipN char device so that this script needs
+# no binary and no libgpiod, and can run before the filesystem is fully alive.
+# CONFIG_GPIO_SYSFS is enabled in this image (checked on the board).
+GPIO_LABEL=esp32s3-gpio
+GPIO_BASE=
+
+# The pins set_led actually drove this run, so that start gives back exactly
+# those and never a pin it found already held by somebody else.
+DRIVEN=
+
+find_base() {
+  chip=
+  for c in /sys/class/gpio/gpiochip*; do
+    [ -r "$c/label" ] || continue
+    if [ "$(cat "$c/label" 2>/dev/null)" = "$GPIO_LABEL" ]; then
+      chip=$c
+      break
+    fi
+  done
+  [ -n "$chip" ] || return 1
+  [ -r "$chip/base" ] || return 1
+  GPIO_BASE=$(cat "$chip/base" 2>/dev/null)
+  [ -n "$GPIO_BASE" ] || return 1
+  return 0
+}
+
+# $1 = the name to report, $2 = the pin number as the schematic gives it
+set_led() {
+  name=$1
+  pin=$2
+  node=/sys/class/gpio/gpio$((GPIO_BASE + pin))
+
+  if [ ! -d "$node" ]; then
+    printf '%s\n' "$((GPIO_BASE + pin))" > /sys/class/gpio/export 2>/dev/null
+    # A pin another driver has claimed cannot be exported. Report it and carry
+    # on: one unavailable LED must not cost the other two, and must not stop
+    # the boot.
+    if [ ! -d "$node" ]; then
+      printf '\n  %s: gpio%s is not available (claimed by a driver?)\n' \
+        "$name" "$pin" >&2
+      return 1
+    fi
+  fi
+
+  # Level and direction in a single write. gpiolib-sysfs reads "high"/"low" as
+  # "become an output at this level", whereas writing "out" first would drive
+  # the pin low for an instant -- which on this LED means flashing it on.
+  if [ "$LED_OFF" = 1 ]; then level=high; else level=low; fi
+
+  printf '%s\n' "$level" > "$node/direction" 2>/dev/null || {
+    printf '\n  %s: could not drive gpio%s\n' "$name" "$pin" >&2
+    return 1
+  }
+  DRIVEN="$DRIVEN $pin"
+  return 0
+}
+
+# Give a pin back without disturbing it. Freeing the line runs the kernel's
+# release path, and this chip's gpio_chip installs no .free hook, so the path
+# clears the kernel's own bookkeeping and writes nothing to the pad: the level
+# set_led gave it stays, and the LED stays dark. Measured on this board, and
+# the reason start can afford to let go.
+release() {
+  pin=$1
+  printf '%s\n' "$((GPIO_BASE + pin))" > /sys/class/gpio/unexport 2>/dev/null
+  return 0
+}
+
+report() {
+  name=$1
+  pin=$2
+  node=/sys/class/gpio/gpio$((GPIO_BASE + pin))
+  if [ -r "$node/value" ]; then
+    v=$(cat "$node/value" 2>/dev/null)
+    if [ "$v" = "$LED_OFF" ]; then
+      printf '  %-6s gpio%-3s %s (dark)\n' "$name" "$pin" "$v"
+    else
+      printf '  %-6s gpio%-3s %s (lit)\n' "$name" "$pin" "$v"
+    fi
+  else
+    # Not exported, which is the normal state once start has finished. The
+    # level cannot be read from here without claiming the line again, and
+    # claiming it through sysfs exports it as an input, which clears the output
+    # enable -- lighting the LED to answer the question. So say only what is
+    # knowable: nothing is holding the pin. In particular this cannot report
+    # whether the pad is left driving or back on its pull, because start and
+    # stop differ in exactly that and both end with the line freed. Darkness is
+    # what start aims for, and it is not something this can measure.
+    printf '  %-6s gpio%-3s free (not held; level not readable here)\n' \
+      "$name" "$pin"
+  fi
+}
+
+case "$1" in
+  start)
+    printf "Turning the RGB LED off: "
+    if ! find_base; then
+      echo "FAIL"
+      printf '  no gpiochip labelled %s\n' "$GPIO_LABEL" >&2
+      exit 1
+    fi
+
+    failed=0
+    set_led red   "$LED_RED_GPIO"   || failed=1
+    set_led green "$LED_GREEN_GPIO" || failed=1
+    set_led blue  "$LED_BLUE_GPIO"  || failed=1
+
+    # Let go of every pin that took. The level survives being freed, so this
+    # costs nothing and leaves the LED lines usable: nothing else in the image
+    # claims them, and holding them open through sysfs would only make
+    # `espctl gpio set LED_BLUE 1` fail with "busy" until somebody stopped this
+    # script by hand.
+    for pin in $DRIVEN; do
+      release "$pin"
+    done
+
+    [ "$failed" = 0 ] && echo "OK" || echo "FAIL"
+
+    # The boot continues either way. A dark LED is a cosmetic default, and
+    # failing init over it would trade a small wrong for a large one.
+    exit 0
+    ;;
+
+  stop)
+    # Undoing start is not merely letting go -- start has already let go, and
+    # the level outlives it. It means handing each pad back to its pull, and
+    # the operation that does that is clearing the output enable by making the
+    # line an input. Written while the line is still exported, because there is
+    # nothing left to write to once it is freed. The pads then show the purple
+    # the SoC comes up with, which is what releasing means here.
+    printf "Releasing the RGB LED (it will light): "
+    if ! find_base; then
+      echo "FAIL"
+      exit 1
+    fi
+    for pin in "$LED_RED_GPIO" "$LED_GREEN_GPIO" "$LED_BLUE_GPIO"; do
+      node=/sys/class/gpio/gpio$((GPIO_BASE + pin))
+      [ -d "$node" ] ||
+        printf '%s\n' "$((GPIO_BASE + pin))" > /sys/class/gpio/export 2>/dev/null
+      printf 'in\n' > "$node/direction" 2>/dev/null
+      release "$pin"
+    done
+    echo "OK"
+    exit 0
+    ;;
+
+  status)
+    if ! find_base; then
+      printf 'no gpiochip labelled %s\n' "$GPIO_LABEL"
+      exit 1
+    fi
+    report red   "$LED_RED_GPIO"
+    report green "$LED_GREEN_GPIO"
+    report blue  "$LED_BLUE_GPIO"
+    exit 0
+    ;;
+
+  restart|reload)
+    "$0" start
+    ;;
+
+  *)
+    echo "Usage: $0 {start|stop|status|restart}"
+    exit 1
+    ;;
+esac

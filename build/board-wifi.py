@@ -26,7 +26,7 @@ c.login()
 c.command(f'wifi connect "{ssid}" "{password}" >/dev/null 2>&1', 120, check=False)
 status = c.command('wifi status', 20, check=False)
 c.close()
-m = re.search(r'inet (\d+\.\d+\.\d+\.\d+)/\d+.*scope global espsta0', status)
+m = re.search(r'inet (\d+\.\d+\.\d+\.\d+)/\d+.*scope global (?:wlan0|espsta0)', status)
 if not m:
     sys.exit('board-wifi: no address after wifi connect:\n' + status[-400:])
 print(m.group(1))

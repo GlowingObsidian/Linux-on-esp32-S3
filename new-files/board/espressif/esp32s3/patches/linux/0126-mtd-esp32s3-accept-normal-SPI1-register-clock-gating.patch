@@ -1,0 +1,14 @@
+diff --git a/drivers/mtd/devices/esp32s3-flash-nor-ll.c b/drivers/mtd/devices/esp32s3-flash-nor-ll.c
+--- a/drivers/mtd/devices/esp32s3-flash-nor-ll.c
++++ b/drivers/mtd/devices/esp32s3-flash-nor-ll.c
+@@ -179,7 +179,9 @@
+ 	CHECK_REGISTER(SPI1 + 0xa0, t->preflight_value & 1);
+ 	CHECK_REGISTER(SPI1 + 0x98, t->preflight_value & 1);
+ 	CHECK_REGISTER(SPI1 + 0xa4, t->preflight_value & 1);
+-	CHECK_REGISTER(SPI1 + 0xe8, !(t->preflight_value & 1));
++	/* CLOCK_GATE is register-clock gating, not the MSPI functional clock.
++	 * NuttX's SPI1 transaction setup explicitly writes zero here. Both zero
++	 * and one are valid; leave the inherited register unchanged. */
+ 	CHECK_REGISTER(EXTMEM + 0x88, t->preflight_value & 1);
+ 	CHECK_REGISTER(EXTMEM + 0x28, t->preflight_value & 7);
+ 	CHECK_REGISTER(EXTMEM, ((t->preflight_value >> 3) & 3) > 2);

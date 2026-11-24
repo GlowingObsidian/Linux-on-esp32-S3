@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "arduino-nano-esp32-sd.dts"
+
+/* Isolation baseline: the SPI driver must not map, clock or initialize GDMA. */
+&spi2 {
+	reg = <0x60024000 0x100>;
+	reg-names = "spi";
+	clocks = <&spi2_clk>;
+	clock-names = "spi";
+	resets = <&reset 6>;
+	reset-names = "reset";
+};

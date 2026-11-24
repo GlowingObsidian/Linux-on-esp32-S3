@@ -1,0 +1,41 @@
+--- a/arch/xtensa/Makefile
++++ b/arch/xtensa/Makefile
+@@ -86,12 +86,13 @@
+ # and the rest are deliberately absent: libmesh.a is what supplies the
+ # thirteen mesh-only symbols the station set leaves undefined, and dropping
+ # it is what makes the station-only link close.
+-libs-$(CONFIG_ESP32_WIFI_BLOB) += $(srctree)/../../../esp-hosted/esp_hosted_ng/esp/esp_driver/esp-idf/components/esp_wifi/lib/esp32s3/libnet80211.a
+-libs-$(CONFIG_ESP32_WIFI_BLOB) += $(srctree)/../../../esp-hosted/esp_hosted_ng/esp/esp_driver/esp-idf/components/esp_wifi/lib/esp32s3/libpp.a
+-libs-$(CONFIG_ESP32_WIFI_BLOB) += $(srctree)/../../../esp-hosted/esp_hosted_ng/esp/esp_driver/esp-idf/components/esp_wifi/lib/esp32s3/libcore.a
+-libs-$(CONFIG_ESP32_WIFI_BLOB) += $(srctree)/../../../esp-hosted/esp_hosted_ng/esp/esp_driver/esp-idf/components/esp_wifi/lib/esp32s3/libwapi.a
+-libs-$(CONFIG_ESP32_WIFI_BLOB) += $(srctree)/../../../esp-hosted/esp_hosted_ng/esp/esp_driver/esp-idf/components/esp_wifi/lib/esp32s3/libespnow.a
+-libs-$(CONFIG_ESP32_WIFI_BLOB) += $(srctree)/../../../esp-hosted/esp_hosted_ng/esp/esp_driver/esp-idf/components/esp_phy/lib/esp32s3/libphy.a
++ESP32_IDF_COMPONENTS ?= $(srctree)/../../../esp-hosted/esp_hosted_ng/esp/esp_driver/esp-idf/components
++libs-$(CONFIG_ESP32_WIFI_BLOB) += $(ESP32_IDF_COMPONENTS)/esp_wifi/lib/esp32s3/libnet80211.a
++libs-$(CONFIG_ESP32_WIFI_BLOB) += $(ESP32_IDF_COMPONENTS)/esp_wifi/lib/esp32s3/libpp.a
++libs-$(CONFIG_ESP32_WIFI_BLOB) += $(ESP32_IDF_COMPONENTS)/esp_wifi/lib/esp32s3/libcore.a
++libs-$(CONFIG_ESP32_WIFI_BLOB) += $(ESP32_IDF_COMPONENTS)/esp_wifi/lib/esp32s3/libwapi.a
++libs-$(CONFIG_ESP32_WIFI_BLOB) += $(ESP32_IDF_COMPONENTS)/esp_wifi/lib/esp32s3/libespnow.a
++libs-$(CONFIG_ESP32_WIFI_BLOB) += $(ESP32_IDF_COMPONENTS)/esp_phy/lib/esp32s3/libphy.a
+ #
+ # libcoexist.a is not part of the radio blob. It is the IDF component that
+ # IDF's own wifi_init.c calls before esp_wifi_init() -- coex_pre_init() and
+@@ -116,7 +117,7 @@
+ # wifi_osi_funcs, not through the IDF event loop. Nothing in the blob's
+ # init path touches esp_event_loop_*. See
+ # experiments/mmu-poc/fork/COEX-LINK-ANALYSIS.md.
+-libs-$(CONFIG_ESP32_WIFI_BLOB) += $(srctree)/../../../esp-hosted/esp_hosted_ng/esp/esp_driver/esp-idf/components/esp_coex/lib/esp32s3/libcoexist.a
++libs-$(CONFIG_ESP32_WIFI_BLOB) += $(ESP32_IDF_COMPONENTS)/esp_coex/lib/esp32s3/libcoexist.a
+ #
+ # libesp_phy.a is deliberately NOT linked, though it does define
+ # coexist_printf.
+--- a/drivers/net/wireless/espressif/esp32-ng/Kconfig
++++ b/drivers/net/wireless/espressif/esp32-ng/Kconfig
+@@ -21,6 +21,7 @@
+ config ESP32_WIFI_BLOB
+ 	bool "Run the Wi-Fi blob inside Linux"
+ 	depends on ESP32_WIFI
++	select GENERIC_ALLOCATOR
+ 	help
+ 	  Link Espressif's closed-source Wi-Fi libraries into the kernel and
+ 	  host them directly, instead of talking to ESP-IDF firmware on the

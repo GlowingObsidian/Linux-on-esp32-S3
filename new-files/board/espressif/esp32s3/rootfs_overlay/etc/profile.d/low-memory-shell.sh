@@ -5,6 +5,8 @@ case $- in *i*) ;; *) return 0 ;; esac
 : "${LOWMEM_ENV:=/etc/dash-resume}"
 : "${LOWMEM_RESUME:=/run/shell-resume}"
 : "${LOWMEM_THRESHOLD:=900}"
+# Overridable so the hook can be tested off the board, where there is no procfs.
+: "${LOWMEM_MEMINFO:=/proc/meminfo}"
 
 __lowmem_last=
 __lowmem_st=0
@@ -21,7 +23,7 @@ __lowmem_read_avail() {
 			__lowmem_avail=$1
 			return 0
 		fi
-	done < /proc/meminfo
+	done < "$LOWMEM_MEMINFO"
 }
 
 # 126 is what bash returns when it could not fork: jobs.c calls

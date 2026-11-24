@@ -1,0 +1,64 @@
+Subject: [PATCH] net wireless esp32 enable the IDF cached TX capability and verify runtime configuration
+
+diff --git a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -98,6 +98,12 @@
+ extern int esp_wifi_internal_tx(void *netif, void *buf, u16 len);
+ typedef void (*blob_wifi_tx_done_cb_t)(u8 ifidx, u8 *data, u16 *len, bool success);
+ extern int esp_wifi_set_tx_done_cb(blob_wifi_tx_done_cb_t callback);
++/* Pinned IDF esp_wifi.h CONFIG_FEATURE_CACHE_TX_BUF_BIT. The buffer count
++ * alone does not enable this feature in wifi_menuconfig_init. */
++#define BLOB_WIFI_FEATURE_CACHE_TX_BUF BIT_ULL(1)
++extern int config_is_cache_tx_buf_enabled(void);
++extern int config_get_wifi_cache_tx_buffer_num(void);
++extern int config_get_wifi_static_tx_buffer_num(void);
+ 
+ /*
+  * The blob's crypto table, from libnet80211.a (ieee80211_crypto.o, 116
+@@ -659,13 +665,16 @@
+ {
+ 	(void)kp;
+ 	return scnprintf(buffer, PAGE_SIZE,
+-		"sram_total=%zu sram_free=%zu tx_calls=%d tx_no_mem=%d tx_accepted=%d tx_failed=%d tx_done=%d tx_done_failed=%d tx_queue_full=%d tx_mode=static static_tx=16 cache_tx=32\n",
++		"sram_total=%zu sram_free=%zu tx_calls=%d tx_no_mem=%d tx_accepted=%d tx_failed=%d tx_done=%d tx_done_failed=%d tx_queue_full=%d tx_mode=static static_tx=%d cache_tx=%d cache_tx_enabled=%d\n",
+ 		osi_internal_pool ? gen_pool_size(osi_internal_pool) : 0,
+ 		osi_internal_pool ? gen_pool_avail(osi_internal_pool) : 0,
+ 		atomic_read(&wifi_tx_calls), atomic_read(&wifi_tx_no_mem),
+ 		atomic_read(&wifi_tx_accepted), atomic_read(&wifi_tx_failed),
+ 		atomic_read(&wifi_tx_done), atomic_read(&wifi_tx_done_failed),
+-		atomic_read(&wifi_tx_queue_full));
++		atomic_read(&wifi_tx_queue_full),
++		config_get_wifi_static_tx_buffer_num(),
++		config_get_wifi_cache_tx_buffer_num(),
++		config_is_cache_tx_buf_enabled());
+ }
+ 
+ static const struct kernel_param_ops wifi_stats_ops = {
+@@ -4983,7 +4992,10 @@
+ 	cfg.nvs_enable = 0;
+ 	cfg.wifi_task_core_id = 0;
+ 	cfg.mgmt_sbuf_num = 6;
+-	cfg.feature_caps = 0;
++	/* IDF enables its PSRAM cached-TX path separately from its size.
++	 * Without this capability, class9 never exists and every burst goes
++	 * straight to the sixteen internal DMA buffers. */
++	cfg.feature_caps = BLOB_WIFI_FEATURE_CACHE_TX_BUF;
+ 	cfg.magic = WIFI_INIT_CONFIG_MAGIC;
+ 
+ 	/*
+@@ -5062,6 +5074,14 @@
+ 		dev_err(hw->adapter.dev, "esp_wifi_init_internal: %d\n", ret);
+ 		goto err_adapter;
+ 	}
++	if (!config_is_cache_tx_buf_enabled() ||
++	    config_get_wifi_cache_tx_buffer_num() != cfg.cache_tx_buf_num) {
++		dev_err(hw->adapter.dev, "cached TX did not enable (enabled=%d buffers=%d)\n",
++			config_is_cache_tx_buf_enabled(),
++			config_get_wifi_cache_tx_buffer_num());
++		ret = -EINVAL;
++		goto err_blob_deinit;
++	}
+ 	dev_dbg(hw->adapter.dev, "blob initialised\n");
+ 
+ 	/*

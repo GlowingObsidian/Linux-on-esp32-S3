@@ -393,9 +393,9 @@ CONFIG_BOOT_ROM_LOG_ALWAYS_ON=y
 # CONFIG_ESPTOOLPY_NO_STUB is not set
 # CONFIG_ESPTOOLPY_OCT_FLASH is not set
 CONFIG_ESPTOOLPY_FLASH_MODE_AUTO_DETECT=y
-# CONFIG_ESPTOOLPY_FLASHMODE_QIO is not set
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 # CONFIG_ESPTOOLPY_FLASHMODE_QOUT is not set
-CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+# CONFIG_ESPTOOLPY_FLASHMODE_DIO is not set
 # CONFIG_ESPTOOLPY_FLASHMODE_DOUT is not set
 CONFIG_ESPTOOLPY_FLASH_SAMPLE_MODE_STR=y
 CONFIG_ESPTOOLPY_FLASHMODE="dio"
@@ -480,15 +480,18 @@ CONFIG_APPTRACE_DEST_UART_NONE=y
 CONFIG_APPTRACE_UART_TASK_PRIO=1
 CONFIG_APPTRACE_LOCK_ENABLE=y
 
-CONFIG_BT_ENABLED=y
-# CONFIG_BT_BLUEDROID_ENABLED is not set
-CONFIG_BT_NIMBLE_ENABLED=y
-CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
-CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
-# CONFIG_BT_NIMBLE_ROLE_CENTRAL is not set
-# CONFIG_BT_NIMBLE_ROLE_OBSERVER is not set
-CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
-CONFIG_BT_NIMBLE_SVC_GAP_DEVICE_NAME="Esp32-Linux"
+# Only /dev/esp-ble needed a Bluetooth stack: it existed so a phone could join
+# the board to WiFi without a cable. This image has no BLE provisioning, so the
+# radio is off and NimBLE is not linked at all. The firmware's own BLE code is
+# already wrapped in #ifdef CONFIG_BT_ENABLED throughout (main.c's call to
+# ble_prov_init, the ESP_BLE_PROV_IF receive branch, and the whole of
+# ble_prov.c), so this one setting is what compiles it out rather than a set of
+# edits that could drift apart. It also returns roughly 117 KB to the factory
+# partition. CONFIG_BT_NIMBLE_SVC_GAP_DEVICE_NAME is gone with it: with the
+# stack off there is no advertisement, so the "Esp32-Linux" name it set can no
+# longer be seen by a scanner, and leaving the line would be a setting that
+# looks live and is not.
+# CONFIG_BT_ENABLED is not set
 
 
 # CONFIG_ADC_SUPPRESS_DEPRECATE_WARN is not set
@@ -696,17 +699,29 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
 # against as CONFIG_VECTORS_ADDR. Measured on this tree:
 #
 #   caches 16K/32K, no watchdogs   0x4037f000
-#   caches 16K/32K, watchdogs on   0x40380000   <- what ships
+#   caches 16K/32K, watchdogs on   0x40380000
 #   caches 32K/64K, watchdogs on   0x40384000
+#
+# Those three were measured with NimBLE linked. CONFIG_BT_ENABLED is off now
+# (see below) and the symbol sits lower, so the firmware that ships reports:
+#
+#   caches 16K/32K, watchdogs on, no BLE   0x4037b000   <- what ships
+#
+# It was 0x4037c000 when NimBLE was first dropped, and moved another 4 KiB
+# down when the Wi-Fi blob's archives were linked into the kernel and the
+# adapter's own IRAM use changed with them. Read it off the ELF rather than
+# trusting this comment:
+#
+#   xtensa-esp32s3-elf-nm network_adapter.elf | grep space_for_vectors
 #
 # Flashing a firmware whose address does not match the kernel gives a core 0
 # StoreProhibited panic on the first boot and a reset loop. Raising the caches
 # is still worth measuring -- the kernel is XIP, so every instruction miss is a
 # flash read -- but it has to move the kernel's VECTORS_ADDR in the same
 # commit. package-final.py compares the two and refuses to package a mismatch.
-CONFIG_ESP32S3_INSTRUCTION_CACHE_16KB=y
-# CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB is not set
-CONFIG_ESP32S3_INSTRUCTION_CACHE_SIZE=0x4000
+# CONFIG_ESP32S3_INSTRUCTION_CACHE_16KB is not set
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+CONFIG_ESP32S3_INSTRUCTION_CACHE_SIZE=0x8000
 # CONFIG_ESP32S3_INSTRUCTION_CACHE_4WAYS is not set
 CONFIG_ESP32S3_INSTRUCTION_CACHE_8WAYS=y
 CONFIG_ESP32S3_ICACHE_ASSOCIATED_WAYS=8
@@ -714,9 +729,9 @@ CONFIG_ESP32S3_ICACHE_ASSOCIATED_WAYS=8
 CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_32B=y
 CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_SIZE=32
 # CONFIG_ESP32S3_DATA_CACHE_16KB is not set
-CONFIG_ESP32S3_DATA_CACHE_32KB=y
-# CONFIG_ESP32S3_DATA_CACHE_64KB is not set
-CONFIG_ESP32S3_DATA_CACHE_SIZE=0x8000
+# CONFIG_ESP32S3_DATA_CACHE_32KB is not set
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_SIZE=0x10000
 # CONFIG_ESP32S3_DATA_CACHE_4WAYS is not set
 CONFIG_ESP32S3_DATA_CACHE_8WAYS=y
 CONFIG_ESP32S3_DCACHE_ASSOCIATED_WAYS=8
@@ -823,7 +838,7 @@ CONFIG_ESP_WIFI_TX_BA_WIN=6
 CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
 CONFIG_ESP_WIFI_RX_BA_WIN=6
 # CONFIG_ESP_WIFI_AMSDU_TX_ENABLED is not set
-CONFIG_ESP_WIFI_NVS_ENABLED=y
+# CONFIG_ESP_WIFI_NVS_ENABLED is not set
 CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0=y
 # CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_1 is not set
 CONFIG_ESP_WIFI_SOFTAP_BEACON_MAX_LEN=752
@@ -897,7 +912,25 @@ CONFIG_FATFS_VFS_FSTAT_BLKSIZE=0
 
 
 # CONFIG_FREERTOS_SMP is not set
-# CONFIG_FREERTOS_UNICORE is not set
+CONFIG_FREERTOS_UNICORE=y
+#
+# Run FreeRTOS on core 0 only, so IDF never starts CPU1.
+#
+# IDF normally takes both cores: its startup calls start_other_core(),
+# which releases CPU1 and hands it to FreeRTOS. That leaves CPU1 running
+# a foreign OS by the time Linux exists, and there is no supported way to
+# take a running core away from a scheduler.
+#
+# This option selects ESP_SYSTEM_SINGLE_CORE_MODE, which makes IDF skip
+# start_other_core() entirely, so CPU1 stays in reset from power-on.
+# That is the state NuttX starts its second core from, and the state the
+# Linux SMP bring-up needs: __cpu_up(1) can then use the documented
+# release sequence rather than trying to stop a running core.
+#
+# IDF's own help text for this option says it is "needed when e.g.
+# another process needs complete control over the second core" -- which
+# is exactly this port.
+#
 CONFIG_FREERTOS_HZ=100
 # CONFIG_FREERTOS_CHECK_STACKOVERFLOW_NONE is not set
 # CONFIG_FREERTOS_CHECK_STACKOVERFLOW_PTRVAL is not set
@@ -1365,9 +1398,9 @@ CONFIG_LOG_BOOTLOADER_LEVEL_ERROR=y
 CONFIG_LOG_BOOTLOADER_LEVEL=1
 # CONFIG_APP_ROLLBACK_ENABLE is not set
 # CONFIG_FLASH_ENCRYPTION_ENABLED is not set
-# CONFIG_FLASHMODE_QIO is not set
+CONFIG_FLASHMODE_QIO=y
 # CONFIG_FLASHMODE_QOUT is not set
-CONFIG_FLASHMODE_DIO=y
+# CONFIG_FLASHMODE_DIO is not set
 # CONFIG_FLASHMODE_DOUT is not set
 CONFIG_MONITOR_BAUD=115200
 # CONFIG_OPTIMIZATION_LEVEL_DEBUG is not set
@@ -1467,7 +1500,7 @@ CONFIG_ESP32_WIFI_AMPDU_RX_ENABLED=y
 CONFIG_ESP32_WIFI_RX_BA_WIN=6
 CONFIG_ESP32_WIFI_RX_BA_WIN=6
 # CONFIG_ESP32_WIFI_AMSDU_TX_ENABLED is not set
-CONFIG_ESP32_WIFI_NVS_ENABLED=y
+# CONFIG_ESP32_WIFI_NVS_ENABLED is not set
 CONFIG_ESP32_WIFI_TASK_PINNED_TO_CORE_0=y
 # CONFIG_ESP32_WIFI_TASK_PINNED_TO_CORE_1 is not set
 CONFIG_ESP32_WIFI_SOFTAP_BEACON_MAX_LEN=752
@@ -1537,3 +1570,5 @@ CONFIG_SPI_FLASH_WRITING_DANGEROUS_REGIONS_ABORTS=y
 CONFIG_SUPPRESS_SELECT_DEBUG_OUTPUT=y
 CONFIG_SUPPORT_TERMIOS=y
 CONFIG_SEMIHOSTFS_MAX_MOUNT_POINTS=1
+
+# Firmware linker reserves the Linux vector/atomic-guard page.

@@ -18,16 +18,26 @@ class KernelConfigTests(unittest.TestCase):
         self.dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
 
-    def check(self, seed, built):
+    def check(self, seed, built, *options):
         (self.dir / 'seed').write_text(seed)
         (self.dir / 'built').write_text(built)
-        return subprocess.run([sys.executable, str(CHECK), str(self.dir / 'seed'),
+        return subprocess.run([sys.executable, str(CHECK), *options, str(self.dir / 'seed'),
                                str(self.dir / 'built')],
                               capture_output=True, text=True, timeout=30)
 
     def test_a_matching_config_passes(self):
         result = self.check('CONFIG_A=y\n# CONFIG_B is not set\n',
                             'CONFIG_A=y\n# CONFIG_B is not set\nCONFIG_C=m\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fork_payload_rejects_a_matching_base_kernel(self):
+        result = self.check('CONFIG_SMP=y\n', 'CONFIG_SMP=y\n', '--require-fork')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('do not package or flash', result.stderr)
+
+    def test_fork_payload_accepts_the_enabled_backend(self):
+        result = self.check('CONFIG_A=y\n',
+                            'CONFIG_A=y\nCONFIG_XTENSA_NOMMU_FORK=y\n', '--require-fork')
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_a_symbol_the_build_dropped_is_caught(self):
@@ -95,7 +105,7 @@ class ExtraFirmwareTests(unittest.TestCase):
     apart, so check that every named blob is handled in both places.
     """
 
-    BOARD_CONFIG = ROOT / 'new-files/board/espressif/esp32s3/devkit_c1_16m_linux.config'
+    BOARD_CONFIG = ROOT / 'new-files/board/espressif/esp32s3/nano_esp32_linux.config'
     INSTALLERS = ['patches/03-buildroot-tracked-changes.patch',
                   'experiments/mmu-poc/fork/build-kernel.sh']
 

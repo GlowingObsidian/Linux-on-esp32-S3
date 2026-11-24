@@ -1,0 +1,261 @@
+From: Shreyan Dey <shreyan@example.com>
+Subject: [PATCH] spi: esp32: handle SD initialization and RX-only transfers
+
+Bound the clock divider, support GPIO chip select, restrict the advertised
+word size to the implemented byte path, and return transfer failures.
+This is the PIO prerequisite for SD; it does not implement GDMA.
+
+--- a/drivers/spi/spi-esp32.c
++++ b/drivers/spi/spi-esp32.c
+@@ -148,9 +148,13 @@
+ 	esp32_spi_write(spi, SPI_CTRL_REG, cr);
+ 
+ 	/* SPI_MISC_REG */
+-	cr = //SPI_CS_KEEP_ACTIVE |
+-		//FIELD_PREP(SPI_MASTER_CS_POL, BIT(cs)) |
+-		(SPI_CS_DIS ^ BIT(cs));
++	cr = SPI_CS_DIS;
++	if (!spi_get_csgpiod(device, 0)) {
++		cr ^= BIT(cs);
++		cr |= esp32_spi_read(spi, SPI_MISC_REG) & SPI_CS_KEEP_ACTIVE;
++		if (device->mode & SPI_CS_HIGH)
++			cr |= FIELD_PREP(SPI_MASTER_CS_POL, BIT(cs));
++	}
+ 
+ 	if (device->mode & SPI_CPOL)
+ 		cr |= SPI_CK_IDLE_EDGE;
+@@ -165,6 +169,9 @@
+ 	u8 cs = spi_get_chipselect(device, 0);
+ 	u32 cr = is_high ? 0 : SPI_CS_KEEP_ACTIVE;
+ 
++	if (spi_get_csgpiod(device, 0))
++		return;
++
+ 	/* SPI_MISC_REG */
+ 	cr |= (SPI_CS_DIS ^ BIT(cs));
+ 
+@@ -177,45 +184,68 @@
+ 	esp32_spi_write(spi, SPI_MISC_REG, cr);
+ }
+ 
+-static void esp32_spi_wait_bit(struct esp32_spi *spi, u32 bit)
++static int esp32_spi_wait_bit(struct esp32_spi *spi, u32 bit)
+ {
+ 	unsigned long timeout = jiffies + HZ;
+ 
+ 	while (esp32_spi_read(spi, SPI_CMD_REG) & bit) {
+ 		if (time_after(jiffies, timeout)) {
+ 			pr_warn("%s: timeout waiting for 0x%08x\n", __func__, bit);
+-			return;
++			return -ETIMEDOUT;
+ 		}
+ 		cpu_relax();
+ 	}
+-}
+-
+-static void esp32_spi_prepare_transfer(struct esp32_spi *spi,
++	return 0;
++}
++
++/* PRE and N store divider minus one. Choose the smallest divisor that
++ * never exceeds the requested bus speed, including MMC's 400 kHz startup.
++ */
++static int esp32_spi_clock(u32 source, u32 requested, u32 *reg, u32 *actual)
++{
++	u32 pre, best_pre = 0, best_n = 0, best_div = 1025;
++
++	if (!source || !requested)
++		return -EINVAL;
++	if (requested >= source) {
++		*reg = SPI_CLK_EQU_SYSCLK;
++		*actual = source;
++		return 0;
++	}
++	for (pre = 1; pre <= 16; pre++) {
++		u32 n = max_t(u32, 2,
++			DIV_ROUND_UP(DIV_ROUND_UP(source, pre), requested));
++
++		if (n <= 64 && pre * n < best_div) {
++			best_pre = pre;
++			best_n = n;
++			best_div = pre * n;
++		}
++	}
++	if (!best_pre)
++		return -EINVAL;
++	*reg = FIELD_PREP(SPI_CLKDIV_PRE, best_pre - 1) |
++		FIELD_PREP(SPI_CLKCNT_N, best_n - 1) |
++		FIELD_PREP(SPI_CLKCNT_L, best_n - 1) |
++		FIELD_PREP(SPI_CLKCNT_H, best_n / 2 - 1);
++	*actual = source / best_div;
++	return 0;
++}
++
++static int esp32_spi_prepare_transfer(struct esp32_spi *spi,
+ 				       struct spi_device *device,
+ 				       struct spi_transfer *t,
+ 				       unsigned int n_words)
+ {
+-	u32 cr;
++	u32 cr, actual;
+ 	unsigned int mode;
+-
+-	/* SPI_CLOCK_REG */
++	int ret;
++
++	ret = esp32_spi_clock(clk_get_rate(spi->clk), t->speed_hz, &cr, &actual);
++	if (ret)
++		return ret;
++	t->effective_speed_hz = actual;
+ 	if (t->speed_hz != spi->speed_hz) {
+-		u32 spi_clock = clk_get_rate(spi->clk);
+-		u32 clkcnt = DIV_ROUND_UP(spi_clock, t->speed_hz) - 1;
+-		u32 clkdiv = 1;
+-
+-		if (clkcnt && !FIELD_FIT(SPI_CLKCNT_N, clkcnt)) {
+-			clkdiv = t->speed_hz / FIELD_MAX(SPI_CLKCNT_N);
+-			clkcnt = DIV_ROUND_UP(spi_clock, t->speed_hz * clkdiv) - 1;
+-		}
+-		if (!clkcnt)
+-			clkcnt = 1;
+-
+-		cr = FIELD_PREP(SPI_CLKDIV_PRE, clkdiv - 1) |
+-			FIELD_PREP(SPI_CLKCNT_N, clkcnt) |
+-			FIELD_PREP(SPI_CLKCNT_L, clkcnt) |
+-			FIELD_PREP(SPI_CLKCNT_H, (clkcnt + 1) / 2 - 1);
+-
+ 		esp32_spi_write(spi, SPI_CLOCK_REG, cr);
+ 		spi->speed_hz = t->speed_hz;
+ 	}
+@@ -233,8 +263,8 @@
+ 	    (device->mode & (SPI_CPOL | SPI_CPHA)) == SPI_CPHA)
+ 		cr |= SPI_CK_OUT_EDGE;
+ 
+-	if (t->tx_buf)
+-		cr |= SPI_USR_MOSI;
++	/* RX-only transfers still send idle ones while clocking the card. */
++	cr |= SPI_USR_MOSI;
+ 	if (t->rx_buf)
+ 		cr |= SPI_USR_MISO;
+ 
+@@ -242,14 +272,19 @@
+ 	WARN_ON(mode != SPI_NBITS_SINGLE);
+ 
+ 	esp32_spi_write(spi, SPI_USER_REG, cr);
+-}
+-
+-static void esp32_spi_start_transfer(struct esp32_spi *spi)
+-{
++	return 0;
++}
++
++static int esp32_spi_start_transfer(struct esp32_spi *spi)
++{
++	int ret;
+ 	/* SPI_CMD_REG */
+ 	esp32_spi_write(spi, SPI_CMD_REG, SPI_UPDATE);
+-	esp32_spi_wait_bit(spi, SPI_UPDATE);
++	ret = esp32_spi_wait_bit(spi, SPI_UPDATE);
++	if (ret)
++		return ret;
+ 	esp32_spi_write(spi, SPI_CMD_REG, SPI_USR);
++	return 0;
+ }
+ 
+ static irqreturn_t esp32_spi_irq(int irq, void *dev_id)
+@@ -265,20 +300,16 @@
+ 	return IRQ_NONE;
+ }
+ 
+-static void esp32_spi_wait(struct esp32_spi *spi)
+-{
+-	esp32_spi_wait_bit(spi, SPI_USR);
+-	if (esp32_spi_read(spi, SPI_DMA_INT_RAW_REG) & SPI_TRANS_DONE_INT) {
+-		esp32_spi_write(spi, SPI_DMA_INT_CLR_REG, SPI_TRANS_DONE_INT);
+-	} else {
+-		WARN_ONCE(1, "wait complete, but no SPI_TRANS_DONE_INT\n");
+-	}
+-#if 0
+-		reinit_completion(&spi->done);
+-		esp32_spi_write(spi, SPI_DMA_INT_ENA_REG, SPI_TRANS_DONE_INT);
+-		wait_for_completion(&spi->done);
+-		esp32_spi_write(spi, SPI_DMA_INT_CLR_REG, SPI_TRANS_DONE_INT);
+-#endif
++static int esp32_spi_wait(struct esp32_spi *spi)
++{
++	int ret = esp32_spi_wait_bit(spi, SPI_USR);
++
++	if (ret)
++		return ret;
++	if (!(esp32_spi_read(spi, SPI_DMA_INT_RAW_REG) & SPI_TRANS_DONE_INT))
++		return -EIO;
++	esp32_spi_write(spi, SPI_DMA_INT_CLR_REG, SPI_TRANS_DONE_INT);
++	return 0;
+ }
+ 
+ static int esp32_spi_transfer_one(struct spi_controller *host,
+@@ -288,27 +319,40 @@
+ 	struct esp32_spi *spi = spi_controller_get_devdata(host);
+ 	const u8 *tx_ptr = t->tx_buf;
+ 	u8 *rx_ptr = t->rx_buf;
++	u8 idle[ESP32_SPI_FIFO_SIZE];
+ 	unsigned int remaining_words = t->len;
++	int ret;
++
++	memset(idle, 0xff, sizeof(idle));
+ 
+ 	while (remaining_words) {
+ 		unsigned int n_words = min(remaining_words, ESP32_SPI_FIFO_SIZE);
+ 		u32 n32 = n_words & -4;
+ 		u32 r32 = n_words - n32;
+ 
+-		esp32_spi_prepare_transfer(spi, device, t, n_words);
++		const u8 *tx = tx_ptr ? tx_ptr : idle;
++
++		ret = esp32_spi_prepare_transfer(spi, device, t, n_words);
++		if (ret)
++			return ret;
+ 
+ 		if (n32)
+-			memcpy_toio(spi->regs + SPI_W0_REG, tx_ptr, n32);
++			memcpy_toio(spi->regs + SPI_W0_REG, tx, n32);
+ 		if (r32) {
+ 			u32 w = 0;
+ 
+-			memcpy(&w, tx_ptr + n32, r32);
++			memcpy(&w, tx + n32, r32);
+ 			memcpy_toio(spi->regs + SPI_W0_REG + n32, &w, 4);
+ 		}
+-		tx_ptr += n_words;
+-
+-		esp32_spi_start_transfer(spi);
+-		esp32_spi_wait(spi);
++		if (tx_ptr)
++			tx_ptr += n_words;
++
++		ret = esp32_spi_start_transfer(spi);
++		if (ret)
++			return ret;
++		ret = esp32_spi_wait(spi);
++		if (ret)
++			return ret;
+ 
+ 		if (rx_ptr) {
+ 			if (n32)
+@@ -385,12 +429,12 @@
+ 	/* Define our host */
+ 	host->dev.of_node = np;
+ 	host->max_speed_hz = clk_get_rate(spi->clk);
++	host->min_speed_hz = DIV_ROUND_UP(host->max_speed_hz, 1024);
++	host->use_gpio_descriptors = true;
+ 	host->bus_num = pdev->id;
+ 	host->mode_bits = SPI_CPHA | SPI_CPOL |
+-		SPI_CS_HIGH | SPI_LSB_FIRST |
+-		SPI_TX_DUAL | SPI_TX_QUAD |
+-		SPI_RX_DUAL | SPI_RX_QUAD;
+-	host->bits_per_word_mask = SPI_BPW_RANGE_MASK(1, 32);
++		SPI_CS_HIGH | SPI_LSB_FIRST;
++	host->bits_per_word_mask = SPI_BPW_MASK(8);
+ 	host->prepare_message = esp32_spi_prepare_message;
+ 	host->set_cs = esp32_spi_set_cs;
+ 	host->transfer_one = esp32_spi_transfer_one;

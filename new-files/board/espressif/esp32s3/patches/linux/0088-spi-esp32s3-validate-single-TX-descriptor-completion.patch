@@ -1,0 +1,49 @@
+Subject: [PATCH] spi: esp32s3: validate single TX descriptor completion
+
+A real SPI read completed with OUT_DONE, both descriptors returned to CPU,
+and RX success EOF, but without OUT_TOTAL_EOF. Requiring total EOF rejects
+this completed single-descriptor transaction and unnecessarily disables DMA.
+
+Use OUT_DONE (TRM v1.8 section 3.4, per-descriptor payload completion) after
+SPI_TRANS_DONE, as opposed to requiring chain total EOF. Also validate TX
+writeback ownership, EOF and exact length. Keep RX success EOF, RX length,
+all hardware error checks and bounded timeouts. NuttX esp32s3_spi_exchange_dma
+likewise waits on SPI transaction completion rather than GDMA total EOF.
+
+--- a/drivers/spi/spi-esp32.c
++++ b/drivers/spi/spi-esp32.c
+@@ -116,7 +116,7 @@
+ #define GDMA_IN_START  BIT(22)
+ #define GDMA_OUT_START BIT(21)
+ #define GDMA_RX_EOF    BIT(1)
+-#define GDMA_TX_EOF    BIT(3)
++#define GDMA_TX_DONE   BIT(0)
+ #define GDMA_IN_ERROR  (BIT(3) | BIT(4) | GENMASK(9, 6))
+ #define GDMA_OUT_ERROR (BIT(2) | GENMASK(7, 4))
+ #define GDMA_OWNER     BIT(31)
+@@ -433,11 +433,23 @@
+ 		ret = esp32_spi_wait(spi);
+ 		if (ret)
+ 			goto abort;
+-		phase = "TX total EOF";
++		/* One descriptor per chunk: OUT_DONE confirms its payload reached
++		 * SPI. SPI_TRANS_DONE above confirms it also left the wire. This
++		 * is not a multi-descriptor chain requiring OUT_TOTAL_EOF.
++		 */
++		phase = "TX descriptor done";
+ 		ret = readl_poll_timeout(spi->gdma + GDMA_OUT_RAW, out_raw,
+-			out_raw & (GDMA_TX_EOF | GDMA_OUT_ERROR), 1, 1000);
++			out_raw & (GDMA_TX_DONE | GDMA_OUT_ERROR), 1, 1000);
+ 		if (ret || (out_raw & GDMA_OUT_ERROR)) {
+ 			ret = ret ? ret : -EIO;
++			goto abort;
++		}
++		phase = "TX descriptor";
++		rmb();
++		out_raw = readl(spi->dma_sram + GDMA_TX_DESC);
++		if ((out_raw & GDMA_OWNER) || !(out_raw & GDMA_DESC_EOF) ||
++		    FIELD_GET(GDMA_LENGTH, out_raw) != len) {
++			ret = -EIO;
+ 			goto abort;
+ 		}
+ 		if (rx) {

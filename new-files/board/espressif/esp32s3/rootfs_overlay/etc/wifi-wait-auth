@@ -1,0 +1,30 @@
+#!/bin/sh
+# ifup pre-up hook: authorize the Wi-Fi link before starting DHCP.
+IFACE=${1:-wlan0}
+CONF=/etc/wpa_supplicant.conf
+LOG=/run/wpa_supplicant.log
+WAIT=45
+
+ip link set "$IFACE" up || exit 1
+: > "$LOG" || exit 1
+wpa_supplicant -i "$IFACE" -c "$CONF" -B -f "$LOG" || exit 1
+n=0
+while [ "$n" -lt "$WAIT" ]; do
+	# A successful association alone does not authorize protected data.
+	# Follow the most recent connection/disconnection event in this fresh log.
+	if awk '
+		/: CTRL-EVENT-CONNECTED - Connection to / { ready=1 }
+		/: CTRL-EVENT-DISCONNECTED / { ready=0 }
+		END { exit !ready }
+	' "$LOG"; then
+		exit 0
+	fi
+	if grep -q 'reason=WRONG_KEY' "$LOG"; then
+		echo 'Wi-Fi authentication failed; DHCP was not started.' >&2
+		exit 2
+	fi
+	sleep 1
+	n=$((n + 1))
+done
+echo 'Wi-Fi authentication timed out; DHCP was not started.' >&2
+exit 1

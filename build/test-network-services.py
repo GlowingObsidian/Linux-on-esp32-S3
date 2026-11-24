@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""remote-login and web-server end to end: ports and SSH auth modes, checked
-from the host over WiFi. Needs wifi already set up and paramiko on the host.
-Puts back /etc/remote-login, remote-login.conf and authorized_keys as they
-were, and leaves the web server off on port 80."""
+"""remote-login end to end: ports and SSH auth modes, checked from the host
+over WiFi. Needs wifi already set up and paramiko on the host. Puts back
+/etc/remote-login, remote-login.conf and authorized_keys as they were."""
 import argparse
 import importlib.util
 import io
@@ -12,7 +11,6 @@ import re
 import socket
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 try:
@@ -36,7 +34,7 @@ spec.loader.exec_module(probe)
 
 c = probe.Console(args.port)
 c.login()
-password = args.password or os.environ.get('MMU_BOARD_PASSWORD', probe.TEST_PASSWORD)
+password = args.password or os.environ.get('MMU_BOARD_PASSWORD', probe.DEFAULT_PASSWORD)
 status = c.command('wifi status', 15, check=False)
 m = re.search(r'inet (\d+\.\d+\.\d+\.\d+)/\d+.*scope global espsta0', status)
 if not m:
@@ -103,7 +101,7 @@ def wait_listening(port, want=True, seconds=20):
 
 
 def state(status):
-    return [line.strip() for line in status.splitlines() if re.match(r'(Listening|SSH|Telnet):', line.strip())]
+    return [line.strip() for line in status.splitlines() if re.match(r'(Listening|SSH):', line.strip())]
 
 
 before = board('remote-login status')
@@ -147,35 +145,6 @@ def auth_password():
     assert not ssh(2222, use_key=True), 'key let in with password only'
     return 'password in, key turned away'
 record('ssh-auth-password-only', auth_password)
-
-
-def telnet_port():
-    board('remote-login port telnet 2323; remote-login telnet')
-    assert wait_listening(2323), 'nothing on 2323'
-    assert wait_listening(2222, want=False), 'SSH still open after switching to telnet'
-    with socket.create_connection((ip, 2323), timeout=10) as s:
-        s.settimeout(10)
-        data = b''
-        end = time.monotonic() + 15
-        while b'login' not in data and time.monotonic() < end:
-            try:
-                data += s.recv(512)
-            except socket.timeout:
-                break
-    assert b'login' in data, f'no login prompt: {data[-80:]!r}'
-    return 'telnet login prompt on 2323, SSH closed'
-record('telnet-port', telnet_port)
-
-
-def web_port():
-    board('web-server port 8080; web-server on')
-    assert wait_listening(8080), 'nothing on 8080'
-    with urllib.request.urlopen(f'http://{ip}:8080/', timeout=20) as r:
-        assert r.status == 200, r.status
-    board('web-server off; web-server port default')
-    assert wait_listening(8080, want=False), '8080 still open after web-server off'
-    return 'page served on 8080, closed again'
-record('web-server-port', web_port)
 
 
 def restore():

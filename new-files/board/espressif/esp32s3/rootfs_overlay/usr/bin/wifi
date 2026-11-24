@@ -1,11 +1,57 @@
 #!/bin/sh
 
-IFACE=espsta0
+IFACE=wlan0
 CONF=/etc/wpa_supplicant.conf
 WPALOG=/run/wpa_supplicant.log
 CONNECT_WAIT=${CONNECT_WAIT:-20}
+STATE=${WIFI_STATE:-/etc/default/wifi}
+BOOT=${WIFI_BOOT:-/usr/sbin/wifi-boot}
 TAB=$(printf '\t')
 NL=$(printf '\nx'); NL=${NL%x}
+
+save_power() {
+	local tmp
+	grep -qx "WIFI_RADIO_ENABLE=$1" "$STATE" 2>/dev/null && return 0
+	tmp=$(mktemp "$STATE.new.XXXXXX") || return 1
+	if [ -f "$STATE" ]; then
+		cp -p "$STATE" "$tmp" || { rm -f "$tmp"; return 1; }
+		awk '!/^[[:space:]]*WIFI_RADIO_ENABLE=/' "$STATE" > "$tmp" || {
+			rm -f "$tmp"; return 1;
+		}
+	fi
+	printf 'WIFI_RADIO_ENABLE=%s\n' "$1" >> "$tmp" || { rm -f "$tmp"; return 1; }
+	mv "$tmp" "$STATE" || { rm -f "$tmp"; return 1; }
+	sync
+}
+
+enable_radio() {
+	save_power 1 || return 1
+	[ ! -d "/sys/class/net/$IFACE" ] || return 0
+	"$BOOT"
+}
+
+saved_network() {
+	[ -r "$CONF" ] && grep -Eq '^[[:space:]]*network[[:space:]]*=[[:space:]]*\{' "$CONF"
+}
+
+resume_or_select() {
+	enable_radio || return 1
+	if iw dev "$IFACE" link 2>/dev/null | grep -q 'Connected to'; then
+		status
+	elif saved_network; then
+		apply_conf 'saved network'
+	else
+		interactive
+	fi
+}
+
+disable_radio() {
+	# Persist before bringing down the SSH transport carrying this command.
+	save_power 0 || return 1
+	link_down
+	ip link set "$IFACE" down 2>/dev/null || true
+	echo 'Wi-Fi off; stays off across boots until wifi on or wifi.'
+}
 
 wrong_key() {
 	grep -q 'reason=WRONG_KEY' "$WPALOG" 2>/dev/null
@@ -47,8 +93,10 @@ scan_list() {
 
 # A quote, a backslash or a newline in one of these values would end the
 # quoted string and let the rest be read as wpa_supplicant directives. The
-# BLE provisioning dialog feeds this function whatever the phone sent, with
-# no authentication, so this check is the boundary.
+# values arrive from whoever is at the console or an SSH session, and an SSID
+# is chosen by whoever runs the network rather than by this board, so neither
+# is trusted to be well formed: this check is the boundary between them and
+# the file.
 reject_unsafe() {
 	case $1 in
 	*\"*|*\\*)
@@ -145,6 +193,7 @@ connect() {
 	else
 		write_conf_open "$SSID" || return 1
 	fi
+	enable_radio || return 1
 	apply_conf "$SSID"
 }
 
@@ -233,10 +282,14 @@ usage: wifi [command]
   wifi connect "SSID"     join an open network
   wifi connect "SSID" PW  join a WPA2 network
   wifi status             show the association and the IP address
-  wifi disconnect         bring the STA link down
+  wifi on                 enable Wi-Fi; join saved network or show the list
+  wifi off                disconnect and remember off across boots
+  wifi disconnect         same as wifi off
 
 The chosen network is stored in /etc/wpa_supplicant.conf (mode 600) and is
-rejoined on every boot. Progress is logged to /var/log/network.log.
+joined automatically when Wi-Fi is enabled. With no saved network, wifi
+shows the picker. Wi-Fi on/off state is remembered across boots.
+Progress is logged to /var/log/network.log.
 EOF
 }
 
@@ -244,11 +297,13 @@ EOF
 [ "${1:-}" = __define_only__ ] && return 0 2>/dev/null
 
 case "${1:-}" in
-"")             interactive ;;
+""|on)          resume_or_select ;;
 scan|list)
+	enable_radio || exit 1
 	# --tsv is the machine-readable form: signal, OPEN or SEC, then the SSID,
-	# separated by tabs. ble-wifi-setup reads that instead of re-parsing the
-	# column layout below, where an SSID with two spaces in it loses one.
+	# separated by tabs. It exists so a caller that wants the list as data
+	# does not have to re-parse the padded column layout below, where an SSID
+	# with two spaces in it loses one.
 	if [ "${2:-}" = --tsv ]; then
 		scan_list
 	else
@@ -257,7 +312,7 @@ scan|list)
 	;;
 connect)        shift; connect "$@" ;;
 status)         status ;;
-disconnect|off) link_down; echo "STA link down." ;;
+disconnect|off) disable_radio ;;
 -h|--help|help) usage ;;
 *)              echo "usage: wifi [scan|connect \"SSID\" [pass]|status|disconnect]" >&2; exit 1 ;;
 esac

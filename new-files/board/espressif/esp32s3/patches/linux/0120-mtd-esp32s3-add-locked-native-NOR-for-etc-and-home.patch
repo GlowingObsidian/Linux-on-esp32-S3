@@ -1,0 +1,886 @@
+diff --git a/drivers/mtd/devices/esp32s3-flash-guard-main.c b/drivers/mtd/devices/esp32s3-flash-guard-main.c
+--- a/drivers/mtd/devices/esp32s3-flash-guard-main.c
++++ b/drivers/mtd/devices/esp32s3-flash-guard-main.c
+@@ -23,6 +23,10 @@
+ 	int last_result;
+ 	bool checked[2], psram_ok;
+ 	u32 setup_before[3], setup_after[3];
++	void __iomem *nor;
++	void *nor_partitions;
++	u32 nor_bytes, nor_entry_offset, nor_jedec, flash_operations;
++	bool nor_id_ok, nor_rw, nor_scratch_ok;
+ };
+ extern const u8 esp32_flash_guard_template_start[];
+ extern const u8 esp32_flash_guard_template_end[];
+@@ -71,7 +75,8 @@
+ 		asm volatile("rsr %0, windowstart" : "=a" (windows));
+ 		writel(windows, &control->windows[cpu]);
+ 	}
+-	ret = entry(control, stack, cpu, cache ? FG_RENDEZVOUS_CYCLES : 120000000);
++	ret = entry(control, stack, cpu, fg->mode == 4 ? 1250000000U :
++		    (cache ? FG_RENDEZVOUS_CYCLES : 120000000));
+ 	if (cache) {
+ 		u32 after_ps;
+ 
+@@ -91,9 +96,9 @@
+ 	ssize_t n;
+ 
+ 	mutex_lock(&fg->lock);
+-	n = sysfs_emit(buf, "runs=%u mode=%u result=%d code_bytes=%u cache_code_bytes=%u cpu0_internal=%u cpu1_internal=%u flash_operations=0 cache_changes=%u cache_stage=%u cache_off_cycles=%u peer_cache_off=%u psram_ok=%u cpu0_status=%u cpu1_status=%u status_acknowledged=%08x\n",
++	n = sysfs_emit(buf, "runs=%u mode=%u result=%d code_bytes=%u cache_code_bytes=%u cpu0_internal=%u cpu1_internal=%u flash_operations=%u cache_changes=%u cache_stage=%u cache_off_cycles=%u peer_cache_off=%u psram_ok=%u cpu0_status=%u cpu1_status=%u status_acknowledged=%08x\n",
+ 		fg->runs, fg->mode, fg->last_result, fg->code_bytes, fg->cache_bytes,
+-		fg->checked[0], fg->checked[1], readl(&c->attempt), readl(&c->stage),
++		fg->checked[0], fg->checked[1], fg->flash_operations, readl(&c->attempt), readl(&c->stage),
+ 		readl(&c->hold_cycles), readl(&c->peer_off), fg->psram_ok,
+ 		readl(&c->result[0]), readl(&c->result[1]), readl(&c->acknowledged));
+ 	mutex_unlock(&fg->lock);
+@@ -151,6 +156,10 @@
+ }
+ static DEVICE_ATTR_RO(cache_live);
+ 
++#ifdef CONFIG_MTD_ESP32S3_NOR
++#include "esp32s3-flash-nor-main.inc"
++#endif
++
+ static ssize_t test_store(struct device *dev, struct device_attribute *attr,
+ 			  const char *buf, size_t count)
+ {
+@@ -159,6 +168,11 @@
+ 	u32 *probe = NULL;
+ 	unsigned int value, cpu, i;
+ 	int ret;
++
++#ifdef CONFIG_MTD_ESP32S3_NOR
++	if (!kstrtouint(buf, 0, &value) && value == 4)
++		return fn_identify_store(dev, buf, count);
++#endif
+ 
+ 	ret = kstrtouint(buf, 0, &value);
+ 	if (ret || (value != 1 && value != 2 && value != 3))
+@@ -257,7 +271,12 @@
+ 
+ static struct attribute *fg_attrs[] = {
+ 	&dev_attr_result.attr, &dev_attr_cache_state.attr,
+-	&dev_attr_cache_live.attr, &dev_attr_test.attr, NULL,
++	&dev_attr_cache_live.attr, &dev_attr_test.attr,
++#ifdef CONFIG_MTD_ESP32S3_NOR
++	&dev_attr_nor_state.attr, &dev_attr_scratch_test.attr,
++	&dev_attr_rw_enable.attr,
++#endif
++	NULL,
+ };
+ static const struct attribute_group fg_group = { .attrs = fg_attrs };
+ 
+@@ -294,6 +313,8 @@
+ 	static_assert(offsetof(struct fg_control, errors_ack) == FGC_ERRORS_ACK);
+ 	static_assert(offsetof(struct fg_control, acknowledged) == FGC_ACKNOWLEDGED);
+ 	static_assert(offsetof(struct fg_control, snapshots) == FGC_SNAPSHOTS);
++	static_assert(offsetof(struct fg_control, nor_task) == FGC_NOR_TASK);
++	static_assert(offsetof(struct fg_control, nor_entry) == FGC_NOR_ENTRY);
+ 	static_assert(sizeof(struct fg_control) == FGC_BYTES);
+ 	static_assert(FG_CONTROL + FGC_BYTES <= FG_STACK(0));
+ 	if (!res || res->start != FG_BASE || resource_size(res) != FG_BYTES)
+@@ -325,6 +346,11 @@
+ 	fg_read_errors(fg, fg->setup_after);
+ 	memset_io(fg->sram + FG_CONTROL, 0, sizeof(struct fg_control));
+ 	platform_set_drvdata(pdev, fg);
++#ifdef CONFIG_MTD_ESP32S3_NOR
++	ret = fn_probe(pdev, fg);
++	if (ret)
++		return ret;
++#endif
+ 	return devm_device_add_group(&pdev->dev, &fg_group);
+ }
+ static const struct of_device_id fg_match[] = {
+diff --git a/drivers/mtd/devices/esp32s3-flash-guard-cache.S b/drivers/mtd/devices/esp32s3-flash-guard-cache.S
+--- a/drivers/mtd/devices/esp32s3-flash-guard-cache.S
++++ b/drivers/mtd/devices/esp32s3-flash-guard-cache.S
+@@ -2,11 +2,18 @@
+ /* Manual non-writing cache gate. Derived from pinned S3 ROM suspend/resume
+  * bodies and IDF's ESP_ROM_HAS_CACHE_SUSPEND_WAITI_BUG workaround.
+  * C masks INTENABLE, spills live windows while caches are on, then calls us.
+- * No windowed calls, tag/MMU changes, or external-memory accesses after entry.
++ * No windowed calls or external-memory accesses after entry. The opt-in
++ * native backend may invoke a separately verified internal call0 routine.
+  * CPU0 alone publishes final. A timed-out peer stays internal until final.
+  * An irrecoverable freeze/restore failure stays internal until user reset.
+  */
+ #include "esp32s3-flash-guard-layout.h"
++
++#ifdef CONFIG_MTD_ESP32S3_NOR
++#define FG_FRAME 64
++#else
++#define FG_FRAME 32
++#endif
+ 
+     .section .text.esp32_flash_cache_template,"ax",@progbits
+     .balign 4
+@@ -159,10 +166,10 @@
+     .endm
+ 
+ esp32_flash_cache_template_start:
+-    entry a1, 32
++    entry a1, FG_FRAME
+     mov a8, a1
+     mov a1, a3
+-    addi a1, a1, -32
++    addi a1, a1, -FG_FRAME
+     s32i a8, a1, 0
+     s32i a0, a1, 4
+     s32i a5, a1, 8
+@@ -328,6 +335,32 @@
+     slli a8, a8, 4
+     bltu a11, a8, .Lhold_minimum
+     s32i a11, a2, FGC_HOLD
++#ifdef CONFIG_MTD_ESP32S3_NOR
++    l32i a7, a2, FGC_NOR_ENTRY
++    beqz a7, .Lnative_done
++    /* A call0 callee owns all general registers. Preserve every live
++     * guard value in this internal frame, including the control pointer. */
++    s32i a2, a1, 20
++    s32i a3, a1, 24
++    s32i a4, a1, 28
++    s32i a12, a1, 32
++    s32i a14, a1, 36
++    l32i a2, a2, FGC_NOR_TASK
++    callx0 a7
++    l32i a2, a1, 20
++    l32i a3, a1, 24
++    l32i a4, a1, 28
++    l32i a12, a1, 32
++    l32i a14, a1, 36
++    l32i a8, a2, FGC_NOR_TASK
++    l32i a7, a8, 16
++    s32i a7, a1, 12
++    l32i a13, a1, 16
++    rsr a11, ccount
++    sub a11, a11, a13
++    s32i a11, a2, FGC_HOLD
++.Lnative_done:
++#endif
+     j .Lrestore
+ .Lrestore_timeout:
+     movi a6, 3
+diff --git a/drivers/mtd/devices/esp32s3-flash-guard-layout.h b/drivers/mtd/devices/esp32s3-flash-guard-layout.h
+--- a/drivers/mtd/devices/esp32s3-flash-guard-layout.h
++++ b/drivers/mtd/devices/esp32s3-flash-guard-layout.h
+@@ -43,7 +43,9 @@
+ #define FGC_ERRORS_ACK 220
+ #define FGC_ACKNOWLEDGED 232
+ #define FGC_SNAPSHOTS 236
+-#define FGC_BYTES 240
++#define FGC_NOR_TASK 240
++#define FGC_NOR_ENTRY 244
++#define FGC_BYTES 248
+ 
+ #ifndef __ASSEMBLER__
+ struct fg_control {
+@@ -54,6 +56,7 @@
+ 	u32 suspended[4], state_off, peer_off;
+ 	u32 ack_request, errors_ack[3], acknowledged;
+ 	u32 snapshots;
++	u32 nor_task, nor_entry;
+ };
+ #endif
+ #endif
+diff --git a/drivers/mtd/devices/esp32s3-flash-nor-main.inc b/drivers/mtd/devices/esp32s3-flash-nor-main.inc
+new file mode 100644
+--- /dev/null
++++ b/drivers/mtd/devices/esp32s3-flash-nor-main.inc
+@@ -0,0 +1,375 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Included by the SRAM guard owner. The read-only root-flash driver remains
++ * unchanged; these two MTDs expose only the validated etc/home intervals. */
++#include <linux/mtd/mtd.h>
++#include "esp32s3-flash-nor.h"
++
++struct fn_partition {
++	struct mtd_info mtd;
++	struct fg_device *fg;
++	u32 offset;
++	u32 users;
++};
++extern const u8 esp32s3_nor_blob_start[], esp32s3_nor_blob_end[];
++extern const u8 esp32s3_nor_entry[];
++
++static int fn_error(u32 status)
++{
++	return !status ? 0 : status == 3 ? -ETIMEDOUT :
++		status == 5 ? -EBUSY : -EIO;
++}
++
++/* Caller holds fg->lock across staging, both-CPU entry and verification. */
++static int fn_execute(struct fg_device *fg, u32 op, u32 address,
++		      u32 length, const u8 *input, u8 *output)
++{
++	struct fg_control __iomem *c = fg->sram + FG_CONTROL;
++	struct fn_task __iomem *t = fg->nor + FN_TASK;
++	u32 probe[16], cpu, i;
++	int ret;
++
++	memset_io(c, 0, sizeof(*c));
++	memset_io(t, 0, sizeof(*t));
++	writel(op, &t->operation);
++	writel(address, &t->address);
++	writel(length, &t->length);
++	writel(FN_TIMEOUT_CYCLES, &t->timeout);
++	writel(fg->nor_jedec, &t->jedec);
++	memset_io(t->data, 0xff, FN_FIFO_BYTES);
++	if (input)
++		memcpy_toio(t->data, input, length);
++	writel(FN_BASE + FN_TASK, &c->nor_task);
++	writel(FN_BASE + FG_ALIAS + fg->nor_entry_offset, &c->nor_entry);
++	for (cpu = 0; cpu < 2; cpu++) {
++		fg->checked[cpu] = false;
++		writel(FG_CANARY, fg->sram + FG_STACK(cpu));
++	}
++	for (i = 0; i < ARRAY_SIZE(probe); i++)
++		WRITE_ONCE(probe[i], 0x5a631c09U ^ (i * 0x314159U));
++	fg->mode = 4;
++	cpus_read_lock();
++	if (num_online_cpus() != 2 || !cpu_online(0) || !cpu_online(1)) {
++		ret = -ENODEV;
++		goto out;
++	}
++	asm volatile("memw\n\tisync" ::: "memory");
++	ret = stop_machine_cpuslocked(fg_cpu, fg, cpu_online_mask);
++	fg->runs++;
++	fg->flash_operations += readl(&t->changed);
++	for (cpu = 0; cpu < 2; cpu++) {
++		u32 sp = readl(&c->sp[cpu]), pc = readl(&c->pc[cpu]);
++		u32 low = FG_BASE + FG_STACK(cpu);
++		pc = (pc & 0x3fffffff) | (fg->iram & 0xc0000000);
++		fg->checked[cpu] = readl(&c->ready[cpu]) == 1 &&
++			sp >= low + 64 && sp < low + FG_STACK_BYTES &&
++			pc >= fg->iram + FG_CACHE_CODE &&
++			pc < fg->iram + FG_CACHE_CODE + fg->cache_bytes &&
++			readl(fg->sram + FG_STACK(cpu)) == FG_CANARY;
++		if (!ret && !fg->checked[cpu])
++			ret = -EIO;
++		if (!ret)
++			ret = fn_error(readl(&c->result[cpu]));
++	}
++	fg->psram_ok = true;
++	for (i = 0; i < ARRAY_SIZE(probe); i++)
++		if (READ_ONCE(probe[i]) != (0x5a631c09U ^ (i * 0x314159U)))
++			fg->psram_ok = false;
++	if (!ret && (!fg->psram_ok || readl(&c->stage) != 5 ||
++	    readl(&c->peer_off) != 1 || readl(&c->irq_off[0]) ||
++	    readl(&c->irq_off[1]) || readl(&c->nmi[0]) || readl(&c->nmi[1])))
++		ret = -EIO;
++	for (i = 0; i < 3; i++)
++		if (!ret && (readl(&c->errors_before[i]) || readl(&c->errors_after[i])))
++			ret = -EIO;
++	if (!ret)
++		ret = fn_error(readl(&t->result));
++	if (!ret && !readl(&t->restored))
++		ret = -EIO;
++	if (!ret && readl(&t->changed) && readl(&t->cache_syncs) != 2)
++		ret = -EIO;
++	if (!ret && op == FN_IDENTIFY) {
++		fg->nor_jedec = readl(&t->jedec);
++		fg->nor_id_ok = fg->nor_jedec == 0xef4018;
++	}
++	if (!ret && output)
++		memcpy_fromio(output, t->data, length);
++out:
++	cpus_read_unlock();
++	fg->last_result = ret;
++	if (ret && readl(&t->changed))
++		fg->nor_rw = false;
++	return ret;
++}
++
++static int fn_read(struct mtd_info *mtd, loff_t from, size_t length,
++		   size_t *retlen, u_char *buffer)
++{
++	struct fn_partition *p = container_of(mtd, struct fn_partition, mtd);
++	*retlen = 0;
++	if (from < 0 || from > mtd->size || length > mtd->size - from)
++		return -EINVAL;
++	mutex_lock(&p->fg->lock);
++	memcpy(buffer, (const void *)(0x42000000UL + p->offset + (unsigned long)from), length);
++	*retlen = length;
++	mutex_unlock(&p->fg->lock);
++	return 0;
++}
++
++static int fn_program(struct fg_device *fg, u32 address, size_t length,
++		      const u8 *buffer, size_t *retlen)
++{
++	u8 verify[FN_FIFO_BYTES];
++	int ret;
++	*retlen = 0;
++	while (length) {
++		size_t chunk = min_t(size_t, length, FN_FIFO_BYTES);
++		u32 i;
++		chunk = min_t(size_t, chunk, 256 - (address & 255));
++		for (i = 0; i < chunk; i++) {
++			u8 old = READ_ONCE(*(const u8 *)(0x42000000UL + address + i));
++			if ((~old & buffer[i]) != 0)
++				return -EINVAL;
++		}
++		ret = fn_execute(fg, FN_PROGRAM, address, chunk, buffer, NULL);
++		if (ret)
++			return ret;
++		/* Check independent SPI1 readback and the invalidated XIP alias. */
++		ret = fn_execute(fg, FN_READ, address, chunk, NULL, verify);
++		if (ret || memcmp(buffer, verify, chunk) ||
++		    memcmp(buffer, (const void *)(0x42000000UL + address), chunk)) {
++			fg->nor_rw = false;
++			return ret ? ret : -EIO;
++		}
++		address += chunk;
++		buffer += chunk;
++		length -= chunk;
++		*retlen += chunk;
++	}
++	return 0;
++}
++
++static int fn_write(struct mtd_info *mtd, loff_t to, size_t length,
++		    size_t *retlen, const u_char *buffer)
++{
++	struct fn_partition *p = container_of(mtd, struct fn_partition, mtd);
++	int ret;
++	*retlen = 0;
++	if (to < 0 || to > mtd->size || length > mtd->size - to)
++		return -EINVAL;
++	mutex_lock(&p->fg->lock);
++	ret = p->fg->nor_rw ? fn_program(p->fg, p->offset + to, length, buffer, retlen) : -EROFS;
++	mutex_unlock(&p->fg->lock);
++	return ret;
++}
++
++static int fn_erased(u32 address)
++{
++	u32 i;
++	const u32 *data = (const void *)(0x42000000UL + address);
++	for (i = 0; i < FN_ERASE_BYTES / sizeof(*data); i++)
++		if (READ_ONCE(data[i]) != 0xffffffffU)
++			return -EIO;
++	return 0;
++}
++
++static int fn_erase(struct mtd_info *mtd, struct erase_info *info)
++{
++	struct fn_partition *p = container_of(mtd, struct fn_partition, mtd);
++	u64 off;
++	int ret = 0;
++	if (info->addr > mtd->size || info->len > mtd->size - info->addr ||
++	    (info->addr | info->len) & (FN_ERASE_BYTES - 1))
++		return -EINVAL;
++	mutex_lock(&p->fg->lock);
++	if (!p->fg->nor_rw) {
++		ret = -EROFS;
++		goto out;
++	}
++	for (off = info->addr; off < info->addr + info->len; off += FN_ERASE_BYTES) {
++		ret = fn_execute(p->fg, FN_ERASE, p->offset + off, 0, NULL, NULL);
++		if (!ret)
++			ret = fn_erased(p->offset + off);
++		if (ret) {
++			info->fail_addr = off;
++			p->fg->nor_rw = false;
++			break;
++		}
++	}
++out:
++	mutex_unlock(&p->fg->lock);
++	return ret;
++}
++
++static ssize_t fn_identify_store(struct device *dev, const char *buf, size_t count)
++{
++	struct fg_device *fg = dev_get_drvdata(dev);
++	int ret;
++	mutex_lock(&fg->lock);
++	fg->nor_id_ok = false;
++	ret = fn_execute(fg, FN_IDENTIFY, 0, 0, NULL, NULL);
++	mutex_unlock(&fg->lock);
++	if (!ret)
++		dev_info(dev, "SPI1 read-only identification: JEDEC=%06x supported=%u; writes locked=%u\n",
++			fg->nor_jedec, fg->nor_id_ok, !fg->nor_rw);
++	return ret ? ret : count;
++}
++
++static ssize_t nor_state_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct fg_device *fg = dev_get_drvdata(dev);
++	struct fn_task __iomem *t = fg->nor + FN_TASK;
++	ssize_t ret;
++	mutex_lock(&fg->lock);
++	ret = sysfs_emit(buf, "jedec=%06x supported=%u scratch_passed=%u rw_enabled=%u flash_operations=%u operation=%u address=%08x length=%u result=%u commands=%u changed=%u cache_syncs=%u spi_restored=%u status_before=%02x status_after=%02x code_bytes=%u\n",
++		fg->nor_jedec, fg->nor_id_ok, fg->nor_scratch_ok, fg->nor_rw,
++		fg->flash_operations, readl(&t->operation), readl(&t->address),
++		readl(&t->length), readl(&t->result), readl(&t->commands),
++		readl(&t->changed), readl(&t->cache_syncs), readl(&t->restored),
++		readl(&t->status_before), readl(&t->status_after), fg->nor_bytes);
++	mutex_unlock(&fg->lock);
++	return ret;
++}
++static DEVICE_ATTR_RO(nor_state);
++
++static ssize_t scratch_test_store(struct device *dev, struct device_attribute *attr,
++				 const char *buf, size_t count)
++{
++	struct fg_device *fg = dev_get_drvdata(dev);
++	struct fn_partition *part = fg->nor_partitions;
++	u8 pattern[FN_FIFO_BYTES];
++	u32 address, i;
++	size_t written;
++	int ret = kstrtou32(buf, 0, &address);
++	if (ret || address != FN_SCRATCH)
++		return -EINVAL;
++	mutex_lock(&fg->lock);
++	fg->nor_scratch_ok = false;
++	if (!fg->nor_id_ok || fg->nor_rw || part[0].users || part[1].users) {
++		ret = -EBUSY;
++		goto out;
++	}
++	/* Explicitly destructive manual gate. Operator backs up this exact
++	 * 64-KiB interval before requesting it; never run during probe/boot. */
++	ret = fn_execute(fg, FN_ERASE, address, 0, NULL, NULL);
++	if (!ret)
++		ret = fn_erased(address);
++	for (i = 0; i < sizeof(pattern); i++)
++		pattern[i] = (i * 37U) ^ 0xa5;
++	if (!ret)
++		ret = fn_program(fg, address + 1, sizeof(pattern), pattern, &written);
++	if (!ret)
++		ret = fn_program(fg, address + 0xf0, sizeof(pattern), pattern, &written);
++	if (!ret)
++		ret = fn_execute(fg, FN_ERASE, address, 0, NULL, NULL);
++	if (!ret)
++		ret = fn_erased(address);
++	fg->nor_scratch_ok = !ret;
++out:
++	mutex_unlock(&fg->lock);
++	dev_info(dev, "manual NOR scratch at %08x: result=%d; rw remains locked\n", address, ret);
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_WO(scratch_test);
++
++static ssize_t rw_enable_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct fg_device *fg = dev_get_drvdata(dev);
++	return sysfs_emit(buf, "%u\n", READ_ONCE(fg->nor_rw));
++}
++
++static ssize_t rw_enable_store(struct device *dev, struct device_attribute *attr,
++			      const char *buf, size_t count)
++{
++	struct fg_device *fg = dev_get_drvdata(dev);
++	int ret = 0;
++	mutex_lock(&fg->lock);
++	if (sysfs_streq(buf, "0"))
++		fg->nor_rw = false;
++	else if (fg->nor_id_ok && ((sysfs_streq(buf, "1") && fg->nor_scratch_ok) ||
++		 sysfs_streq(buf, "resume")))
++		fg->nor_rw = true;
++	else
++		ret = -EPERM;
++	mutex_unlock(&fg->lock);
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_RW(rw_enable);
++
++static int fn_get_device(struct mtd_info *mtd)
++{
++	struct fn_partition *p = container_of(mtd, struct fn_partition, mtd);
++	mutex_lock(&p->fg->lock);
++	p->users++;
++	mutex_unlock(&p->fg->lock);
++	return 0;
++}
++
++static void fn_put_device(struct mtd_info *mtd)
++{
++	struct fn_partition *p = container_of(mtd, struct fn_partition, mtd);
++	mutex_lock(&p->fg->lock);
++	if (p->users)
++		p->users--;
++	mutex_unlock(&p->fg->lock);
++}
++
++static void fn_unregister(void *data)
++{
++	struct fn_partition *part = data;
++	mtd_device_unregister(&part[1].mtd);
++	mtd_device_unregister(&part[0].mtd);
++}
++
++static int fn_probe(struct platform_device *pdev, struct fg_device *fg)
++{
++	struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++	struct fn_partition *part;
++	u32 i;
++	int ret;
++	static_assert(FN_TASK + sizeof(struct fn_task) <= FN_BYTES);
++	if (!res || res->start != FN_BASE || resource_size(res) != FN_BYTES)
++		return -EINVAL;
++	fg->nor = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(fg->nor))
++		return PTR_ERR(fg->nor);
++	fg->nor_bytes = esp32s3_nor_blob_end - esp32s3_nor_blob_start;
++	fg->nor_entry_offset = esp32s3_nor_entry - esp32s3_nor_blob_start;
++	if (!fg->nor_bytes || fg->nor_bytes > FN_TASK || fg->nor_entry_offset >= fg->nor_bytes)
++		return -E2BIG;
++	memcpy_toio(fg->nor, esp32s3_nor_blob_start, fg->nor_bytes);
++	for (i = 0; i < fg->nor_bytes; i++)
++		if (readb(fg->nor + i) != esp32s3_nor_blob_start[i])
++			return -EIO;
++	asm volatile("memw\n\tisync" ::: "memory");
++	memset_io(fg->nor + FN_TASK, 0, sizeof(struct fn_task));
++	part = devm_kcalloc(&pdev->dev, 2, sizeof(*part), GFP_KERNEL);
++	if (!part)
++		return -ENOMEM;
++	fg->nor_partitions = part;
++	for (i = 0; i < 2; i++) {
++		struct mtd_info *mtd = &part[i].mtd;
++		part[i].fg = fg;
++		part[i].offset = i ? FN_HOME_BASE : FN_ETC_BASE;
++		mtd->name = i ? "home" : "etc";
++		mtd->size = i ? FN_HOME_BYTES : FN_ETC_BYTES;
++		mtd->type = MTD_NORFLASH;
++		mtd->flags = MTD_CAP_NORFLASH;
++		mtd->erasesize = FN_ERASE_BYTES;
++		mtd->writesize = 1;
++		mtd->writebufsize = FN_FIFO_BYTES;
++		mtd->owner = THIS_MODULE;
++		mtd->dev.parent = &pdev->dev;
++		mtd->_read = fn_read;
++		mtd->_write = fn_write;
++		mtd->_erase = fn_erase;
++		mtd->_get_device = fn_get_device;
++		mtd->_put_device = fn_put_device;
++		ret = mtd_device_register(mtd, NULL, 0);
++		if (ret) {
++			if (i)
++				mtd_device_unregister(&part[0].mtd);
++			return ret;
++		}
++	}
++	return devm_add_action_or_reset(&pdev->dev, fn_unregister, part);
++}
+diff --git a/drivers/mtd/devices/esp32s3-flash-nor-ll.c b/drivers/mtd/devices/esp32s3-flash-nor-ll.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/mtd/devices/esp32s3-flash-nor-ll.c
+@@ -0,0 +1,251 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Native SPI1 transactions, derived from the pinned ESP32-S3 SPIMEM LL.
++ * Compiled with call0 ABI, text-section literals and no external calls.
++ * Only this object executes while flash is busy. Its argument, code,
++ * constants and stack must all reside in explicitly owned SRAM1.
++ */
++#include "esp32s3-flash-nor.h"
++
++#define INLINE static __attribute__((always_inline)) inline
++#define SPI1 0x60002000U
++#define SPI0 0x60003000U
++#define EXTMEM 0x600c4000U
++#define USR (1U << 18)
++#define COMMAND (1U << 31)
++#define ADDRESS (1U << 30)
++#define MISO (1U << 28)
++#define MOSI (1U << 27)
++#define CS_HOLD_SETUP ((1U << 6) | (1U << 7))
++
++INLINE fn_u32 rd(fn_u32 address)
++{
++	fn_u32 value;
++	__asm__ volatile("memw" ::: "memory");
++	value = *(volatile fn_u32 *)(__UINTPTR_TYPE__)address;
++	__asm__ volatile("memw" ::: "memory");
++	return value;
++}
++
++INLINE void wr(fn_u32 address, fn_u32 value)
++{
++	__asm__ volatile("memw" ::: "memory");
++	*(volatile fn_u32 *)(__UINTPTR_TYPE__)address = value;
++	__asm__ volatile("memw" ::: "memory");
++}
++
++INLINE fn_u32 cycles(void)
++{
++	fn_u32 value;
++	__asm__ volatile("rsr %0, ccount" : "=a"(value));
++	return value;
++}
++
++INLINE void park(void)
++{
++	/* A busy controller/flash cannot safely release either CPU into XIP. */
++	for (;;)
++		__asm__ volatile("memw" ::: "memory");
++}
++
++INLINE fn_u32 transact(struct fn_task *t, fn_u32 command,
++			 fn_u32 address_bits, fn_u32 input, fn_u32 output)
++{
++	fn_u32 start = cycles();
++	fn_u32 user = COMMAND | CS_HOLD_SETUP;
++	if (address_bits)
++		user |= ADDRESS;
++	if (input)
++		user |= MISO;
++	if (output)
++		user |= MOSI;
++	wr(SPI1 + 0x18, user);
++	wr(SPI1 + 0x1c, address_bits ? (address_bits - 1) << 26 : 0);
++	wr(SPI1 + 0x20, (7U << 28) | command);
++	wr(SPI1 + 0x24, output ? output * 8 - 1 : 0);
++	wr(SPI1 + 0x28, input ? input * 8 - 1 : 0);
++	wr(SPI1, USR);
++	t->commands++;
++	while (rd(SPI1)) {
++		if ((fn_u32)(cycles() - start) >= FN_COMMAND_CYCLES) {
++			t->result = 3;
++			park();
++		}
++	}
++	return rd(SPI1 + 0x58);
++}
++
++INLINE fn_u32 status(struct fn_task *t)
++{
++	return transact(t, 0x05, 0, 1, 0) & 0xff;
++}
++
++INLINE void wait_ready(struct fn_task *t, fn_u32 start)
++{
++	while (status(t) & 1) {
++		if ((fn_u32)(cycles() - start) >= t->timeout) {
++			t->result = 3;
++			park();
++		}
++	}
++}
++
++INLINE int allowed(fn_u32 address, fn_u32 length)
++{
++	return length &&
++		((address >= FN_ETC_BASE && address < FN_ETC_BASE + FN_ETC_BYTES &&
++		  length <= FN_ETC_BASE + FN_ETC_BYTES - address) ||
++		 (address >= FN_HOME_BASE && address < FN_HOME_BASE + FN_HOME_BYTES &&
++		  length <= FN_HOME_BASE + FN_HOME_BYTES - address));
++}
++
++INLINE fn_u32 saved_offset(fn_u32 i)
++{
++	if (i < 2)
++		return 4 + i * 4;
++	if (i < 9)
++		return (i + 2) * 4;
++	if (i < 11)
++		return 0x34 + (i - 9) * 8;
++	return i == 11 ? 0xa8 : 0xe0;
++}
++
++INLINE void invalidate(struct fn_task *t, fn_u32 ctrl, fn_u32 address,
++			fn_u32 bytes, fn_u32 line_shift, fn_u32 done)
++{
++	fn_u32 addr_reg = EXTMEM + ctrl + 4;
++	fn_u32 size_reg = EXTMEM + ctrl + 8;
++	fn_u32 old_addr = rd(addr_reg), old_size = rd(size_reg);
++	fn_u32 mask = (1U << line_shift) - 1;
++	fn_u32 count = (bytes + (address & mask) + mask) >> line_shift;
++	fn_u32 start = cycles();
++	wr(addr_reg, address & ~mask);
++	wr(size_reg, count);
++	wr(EXTMEM + ctrl, 1);
++	while (!(rd(EXTMEM + ctrl) & done)) {
++		if ((fn_u32)(cycles() - start) >= FN_COMMAND_CYCLES) {
++			t->result = 3;
++			park();
++		}
++	}
++	wr(EXTMEM + ctrl, 0);
++	wr(addr_reg, old_addr);
++	wr(size_reg, old_size);
++	t->cache_syncs++;
++}
++
++/* Labels bracket the literal pool as well as the function. Verify the
++ * final linked range and every literal/call before copying it to SRAM. */
++__asm__(".section .text.esp32s3_nor_template,\"ax\",@progbits\n"
++	".balign 4\n.global esp32s3_nor_blob_start\n"
++	"esp32s3_nor_blob_start:\n.previous\n");
++
++__attribute__((__noinline__, __section__(".text.esp32s3_nor_template")))
++void esp32s3_nor_entry(struct fn_task *t)
++{
++	/* All saved registers are on the caller's internal call0 stack. */
++	fn_u32 save[13], i, start, sr, sr2;
++	t->result = 5;
++	if (t->operation < FN_IDENTIFY || t->operation > FN_ERASE ||
++	    !t->timeout || t->timeout > FN_TIMEOUT_CYCLES)
++		return;
++	if (t->operation != FN_IDENTIFY &&
++	    (!allowed(t->address, t->operation == FN_ERASE ? FN_ERASE_BYTES : t->length) ||
++	     (t->operation == FN_ERASE ? (t->address & (FN_ERASE_BYTES - 1)) :
++	      (!t->length || t->length > FN_FIFO_BYTES ||
++	       (t->operation == FN_PROGRAM && (t->address & 255) + t->length > 256)))))
++		return;
++	/* This port uses single-command STR flash, CS0, with octal PSRAM on
++	 * SPI0. Reject unsupported flash DDR/OPI instead of changing chip mode. */
++	if (rd(SPI1) || rd(SPI0) || (rd(SPI0 + 0x54) & 7) ||
++	    (rd(SPI1 + 0x54) & 7) || (rd(SPI0 + 0xe0) & 1) ||
++	    (rd(SPI0 + 0x08) & 0x270U) ||
++	    (rd(SPI1 + 0xa0) & 1) || (rd(SPI1 + 0x98) & 1) ||
++	    (rd(EXTMEM + 0x88) & 1) || (rd(EXTMEM + 0x28) & 7) ||
++	    ((rd(EXTMEM) >> 3) & 3) > 2)
++		return;
++	for (i = 0; i < 13; i++)
++		save[i] = rd(SPI1 + saved_offset(i));
++	/* SPI1 only. Leave SPI0 clock, PSRAM timing, pins and cache MMU alone. */
++	wr(SPI1 + 0x08, 0);
++	wr(SPI1 + 0x10, (save[2] & ~0x3fffU) | 1U | (1U << 7));
++	wr(SPI1 + 0x14, 23U | (11U << 8) | (23U << 16));
++	wr(SPI1 + 0x34, (save[9] & ~0xc03U) | 2U);
++	wr(SPI1 + 0x3c, save[10] & 1U);
++	wr(SPI1 + 0xa8, save[11] & ~(7U << 2));
++	wr(SPI1 + 0xe0, save[12] & ~1U);
++	start = cycles();
++	wait_ready(t, start);
++	sr = status(t);
++	t->status_before = sr;
++	if (sr & 2)
++		goto restore;
++	if (t->operation == FN_IDENTIFY) {
++		fn_u32 id = transact(t, 0x9f, 0, 3, 0);
++		fn_u32 manufacturer, capacity;
++		__asm__ volatile("extui %0, %1, 0, 8" : "=a"(manufacturer) : "a"(id));
++		__asm__ volatile("extui %0, %1, 16, 8" : "=a"(capacity) : "a"(id));
++		t->jedec = (manufacturer << 16) | (id & 0xff00) | capacity;
++		t->result = 0;
++		goto restore;
++	}
++	if (t->jedec != 0xef4018U)
++		goto restore;
++	if (t->operation == FN_READ) {
++		wr(SPI1 + 0x04, t->address);
++		transact(t, 0x03, 24, t->length, 0);
++		for (i = 0; i < (t->length + 3) / 4; i++)
++			t->data[i] = rd(SPI1 + 0x58 + i * 4);
++		t->result = 0;
++		goto restore;
++	}
++	sr2 = transact(t, 0x35, 0, 1, 0) & 0xff;
++	/* Never clear protection bits or change QE/calibration configuration. */
++	if ((sr & 0x7c) || (sr2 & 0x40))
++		goto restore;
++	transact(t, 0x06, 0, 0, 0);
++	if ((status(t) & 3) != 2)
++		goto disable;
++	wr(SPI1 + 0x04, t->address);
++	if (t->operation == FN_PROGRAM) {
++		for (i = 0; i < (t->length + 3) / 4; i++)
++			wr(SPI1 + 0x58 + i * 4, t->data[i]);
++		t->changed = 1;
++		transact(t, 0x02, 24, 0, t->length);
++	} else {
++		t->changed = 1;
++		transact(t, 0xd8, 24, 0, 0);
++	}
++	start = cycles();
++	wait_ready(t, start);
++	t->status_after = status(t);
++	if (!(t->status_after & 3))
++		t->result = 0;
++disable:
++	transact(t, 0x04, 0, 0, 0);
++	if (status(t) & 3) {
++		t->result = 6;
++		park();
++	}
++restore:
++	if (t->changed) {
++		fn_u32 bytes = t->operation == FN_ERASE ? FN_ERASE_BYTES : t->length;
++		/* Public S3 register definitions use cache-line counts. Invalidate
++		 * only the two flash aliases; preserve every dirty PSRAM line. */
++		invalidate(t, 0x88, 0x42000000U + t->address, bytes,
++			   4 + ((rd(EXTMEM + 0x60) >> 3) & 1), 2);
++		invalidate(t, 0x28, 0x3c000000U + t->address, bytes,
++			   4 + ((rd(EXTMEM) >> 3) & 3), 8);
++	}
++	for (i = 0; i < 13; i++)
++		wr(SPI1 + saved_offset(i), save[i]);
++	for (i = 0; i < 13; i++) {
++		if (rd(SPI1 + saved_offset(i)) != save[i]) {
++			t->result = 6;
++			park();
++		}
++	}
++	t->restored = 1;
++}
++
++__asm__(".section .text.esp32s3_nor_template,\"ax\",@progbits\n"
++	".global esp32s3_nor_blob_end\nesp32s3_nor_blob_end:\n.previous\n");
+diff --git a/drivers/mtd/devices/esp32s3-flash-nor.h b/drivers/mtd/devices/esp32s3-flash-nor.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/mtd/devices/esp32s3-flash-nor.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef ESP32S3_FLASH_NOR_H
++#define ESP32S3_FLASH_NOR_H
++
++/* Additional SRAM1, immediately below the already tested guard. */
++#define FN_BASE 0x3fcc7000
++#define FN_BYTES 0x1000
++#define FN_TASK 0xf00
++#define FN_FIFO_BYTES 64
++#define FN_TIMEOUT_CYCLES 1200000000U
++#define FN_COMMAND_CYCLES 240000U
++#define FN_SCRATCH 0x00ff0000U
++#define FN_ERASE_BYTES 0x10000U
++#define FN_ETC_BASE 0x000d0000U
++#define FN_ETC_BYTES 0x00070000U
++#define FN_HOME_BASE 0x00c00000U
++#define FN_HOME_BYTES 0x00400000U
++#define FN_IDENTIFY 1U
++#define FN_READ 2U
++#define FN_PROGRAM 3U
++#define FN_ERASE 4U
++
++/* Independent of kernel headers: the cache-off object uses call0 ABI. */
++typedef __UINT32_TYPE__ fn_u32;
++struct fn_task {
++	fn_u32 operation, address, length, timeout;
++	fn_u32 result, jedec, status_before, status_after;
++	fn_u32 commands, changed, cache_syncs, restored;
++	fn_u32 data[FN_FIFO_BYTES / 4];
++};
++
++#endif
+diff --git a/drivers/mtd/devices/Kconfig b/drivers/mtd/devices/Kconfig
+--- a/drivers/mtd/devices/Kconfig
++++ b/drivers/mtd/devices/Kconfig
+@@ -237,3 +237,14 @@
+ 	  programming or erase. Mode 3 additionally acknowledges only a saved
+ 	  CPU0 IBUS-write status latch (0x02), then requires a clean readback.
+ 	  Cache tests are manual. Development hardware gate.
++
++config MTD_ESP32S3_NOR
++	bool "ESP32-S3 guarded native etc/home NOR backend"
++	depends on MTD_ESP32_FLASH_GUARD_TEST
++	default n
++	help
++	  Linux-owned bounded SPI1 commands on SRAM stacks, with both CPUs
++	  stopped and caches suspended. Exposes only etc/home as raw NOR.
++	  Writes start locked. The manual scratch gate erases exactly the
++	  explicitly requested last 64-KiB home block; back it up first.
++	  No automatic erase, protection changes, NVS or IDF flash server.
+diff --git a/drivers/mtd/devices/Makefile b/drivers/mtd/devices/Makefile
+--- a/drivers/mtd/devices/Makefile
++++ b/drivers/mtd/devices/Makefile
+@@ -25,3 +25,6 @@
+ 
+ obj-$(CONFIG_MTD_ESP32_FLASH_GUARD_TEST) += esp32s3-flash-guard-test.o
+ esp32s3-flash-guard-test-y := esp32s3-flash-guard-main.o esp32s3-flash-guard-template.o esp32s3-flash-guard-cache.o
++
++esp32s3-flash-guard-test-$(CONFIG_MTD_ESP32S3_NOR) += esp32s3-flash-nor-ll.o
++CFLAGS_esp32s3-flash-nor-ll.o += -Os -mabi=call0 -mno-fdpic -mtext-section-literals -fno-toplevel-reorder -fno-jump-tables -fno-stack-protector -ffreestanding -fno-builtin -fno-unwind-tables -fno-asynchronous-unwind-tables

@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "arduino-nano-esp32-hybrid-wifi.dts"
+
+/ {
+	/* TRM4.3.2: SRAM1 is directly accessible on both buses, unlike
+	 * cache-owned SRAM0/2. Keep below the independent SPI/Wi-Fi regions.
+	 * This experimental reservation needs runtime hardware verification.
+	 */
+	flash-guard@3fcc8000 {
+		compatible = "espressif,esp32s3-flash-guard-test";
+		reg = <0x3fcc8000 0x2000>;
+		status = "okay";
+	};
+};

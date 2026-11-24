@@ -1,0 +1,39 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -2822,7 +2822,12 @@
+ 
+ static uint32_t osi_slowclk_cal_get(void)
+ {
+-	return 0;
++	/* Same Q19 -> Q12 conversion as NuttX's S3 adapter. The XTAL
++	 * selection feeds a divided 1 MHz low-power clock, hence 1us/tick.
++	 */
++	if (readl((void __iomem *)0x600c002c) & BIT(26))
++		return 1U << 12;
++	return readl((void __iomem *)0x60008054) >> 7;
+ }
+ 
+ static bool osi_env_is_chip(void)
+@@ -4107,6 +4112,22 @@
+ 		return -EBUSY;
+ 	hw->blob_started = true;
+ 
++	/* IDF/NuttX HAL power-domain-on sequence, before installing any
++	 * coexistence/radio state. Linux owns the radio and has no BT user.
++	 * Preserve unrelated RTC and reset bits.
++	 */
++	{
++		u32 v = readl((void __iomem *)0x60008090);
++		u32 reset = readl(ESP32_SYSTEM_REG(SYSTEM_WIFI_RST_EN_REG));
++
++		writel(v & ~BIT(17), (void __iomem *)0x60008090);
++		writel(reset | 0x2a1f, ESP32_SYSTEM_REG(SYSTEM_WIFI_RST_EN_REG));
++		udelay(10);
++		writel(reset & ~0x2a1f, ESP32_SYSTEM_REG(SYSTEM_WIFI_RST_EN_REG));
++		v = readl((void __iomem *)0x60008094);
++		writel(v & ~BIT(28), (void __iomem *)0x60008094);
++	}
++
+ 	memset(&cfg, 0, sizeof(cfg));
+ 	cfg.osi_funcs = &g_osi_funcs;
+ 	cfg.wpa_crypto_funcs.size = WPA_CRYPTO_FUNCS_SIZE;

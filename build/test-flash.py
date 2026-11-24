@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
+import csv
 import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -23,11 +25,17 @@ class FlashTests(unittest.TestCase):
         self.table = self.root / TABLE
         self.table.parent.mkdir(parents=True)
         shutil.copy2(REPO / TABLE, self.table)
-        shutil.copy2(REPO / 'images/partition-table.bin', self.images)
+        entries = b''
+        for name, kind, subtype, offset, size in csv.reader(self.table.read_text().splitlines()):
+            code = {'app': 0, '0x40': 0x40}[kind.strip()]
+            entry = 0 if subtype.strip() == 'factory' else int(subtype, 0)
+            entries += struct.pack('<HBBII16sI', 0x50aa, code, entry,
+                                   int(offset, 0), int(size, 0), name.strip().encode(), 0)
+        (self.images / 'partition-table.bin').write_bytes(entries.ljust(3072, b'\xff'))
         for name, size in {
             'bootloader.bin': 4096, 'network_adapter.bin': 4096,
-            'etc.jffs2': 4096, 'xipImage': 4096, 'rootfs.cramfs': 4096,
-            'home.jffs2': 0x340000, 'linux-esp32s3-native-full.bin': 0x1000000,
+            'xipImage': 4096, 'rootfs.cramfs': 4096,
+            'linux-esp32s3-native-full.bin': 0x1000000,
         }.items():
             with (self.images / name).open('wb') as stream:
                 stream.truncate(size)
@@ -38,6 +46,8 @@ class FlashTests(unittest.TestCase):
         mock.write_text(f'#!{sys.executable}\n' + '''import json, os, sys
 with open(os.environ['FLASH_TEST_LOG'], 'a') as stream:
     stream.write(json.dumps(sys.argv[1:]) + '\\n')
+if 'verify_flash' in sys.argv and os.environ.get('FAIL_VERIFY') == '1':
+    sys.exit(7)
 if 'erase_flash' in sys.argv and os.environ.get('FAIL_ERASE') == '1':
     sys.exit(9)
 if 'write_flash' in sys.argv and os.environ.get('FAIL_WRITE') == '1':
@@ -65,7 +75,7 @@ if 'write_flash' in sys.argv and os.environ.get('FAIL_WRITE') == '1':
         self.assertEqual(len(calls), 1)
         self.assertIn('COM test', calls[0])
         self.assertEqual(calls[0][-2:], ['0x0', str(self.images / 'linux-esp32s3-native-full.bin')])
-        self.assertIn('even without --erase', result.stdout)
+        self.assertIn('full image overwrites everything', result.stdout)
 
     def test_full_erase_then_write(self):
         result, calls = self.run_flash('--erase')
@@ -74,26 +84,25 @@ if 'write_flash' in sys.argv and os.environ.get('FAIL_WRITE') == '1':
         self.assertIn('erase_flash', calls[0])
         self.assertIn('write_flash', calls[1])
 
-    def test_parts_preserve_home_but_write_etc(self):
-        (self.images / 'home.jffs2').unlink()
+    def test_parts_verify_existing_layout_before_write(self):
         result, calls = self.run_flash('--parts')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(calls), 1)
-        self.assertNotIn(str(self.images / 'home.jffs2'), calls[0])
-        self.assertIn(str(self.images / 'etc.jffs2'), calls[0])
-        self.assertIn('preserves /home but overwrites /etc', result.stdout)
-
-    def test_parts_erase_with_paths_containing_spaces(self):
-        result, calls = self.run_flash('--parts', '--erase')
-        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(calls), 2)
-        self.assertIn('erase_flash', calls[0])
-        self.assertEqual(calls[1][-2:], [str(0xcc0000), str(self.images / 'home.jffs2')])
-        self.assertIn('COM test', calls[1])
+        self.assertIn('verify_flash', calls[0])
+        self.assertIn('write_flash', calls[1])
+        self.assertEqual(calls[1][-2:], [str(0x510000), str(self.images / 'rootfs.cramfs')])
+
+    def test_mismatched_board_layout_stops_single_update(self):
+        self.env['FAIL_VERIFY'] = '1'
+        result, calls = self.run_flash('--part', 'rootfs', '--before', 'no_reset')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertIn('verify_flash', calls[0])
+        self.assertIn('no flash was written', result.stderr)
 
     def test_missing_each_part_never_erases(self):
         for name in ('bootloader.bin', 'partition-table.bin', 'network_adapter.bin',
-                     'etc.jffs2', 'xipImage', 'rootfs.cramfs'):
+                     'xipImage', 'rootfs.cramfs'):
             with self.subTest(name=name):
                 path = self.images / name
                 saved = path.with_suffix('.saved')
@@ -137,20 +146,6 @@ if 'write_flash' in sys.argv and os.environ.get('FAIL_WRITE') == '1':
     def test_missing_images_directory_never_accesses_device(self):
         self.reject('--images', str(self.root / 'does not exist'))
 
-    def test_missing_home_writes_the_other_parts(self):
-        (self.images / 'home.jffs2').unlink()
-        result, calls = self.run_flash('--parts', '--erase')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(calls), 2)
-        self.assertIn('erase_flash', calls[0])
-        self.assertIn(str(self.images / 'rootfs.cramfs'), calls[1])
-        self.assertNotIn(str(self.images / 'home.jffs2'), calls[1])
-        self.assertIn('left erased', result.stdout)
-
-    def test_truncated_home_never_erases(self):
-        (self.images / 'home.jffs2').write_bytes(b'bad')
-        self.reject('--parts', '--erase')
-
     def test_missing_csv_never_erases(self):
         self.table.unlink()
         self.reject('--parts', '--erase')
@@ -158,18 +153,21 @@ if 'write_flash' in sys.argv and os.environ.get('FAIL_WRITE') == '1':
     def test_bad_csv_never_erases(self):
         original = self.table.read_text()
         for text in (
-            original.replace('0x00cc0000', 'not-a-number'),
-            original.replace('0x00cc0000', '$(touch injected)'),
-            original.replace('0x00cc0000', '0x00cb0000'),
-            original.replace('0x00cc0000', '0x00cc0001'),
-            original.replace('0x00340000', '0x00350000'),
-            original.replace('0x00340000', '0'),
-            original.replace('0x00340000', '-4096'),
-            original.replace('0x00340000', '0x00330000'),
-            original + original.splitlines()[-1] + '\n',
-            '\n'.join(original.splitlines()[:-1]),
+            original.replace('0x00510000', 'not-a-number'),        # not a number
+            original.replace('0x00510000', '$(touch injected)'),   # injection
+            original.replace('0x00510000', '0x00008000'),          # below 0x9000
+            original.replace('0x00510000', '0x00510001'),          # misaligned offset
+            original.replace('0x00510000', '0x00440000'),          # overlaps rootfs
+            original.replace('0x006f0000', '0x00000000'),          # zero size
+            original.replace('0x006f0000', '-4096'),               # negative size
+            original.replace('0x006f0000', '0x006f0001'),          # misaligned size
+            original.replace('0x006f0000', '0x00c00000'),          # past 16 MiB
+            original + original.splitlines()[-1] + '\n',           # duplicate partition
+            '\n'.join(original.splitlines()[:-1]),                 # missing partition
         ):
             with self.subTest(csv=text):
+                self.assertNotEqual(text, original,
+                                    'mutation is a no-op: the partition table moved')
                 self.table.write_text(text)
                 self.reject('--parts', '--erase')
 

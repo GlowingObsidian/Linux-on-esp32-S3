@@ -13,6 +13,6 @@ if ! patch --force --dry-run -R -p1 < "$task_dir/scheduler.patch" >/dev/null 2>&
     patch --batch --forward -p1 < "$task_dir/scheduler.patch"
 fi
 make -j8 ARCH=xtensa CROSS_COMPILE="$prefix" xipImage 2>&1 | tee "$out_dir/real-bins/kernel-slice-build.log"
-test "$(wc -c < arch/xtensa/boot/xipImage)" -le $((0x400000))
+test "$(wc -c < arch/xtensa/boot/xipImage)" -le $((0x3d0000))
 cp arch/xtensa/boot/xipImage "$out_dir/real-bins/xipImage-fork-slice"
 sha256sum "$out_dir/real-bins/xipImage-fork-slice"

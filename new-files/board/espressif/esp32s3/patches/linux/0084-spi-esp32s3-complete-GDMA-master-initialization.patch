@@ -1,0 +1,161 @@
+From: Shreyan Dey <shreyan@example.com>
+Subject: [PATCH] spi: esp32s3: complete GDMA master initialization
+
+Match NuttX GDMA initialization and SPI master FIFO control. Verify GDMA
+identity after enabling its internal clock, preserve master FIFO flags, and
+report the failed DMA phase and status before resetting on error.
+
+--- a/drivers/spi/spi-esp32.c
++++ b/drivers/spi/spi-esp32.c
+@@ -68,6 +68,7 @@
+ #define SPI_DIN_NUM_REG		0x28
+ #define SPI_DOUT_MODE_REG	0x2c
+ #define SPI_DMA_CONF_REG	0x30
++#define SPI_DMA_MASTER_FLAGS		(BIT(19) | BIT(20))
+ #define SPI_DMA_RX_ENA			BIT(27)
+ #define SPI_DMA_TX_ENA			BIT(28)
+ #define SPI_RX_AFIFO_RST		BIT(29)
+@@ -97,6 +98,10 @@
+  * Bounce buffers and descriptors stay in uncached internal SRAM; Linux RAM
+  * (PSRAM) is never exposed directly to this DMA master.
+  */
++#define GDMA_MISC_CONF  0x3c8
++#define GDMA_CLOCK_EN   BIT(4)
++#define GDMA_DATE       0x40c
++#define GDMA_DATE_VALUE 0x02101180
+ #define GDMA_IN_CONF0  0x000
+ #define GDMA_IN_RAW    0x008
+ #define GDMA_IN_CLR    0x014
+@@ -126,6 +131,7 @@
+ #define GDMA_SRAM_SIZE 0x2040
+ 
+ struct esp32_spi {
++	struct device *dev;
+ 	void __iomem *regs;		/* virt. address of control registers */
+ 	struct clk *clk;		/* bus clock */
+ 	void __iomem *gdma, *dma_sram;
+@@ -162,7 +168,7 @@
+ 	esp32_spi_write(spi, SPI_DMA_CONF_REG,
+ 			SPI_RX_AFIFO_RST |
+ 			SPI_BUF_AFIFO_RST | SPI_DMA_AFIFO_RST);
+-	esp32_spi_write(spi, SPI_DMA_CONF_REG, 0);
++	esp32_spi_write(spi, SPI_DMA_CONF_REG, SPI_DMA_MASTER_FLAGS);
+ }
+ 
+ static int
+@@ -380,11 +386,14 @@
+ 	u8 *rx = t->rx_buf;
+ 	u32 remaining = t->len;
+ 	int ret = 0;
++	const char *phase = "prepare";
++	u32 len = 0;
+ 
+ 	while (remaining) {
+-		u32 len = min_t(u32, remaining, GDMA_MAX_BYTES);
++		u32 chunk = min_t(u32, remaining, GDMA_MAX_BYTES);
+ 		u32 in_raw, out_raw;
+ 
++		len = chunk;
+ 		ret = esp32_spi_prepare_transfer(spi, device, t, len);
+ 		if (ret)
+ 			return ret;
+@@ -392,7 +401,7 @@
+ 		esp32_spi_write(spi, SPI_DMA_CONF_REG,
+ 			SPI_RX_AFIFO_RST | SPI_BUF_AFIFO_RST | SPI_DMA_AFIFO_RST);
+ 		esp32_spi_write(spi, SPI_DMA_CONF_REG,
+-			SPI_DMA_TX_ENA | (rx ? SPI_DMA_RX_ENA : 0));
++			SPI_DMA_MASTER_FLAGS | SPI_DMA_TX_ENA | (rx ? SPI_DMA_RX_ENA : 0));
+ 		if (tx)
+ 			memcpy_toio(spi->dma_sram + GDMA_TX_BUF, tx, len);
+ 		else
+@@ -410,6 +419,7 @@
+ 			       GDMA_IN_START, spi->gdma + GDMA_IN_LINK);
+ 		writel(((spi->dma_phys + GDMA_TX_DESC) & GDMA_LINK_ADDR) |
+ 		       GDMA_OUT_START, spi->gdma + GDMA_OUT_LINK);
++		phase = "SPI start/IRQ";
+ 		ret = esp32_spi_start_transfer(spi);
+ 		if (!ret && !wait_for_completion_timeout(&spi->done, HZ))
+ 			ret = -ETIMEDOUT;
+@@ -418,9 +428,11 @@
+ 		synchronize_irq(spi->irq);
+ 		if (ret)
+ 			goto abort;
++		phase = "SPI done";
+ 		ret = esp32_spi_wait(spi);
+ 		if (ret)
+ 			goto abort;
++		phase = "TX total EOF";
+ 		ret = readl_poll_timeout(spi->gdma + GDMA_OUT_RAW, out_raw,
+ 			out_raw & (GDMA_TX_EOF | GDMA_OUT_ERROR), 1, 1000);
+ 		if (ret || (out_raw & GDMA_OUT_ERROR)) {
+@@ -428,12 +440,14 @@
+ 			goto abort;
+ 		}
+ 		if (rx) {
++			phase = "RX EOF";
+ 			ret = readl_poll_timeout(spi->gdma + GDMA_IN_RAW, in_raw,
+ 				in_raw & (GDMA_RX_EOF | GDMA_IN_ERROR), 1, 1000);
+ 			if (ret || (in_raw & GDMA_IN_ERROR)) {
+ 				ret = ret ? ret : -EIO;
+ 				goto abort;
+ 			}
++			phase = "RX descriptor";
+ 			rmb();
+ 			in_raw = readl(spi->dma_sram + GDMA_RX_DESC);
+ 			if ((in_raw & GDMA_OWNER) || FIELD_GET(GDMA_LENGTH, in_raw) != len) {
+@@ -449,13 +463,32 @@
+ 	}
+ 	goto out;
+ abort:
++	dev_err_ratelimited(spi->dev,
++		"DMA %s: err=%d len=%u hz=%u SPI=%08x IN=%08x OUT=%08x RXdesc=%08x TXdesc=%08x\n",
++		phase, ret, len, t->effective_speed_hz,
++		esp32_spi_read(spi, SPI_DMA_INT_RAW_REG),
++		readl(spi->gdma + GDMA_IN_RAW), readl(spi->gdma + GDMA_OUT_RAW),
++		readl(spi->dma_sram + GDMA_RX_DESC), readl(spi->dma_sram + GDMA_TX_DESC));
+ 	/* Stop SPI before reclaiming its DMA buffers following an error. */
+ 	esp32_spi_init(spi);
+ 	spi->speed_hz = 0;
+ out:
+ 	esp32_spi_dma_reset(spi);
+-	esp32_spi_write(spi, SPI_DMA_CONF_REG, 0);
++	esp32_spi_write(spi, SPI_DMA_CONF_REG, SPI_DMA_MASTER_FLAGS);
+ 	return ret;
++}
++
++static int esp32_spi_dma_hw_init(struct esp32_spi *spi)
++{
++	/* NuttX esp32s3_dma_init() enables both the system and internal clocks. */
++	writel(readl(spi->gdma + GDMA_MISC_CONF) | GDMA_CLOCK_EN,
++	       spi->gdma + GDMA_MISC_CONF);
++	if (readl(spi->gdma + GDMA_DATE) != GDMA_DATE_VALUE)
++		return -EIO;
++	esp32_spi_dma_reset(spi);
++	writel(0, spi->gdma + GDMA_OUT_PERI);
++	writel(0, spi->gdma + GDMA_IN_PERI);
++	return 0;
+ }
+ 
+ /* Optional S3-only resources. Without these, the existing PIO path remains. */
+@@ -494,10 +527,9 @@
+ 	ret = reset_control_deassert(rst);
+ 	if (ret)
+ 		return ret;
+-	/* SPI2 peripheral selector. The whole GDMA resource is exclusively held. */
+-	esp32_spi_dma_reset(spi);
+-	writel(0, spi->gdma + GDMA_OUT_PERI);
+-	writel(0, spi->gdma + GDMA_IN_PERI);
++	ret = esp32_spi_dma_hw_init(spi);
++	if (ret)
++		return dev_err_probe(&pdev->dev, ret, "GDMA clock/reset readback failed\n");
+ 	dev_info(&pdev->dev, "SPI2 GDMA pair 0, internal SRAM bounce buffers\n");
+ 	return 0;
+ }
+@@ -580,6 +612,7 @@
+ 	}
+ 
+ 	spi = spi_controller_get_devdata(host);
++	spi->dev = &pdev->dev;
+ 	init_completion(&spi->done);
+ 	platform_set_drvdata(pdev, host);
+ 

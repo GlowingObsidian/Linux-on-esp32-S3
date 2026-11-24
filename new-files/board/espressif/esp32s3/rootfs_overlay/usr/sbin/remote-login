@@ -14,12 +14,11 @@ DROPBEAR=${REMOTE_LOGIN_DROPBEAR:-/usr/sbin/dropbear}
 KEYS=${REMOTE_LOGIN_HOME:-/home/root}/.ssh/authorized_keys
 
 SSH_PORT=22
-TELNET_PORT=23
 SSH_AUTH=both
 
 usage() {
-	echo "usage: remote-login ssh|telnet|off" >&2
-	echo "       remote-login port ssh|telnet N|default" >&2
+	echo "usage: remote-login ssh|off" >&2
+	echo "       remote-login port ssh N|default" >&2
 	echo "       remote-login auth password|both|key" >&2
 	echo "       remote-login apply|status" >&2
 	exit 1
@@ -44,8 +43,6 @@ load() {
 	[ -r "$SETTINGS" ] || return 0
 	value=$(setting SSH_PORT)
 	if valid_port "$value"; then SSH_PORT=$value; fi
-	value=$(setting TELNET_PORT)
-	if valid_port "$value"; then TELNET_PORT=$value; fi
 	value=$(setting SSH_AUTH)
 	case $value in
 	password|both|key) SSH_AUTH=$value ;;
@@ -53,8 +50,8 @@ load() {
 }
 
 store() {
-	printf 'SSH_PORT=%s\nTELNET_PORT=%s\nSSH_AUTH=%s\n' \
-		"$SSH_PORT" "$TELNET_PORT" "$SSH_AUTH" > "$SETTINGS.new"
+	printf 'SSH_PORT=%s\nSSH_AUTH=%s\n' \
+		"$SSH_PORT" "$SSH_AUTH" > "$SETTINGS.new"
 	mv "$SETTINGS.new" "$SETTINGS"
 }
 
@@ -64,23 +61,6 @@ enabled() {
 		[ "$word" = "$1" ] && return 0
 	done
 	return 1
-}
-
-web_port() {
-	awk '{ l = $0; sub(/^#/, "", l); split(l, f, /[ \t]+/)
-	       if (f[6] == "/usr/sbin/httpd") { print (f[1] ~ /^[0-9]+$/ ? f[1] : 80); exit } }' "$CONF" 2>/dev/null
-}
-
-check_ports() {
-	if [ "$SSH_PORT" = "$TELNET_PORT" ]; then
-		echo "remote-login: SSH and Telnet cannot share port $SSH_PORT" >&2
-		exit 1
-	fi
-	web=$(web_port)
-	if [ -n "$web" ] && { [ "$web" = "$SSH_PORT" ] || [ "$web" = "$TELNET_PORT" ]; }; then
-		echo "remote-login: port $web belongs to the web server" >&2
-		exit 1
-	fi
 }
 
 ssh_flags() {
@@ -99,19 +79,22 @@ auth_text() {
 }
 
 apply() {
-	check_ports
 	ssh_on='#'
-	telnet_on='#'
 	enabled ssh && ssh_on=
-	enabled telnet && telnet_on=
 	tmp=$CONF.new
+	# The filter drops three names, not one. /usr/sbin/httpd because this image
+	# builds no web server, and /usr/sbin/telnetd because it no longer builds
+	# one either: /etc lives in jffs2 and survives a flash, so a board updated
+	# from an older image still has the line that image wrote, and inetd would
+	# fork a name that no longer exists. Dropping them here means the first
+	# `remote-login` after an update clears them; nothing else needs to know
+	# they were ever there.
 	awk '{ l = $0; sub(/^#/, "", l); split(l, f, /[ \t]+/)
-	       if (f[6] != "/usr/sbin/dropbear" && f[6] != "/usr/sbin/telnetd") print }' \
+	       if (f[6] != "/usr/sbin/dropbear" && f[6] != "/usr/sbin/telnetd" &&
+	           f[6] != "/usr/sbin/httpd") print }' \
 		"$CONF" > "$tmp" 2>/dev/null || : > "$tmp"
 	printf '%s%s\tstream\ttcp\tnowait\troot\t/usr/sbin/dropbear\tdropbear -i -R -I 600%s\n' \
 		"$ssh_on" "$SSH_PORT" "$(ssh_flags)" >> "$tmp"
-	printf '%s%s\tstream\ttcp\tnowait\troot\t/usr/sbin/telnetd\ttelnetd -i\n' \
-		"$telnet_on" "$TELNET_PORT" >> "$tmp"
 	mv "$tmp" "$CONF"
 	restart_inetd
 }
@@ -130,24 +113,17 @@ ssh)
 		exit 1
 	fi
 	choose ssh
-	echo "SSH on port $SSH_PORT ($(auth_text)), telnet off."
-	;;
-telnet)
-	choose telnet
-	echo "Telnet on port $TELNET_PORT, SSH off. Telnet sends the password in clear text."
+	echo "SSH on port $SSH_PORT ($(auth_text))."
 	;;
 off|none)
 	choose off
-	echo "SSH and Telnet off. Log in on the console."
+	echo "SSH off. Log in on the console."
 	;;
 port)
 	[ $# -eq 3 ] || usage
 	value=$3
 	if [ "$value" = default ]; then
-		case $2 in
-		ssh) value=22 ;;
-		telnet) value=23 ;;
-		esac
+		value=22
 	fi
 	if ! valid_port "$value"; then
 		echo "remote-login: '$3' is not a port (1-65535)" >&2
@@ -155,16 +131,11 @@ port)
 	fi
 	case $2 in
 	ssh) SSH_PORT=$value ;;
-	telnet) TELNET_PORT=$value ;;
 	*) usage ;;
 	esac
-	check_ports
 	store
 	apply
-	case $2 in
-	ssh) echo "SSH port is $SSH_PORT." ;;
-	*) echo "Telnet port is $TELNET_PORT." ;;
-	esac
+	echo "SSH port is $SSH_PORT."
 	;;
 auth)
 	[ $# -eq 2 ] || usage
@@ -186,10 +157,8 @@ apply)
 status|"")
 	on=
 	enabled ssh && on="$on ssh"
-	enabled telnet && on="$on telnet"
 	echo "Listening:${on:- nothing}"
 	echo "SSH: port $SSH_PORT, $(auth_text)$(enabled ssh || echo ', off')"
-	echo "Telnet: port $TELNET_PORT$(enabled telnet || echo ', off')"
 	;;
 *)
 	usage

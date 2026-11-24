@@ -1,0 +1,16 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -3690,7 +3690,12 @@
+ 		}
+ 		memset(&resp, 0, sizeof(resp));
+ 		memcpy(resp.mac_addr, mac, MAC_ADDR_LEN);
+-		ret = blob_post_cmd_resp(hw, cmd_code, &resp, sizeof(resp), CMD_RESPONSE_SUCCESS);
++		/* The helper adds the command header. Pass only MAC + pad,
++		 * not cmd_config_mac_address's embedded header a second time.
++		 */
++		ret = blob_post_cmd_resp(hw, cmd_code, resp.mac_addr,
++					  sizeof(resp) - sizeof(resp.header),
++					  CMD_RESPONSE_SUCCESS);
+ 		if (ret)
+ 			return false;
+ 		pr_info("cmd: get mac answered %pM\n", mac);

@@ -1,0 +1,198 @@
+Subject: [PATCH] xtensa esp32 use explicit PSRAM atomic syscalls and software futex RMWs
+
+diff --git a/arch/xtensa/include/asm/esp32-atomic.h b/arch/xtensa/include/asm/esp32-atomic.h
+--- a/arch/xtensa/include/asm/esp32-atomic.h
++++ b/arch/xtensa/include/asm/esp32-atomic.h
+@@ -5,9 +5,12 @@
+ #include <linux/types.h>
+ enum esp32_atomic_op {
+  ESP32_ATOMIC_xchg, ESP32_ATOMIC_cmpxchg, ESP32_ATOMIC_add,
+- ESP32_ATOMIC_sub, ESP32_ATOMIC_and, ESP32_ATOMIC_or, ESP32_ATOMIC_xor
++ ESP32_ATOMIC_sub, ESP32_ATOMIC_and, ESP32_ATOMIC_or, ESP32_ATOMIC_xor,
++ ESP32_ATOMIC_read
+ };
+ unsigned long esp32_atomic_update(volatile void *ptr, unsigned long arg,
+  unsigned long compare, enum esp32_atomic_op op, unsigned int size);
++int esp32_user_atomic_update(u32 __user *ptr, u32 arg, u32 compare,
++ enum esp32_atomic_op op, u32 *old);
+ #endif
+ #endif
+diff --git a/arch/xtensa/include/asm/futex.h b/arch/xtensa/include/asm/futex.h
+--- a/arch/xtensa/include/asm/futex.h
++++ b/arch/xtensa/include/asm/futex.h
+@@ -15,6 +15,9 @@
+ #include <linux/futex.h>
+ #include <linux/uaccess.h>
+ #include <linux/errno.h>
++#ifdef CONFIG_XTENSA_SMP_ESP32
++#include <asm/esp32-atomic.h>
++#endif
+ 
+ #define arch_futex_atomic_op_inuser arch_futex_atomic_op_inuser
+ #define futex_atomic_cmpxchg_inatomic futex_atomic_cmpxchg_inatomic
+@@ -73,7 +76,27 @@
+ static inline int arch_futex_atomic_op_inuser(int op, int oparg, int *oval,
+ 		u32 __user *uaddr)
+ {
+-#if XCHAL_HAVE_S32C1I || XCHAL_HAVE_EXCLUSIVE
++#ifdef CONFIG_XTENSA_SMP_ESP32
++	u32 oldval, argument = oparg;
++	enum esp32_atomic_op operation;
++	int ret;
++
++	switch (op) {
++	case FUTEX_OP_SET: operation = ESP32_ATOMIC_xchg; break;
++	case FUTEX_OP_ADD: operation = ESP32_ATOMIC_add; break;
++	case FUTEX_OP_OR: operation = ESP32_ATOMIC_or; break;
++	case FUTEX_OP_ANDN:
++		operation = ESP32_ATOMIC_and;
++		argument = ~argument;
++		break;
++	case FUTEX_OP_XOR: operation = ESP32_ATOMIC_xor; break;
++	default: return -ENOSYS;
++	}
++	ret = esp32_user_atomic_update(uaddr, argument, 0, operation, &oldval);
++	if (!ret)
++		*oval = (int)oldval;
++	return ret;
++#elif XCHAL_HAVE_S32C1I || XCHAL_HAVE_EXCLUSIVE
+ 	int oldval = 0, ret;
+ 
+ 	if (!access_ok(uaddr, sizeof(u32)))
+@@ -117,7 +140,10 @@
+ futex_atomic_cmpxchg_inatomic(u32 *uval, u32 __user *uaddr,
+ 			      u32 oldval, u32 newval)
+ {
+-#if XCHAL_HAVE_S32C1I || XCHAL_HAVE_EXCLUSIVE
++#ifdef CONFIG_XTENSA_SMP_ESP32
++	return esp32_user_atomic_update(uaddr, newval, oldval,
++					ESP32_ATOMIC_cmpxchg, uval);
++#elif XCHAL_HAVE_S32C1I || XCHAL_HAVE_EXCLUSIVE
+ 	unsigned long tmp;
+ 	int ret = 0;
+ 
+diff --git a/arch/xtensa/kernel/entry.S b/arch/xtensa/kernel/entry.S
+--- a/arch/xtensa/kernel/entry.S
++++ b/arch/xtensa/kernel/entry.S
+@@ -1103,7 +1103,10 @@
+ 
+ 	rsr	a0, depc			# get syscall-nr
+ 	_beqz	a0, fast_syscall_spill_registers
++#ifndef CONFIG_XTENSA_SMP_ESP32
+ 	_beqi	a0, __NR_xtensa, fast_syscall_xtensa
++#endif
++	/* S3 atomics use the full syscall frame and shared SRAM gate. */
+ 
+ 	call0	user_exception
+ 
+diff --git a/arch/xtensa/kernel/esp32-atomic.c b/arch/xtensa/kernel/esp32-atomic.c
+--- a/arch/xtensa/kernel/esp32-atomic.c
++++ b/arch/xtensa/kernel/esp32-atomic.c
+@@ -8,6 +8,9 @@
+ #include <linux/smp.h>
+ #include <asm/irqflags.h>
+ #include <asm/esp32-atomic.h>
++#include <linux/errno.h>
++#include <linux/uaccess.h>
++#include <asm/page.h>
+ 
+ struct esp32_atomic_gate {
+  u8 intent[2];
+@@ -46,13 +49,41 @@
+  case ESP32_ATOMIC_and: next = old & arg; break;
+  case ESP32_ATOMIC_or: next = old | arg; break;
+  case ESP32_ATOMIC_xor: next = old ^ arg; break;
++ case ESP32_ATOMIC_read: break;
+  }
+- if (size == 1) *(volatile u8 *)ptr = next;
+- else if (size == 2) *(volatile u16 *)ptr = next;
+- else *(volatile u32 *)ptr = next;
++ /* A failed compare-and-swap must not issue a stale store. */
++ if (op != ESP32_ATOMIC_read &&
++     (op != ESP32_ATOMIC_cmpxchg || old == compare)) {
++  if (size == 1) *(volatile u8 *)ptr = next;
++  else if (size == 2) *(volatile u16 *)ptr = next;
++  else *(volatile u32 *)ptr = next;
++ }
+  asm volatile("memw" ::: "memory");
+  WRITE_ONCE(esp32_atomic_guard.intent[cpu], 0);
+  asm volatile("memw" ::: "memory");
+  arch_local_irq_restore(flags);
+  return old;
+ }
++
++
++/* PSRAM is reached through the S3 data-memory/cache path. ATOMCTL does not
++ * redirect its native S32C1I instructions to the load/store exception handler.
++ * Explicit user atomics and futex RMWs therefore share this software gate.
++ * Only mapped RAM and the existing internal data-SRAM alias are accepted;
++ * peripheral registers and instruction/flash mappings are never operands.
++ */
++int esp32_user_atomic_update(u32 __user *ptr, u32 arg, u32 compare,
++ enum esp32_atomic_op op, u32 *old)
++{
++ unsigned long address = (unsigned long)ptr;
++ bool internal = address >= 0x3fc88000UL && address <= 0x3fd00000UL - 4;
++
++ if (address & 3)
++  return -EINVAL;
++ if (!access_ok(ptr, sizeof(*ptr)) ||
++     (!internal && (!virt_addr_valid((void *)address) ||
++                    !virt_addr_valid((void *)(address + 3)))))
++  return -EFAULT;
++ *old = esp32_atomic_update((void *)ptr, arg, compare, op, sizeof(*ptr));
++ return 0;
++}
+diff --git a/arch/xtensa/kernel/syscall.c b/arch/xtensa/kernel/syscall.c
+--- a/arch/xtensa/kernel/syscall.c
++++ b/arch/xtensa/kernel/syscall.c
+@@ -26,9 +26,49 @@
+ #include <linux/mman.h>
+ #include <linux/sched/mm.h>
+ #include <linux/shm.h>
++#ifdef CONFIG_XTENSA_SMP_ESP32
++#include <asm/esp32-atomic.h>
++
++/* Existing Xtensa atomic ABI: commands 1..4 retain their old results.
++ * S3 extensions provide a serialized read (5), and/or/xor (6..8), and an
++ * ABI query (9). This is an explicit path: native PSRAM CAS never traps.
++ */
++asmlinkage long esp32_sysxtensa(unsigned long command, u32 __user *ptr,
++			      u32 argument, u32 replacement)
++{
++	enum esp32_atomic_op operation;
++	u32 old;
++	int ret;
++
++	if (command == 9)
++		return 0x53334131; /* S3A1 */
++	switch (command) {
++	case 1: operation = ESP32_ATOMIC_xchg; break;
++	case 2:
++	case 3: operation = ESP32_ATOMIC_add; break;
++	case 4: operation = ESP32_ATOMIC_cmpxchg; break;
++	case 5: operation = ESP32_ATOMIC_read; break;
++	case 6: operation = ESP32_ATOMIC_and; break;
++	case 7: operation = ESP32_ATOMIC_or; break;
++	case 8: operation = ESP32_ATOMIC_xor; break;
++	default: return -EINVAL;
++	}
++	ret = esp32_user_atomic_update(ptr,
++		command == 4 ? replacement : argument,
++		command == 4 ? argument : 0, operation, &old);
++	if (ret)
++		return ret;
++	return command == 4 ? old == argument : old;
++}
++#endif
+ 
+ syscall_t sys_call_table[] /* FIXME __cacheline_aligned */= {
++#ifdef CONFIG_XTENSA_SMP_ESP32
++#define __SYSCALL(nr, entry) ((nr) == __NR_xtensa ? \
++	(syscall_t)esp32_sysxtensa : (syscall_t)entry),
++#else
+ #define __SYSCALL(nr, entry)	(syscall_t)entry,
++#endif
+ #include <asm/syscall_table.h>
+ };
+ 

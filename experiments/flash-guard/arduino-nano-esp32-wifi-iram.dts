@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/* Opt-in native Wi-Fi hot-code profile; the ordinary flash-rw profile is intact. */
+#include "arduino-nano-esp32-flash-rw.dts"
+
+&{/wifi_blob} {
+	/* SRAM1 instruction alias 0x40390000..0x403a0000. The buffer pool
+	 * retains its full, separate 64 KiB at 0x3fccc700. */
+	reg = <0x3fccc700 0x10000>, <0x3fca0000 0x10000>;
+	reg-names = "wifi-sram", "wifi-iram";
+};

@@ -1,0 +1,36 @@
+diff --git a/drivers/clk/clk-gpio.c b/drivers/clk/clk-gpio.c
+--- a/drivers/clk/clk-gpio.c
++++ b/drivers/clk/clk-gpio.c
+@@ -211,10 +211,29 @@
+ 	}
+ 
+ 	gpio_name = is_mux ? "select" : "enable";
+-	gpiod = devm_gpiod_get(dev, gpio_name, GPIOD_OUT_LOW);
+-	if (IS_ERR(gpiod))
+-		return dev_err_probe(dev, PTR_ERR(gpiod),
++	/* S3 gates are SYSTEM register bits, including the live early UART.
++	 * Forcing an inherited gate low can stop console output before the
++	 * UART driver can claim and enable its clock. Preserve its state
++	 * while establishing output direction; leave other machines unchanged.
++	 */
++	if (!is_mux && of_machine_is_compatible("espressif,esp32s3")) {
++		int state, ret;
++
++		gpiod = devm_gpiod_get(dev, gpio_name, GPIOD_ASIS);
++		if (IS_ERR(gpiod))
++			return PTR_ERR(gpiod);
++		state = gpiod_get_value_cansleep(gpiod);
++		if (state < 0)
++			return state;
++		ret = gpiod_direction_output(gpiod, state);
++		if (ret)
++			return ret;
++	} else {
++		gpiod = devm_gpiod_get(dev, gpio_name, GPIOD_OUT_LOW);
++		if (IS_ERR(gpiod))
++			return dev_err_probe(dev, PTR_ERR(gpiod),
+ 				     "Can't get '%s' named GPIO property\n", gpio_name);
++	}
+ 
+ 	if (is_mux)
+ 		hw = clk_hw_register_gpio_mux(dev, gpiod);

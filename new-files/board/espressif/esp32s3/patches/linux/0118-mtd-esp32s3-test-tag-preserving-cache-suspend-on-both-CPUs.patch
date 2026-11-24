@@ -1,0 +1,801 @@
+--- a/drivers/mtd/devices/Makefile
++++ b/drivers/mtd/devices/Makefile
+@@ -24,4 +24,4 @@
+ CFLAGS_docg3.o			+= -I$(src)
+ 
+ obj-$(CONFIG_MTD_ESP32_FLASH_GUARD_TEST) += esp32s3-flash-guard-test.o
+-esp32s3-flash-guard-test-y := esp32s3-flash-guard-main.o esp32s3-flash-guard-template.o
++esp32s3-flash-guard-test-y := esp32s3-flash-guard-main.o esp32s3-flash-guard-template.o esp32s3-flash-guard-cache.o
+--- a/drivers/mtd/devices/Kconfig
++++ b/drivers/mtd/devices/Kconfig
+@@ -232,4 +232,6 @@
+ 	default n
+ 	help
+ 	  Tests a relocated SRAM/IRAM two-CPU rendezvous and internal stacks.
+-	  Does not program flash or disable caches. Development hardware gate.
++	  Manual sysfs mode 1 tests SRAM only; mode 2 suspends/resumes caches
++	  while retaining tags, with both CPUs on internal stacks. No flash
++	  programming, erase, or automatic cache test. Development hardware gate.
+--- a/drivers/mtd/devices/esp32s3-flash-guard-main.c
++++ b/drivers/mtd/devices/esp32s3-flash-guard-main.c
+@@ -1,5 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+-/* First hardware gate only: no flash programming or cache-disable calls. */
++/* Manual SRAM rendezvous (1) or tag-preserving cache suspend/resume (2).
++ * Both modes leave flash commands and the read-only MTD backend untouched.
++ */
+ #include <linux/cpu.h>
+ #include <linux/io.h>
+ #include <linux/module.h>
+@@ -8,75 +10,147 @@
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
+ #include <linux/stop_machine.h>
+-
+-#define FG_BASE 0x3fcc8000UL
+-#define FG_BYTES 0x2000
+-#define FG_ALIAS 0x6f0000UL
+-#define FG_CONTROL 0x800
+-#define FG_STACK(cpu) (0x1000 + (cpu) * 0x800)
+-#define FG_STACK_BYTES 0x800
+-#define FG_CANARY 0x9b21a55a
+-
+-struct fg_control {
+-	u32 ready[2], release, result[2], sp[2], pc[2], elapsed[2];
+-};
++#include <asm/traps.h>
++#include "esp32s3-flash-guard-layout.h"
++
+ struct fg_device {
+ 	void __iomem *sram;
+ 	unsigned long iram;
+ 	struct mutex lock;
+-	u32 code_bytes, runs;
++	u32 code_bytes, cache_bytes, runs, mode;
+ 	int last_result;
+-	bool checked[2];
++	bool checked[2], psram_ok;
+ };
+ extern const u8 esp32_flash_guard_template_start[];
+ extern const u8 esp32_flash_guard_template_end[];
++extern const u8 esp32_flash_cache_template_start[];
++extern const u8 esp32_flash_cache_template_end[];
++
++static __always_inline u32 fg_mask_all(void)
++{
++	u32 saved;
++
++	asm volatile("rsr %0, intenable\n\tmovi a8, 0\n\twsr a8, intenable\n\trsync"
++		     : "=a" (saved) : : "a8", "memory");
++	return saved;
++}
++
++static __always_inline void fg_restore_all(u32 saved)
++{
++	asm volatile("wsr %0, intenable\n\trsync" : : "a" (saved) : "memory");
++}
+ 
+ static int fg_cpu(void *arg)
+ {
+ 	struct fg_device *fg = arg;
+ 	unsigned int cpu = raw_smp_processor_id();
+ 	typedef int (*fg_entry)(struct fg_control *, void *, unsigned int, u32);
+-	fg_entry entry = (fg_entry)fg->iram;
++	bool cache = fg->mode == 2;
++	fg_entry entry = (fg_entry)(fg->iram + (cache ? FG_CACHE_CODE : 0));
++	struct fg_control *control = (void __force *)(fg->sram + FG_CONTROL);
++	void *stack = (void __force *)(fg->sram + FG_STACK(cpu) + FG_STACK_BYTES);
++	u32 enabled = 0, ps = 0, windows;
+ 	int ret;
+ 
+ 	if (cpu > 1)
+ 		return -EINVAL;
+-	ret = entry((void __force *)(fg->sram + FG_CONTROL),
+-		     (void __force *)(fg->sram + FG_STACK(cpu) + FG_STACK_BYTES),
+-		     cpu, 120000000);
+-	return ret == 0 ? 0 : (ret == 3 ? -ETIMEDOUT : -EIO);
++	if (cache) {
++		/* stop_machine masks only LOCKLEVEL=3 on this S3. Mask inputs
++		 * 4/5 as well, BEFORE spilling windows. No external call may
++		 * occur between this spill and the relocated entry except entry.
++		 * True NMI routes/pending state are checked by the SRAM guard.
++		 */
++		enabled = fg_mask_all();
++		asm volatile("rsr %0, ps" : "=a" (ps));
++		writel(enabled, &control->irq_saved[cpu]);
++		writel(ps, &control->ps[cpu]);
++		spill_registers();
++		asm volatile("rsr %0, windowstart" : "=a" (windows));
++		writel(windows, &control->windows[cpu]);
++	}
++	ret = entry(control, stack, cpu, cache ? FG_RENDEZVOUS_CYCLES : 120000000);
++	if (cache) {
++		u32 after_ps;
++
++		asm volatile("rsr %0, ps" : "=a" (after_ps));
++		fg_restore_all(enabled);
++		/* CALLINC may vary; interrupt level, EXCM and WOE must not. */
++		if ((ps ^ after_ps) & 0x4001f)
++			return -EIO;
++	}
++	return ret == 0 ? 0 : (ret == 3 ? -ETIMEDOUT : (ret == 5 ? -EBUSY : -EIO));
+ }
+ 
+ static ssize_t result_show(struct device *dev, struct device_attribute *attr, char *buf)
+ {
+ 	struct fg_device *fg = dev_get_drvdata(dev);
++	struct fg_control __iomem *c = fg->sram + FG_CONTROL;
+ 	ssize_t n;
+ 
+ 	mutex_lock(&fg->lock);
+-	n = sysfs_emit(buf, "runs=%u result=%d code_bytes=%u cpu0_internal=%u cpu1_internal=%u flash_operations=0 cache_changes=0\n",
+-		fg->runs, fg->last_result, fg->code_bytes, fg->checked[0], fg->checked[1]);
++	n = sysfs_emit(buf, "runs=%u mode=%u result=%d code_bytes=%u cache_code_bytes=%u cpu0_internal=%u cpu1_internal=%u flash_operations=0 cache_changes=%u cache_stage=%u cache_off_cycles=%u peer_cache_off=%u psram_ok=%u\n",
++		fg->runs, fg->mode, fg->last_result, fg->code_bytes, fg->cache_bytes,
++		fg->checked[0], fg->checked[1], readl(&c->attempt), readl(&c->stage),
++		readl(&c->hold_cycles), readl(&c->peer_off), fg->psram_ok);
+ 	mutex_unlock(&fg->lock);
+ 	return n;
+ }
+ static DEVICE_ATTR_RO(result);
+ 
++static ssize_t cache_state_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct fg_device *fg = dev_get_drvdata(dev);
++	struct fg_control __iomem *c = fg->sram + FG_CONTROL;
++	ssize_t n;
++
++	mutex_lock(&fg->lock);
++	n = sysfs_emit(buf, "i_before=%08x i_after=%08x d_before=%08x d_after=%08x i_off=%08x d_off=%08x buses_off=%08x,%08x state_off=%08x errors_before=%08x,%08x,%08x errors_after=%08x,%08x,%08x irq_off=%08x,%08x windows=%08x,%08x\n",
++		readl(&c->before[0]), readl(&c->after[0]),
++		readl(&c->before[4]), readl(&c->after[4]),
++		readl(&c->suspended[0]), readl(&c->suspended[1]),
++		readl(&c->suspended[2]), readl(&c->suspended[3]), readl(&c->state_off),
++		readl(&c->errors_before[0]), readl(&c->errors_before[1]), readl(&c->errors_before[2]),
++		readl(&c->errors_after[0]), readl(&c->errors_after[1]), readl(&c->errors_after[2]),
++		readl(&c->irq_off[0]), readl(&c->irq_off[1]),
++		readl(&c->windows[0]), readl(&c->windows[1]));
++	mutex_unlock(&fg->lock);
++	return n;
++}
++static DEVICE_ATTR_RO(cache_state);
++
+ static ssize_t test_store(struct device *dev, struct device_attribute *attr,
+ 			  const char *buf, size_t count)
+ {
+ 	struct fg_device *fg = dev_get_drvdata(dev);
+-	unsigned int value, cpu;
++	struct fg_control __iomem *c = fg->sram + FG_CONTROL;
++	u32 *probe = NULL;
++	unsigned int value, cpu, i;
+ 	int ret;
+ 
+ 	ret = kstrtouint(buf, 0, &value);
+-	if (ret || value != 1)
++	if (ret || (value != 1 && value != 2))
+ 		return -EINVAL;
+ 	mutex_lock(&fg->lock);
++	fg->mode = value;
++	fg->psram_ok = false;
++	if (value == 2) {
++		/* A temporary dirty PSRAM page exercises tag/data preservation.
++		 * It is never touched while caches are suspended.
++		 */
++		probe = kmalloc(4096, GFP_KERNEL);
++		if (!probe) {
++			ret = -ENOMEM;
++			goto unlock;
++		}
++		for (i = 0; i < 1024; i++)
++			probe[i] = 0x5639a721 ^ (i * 0x10201);
++	}
+ 	cpus_read_lock();
+ 	if (num_online_cpus() != 2 || !cpu_online(0) || !cpu_online(1)) {
+ 		ret = -ENODEV;
+ 		goto out;
+ 	}
+-	memset_io(fg->sram + FG_CONTROL, 0, sizeof(struct fg_control));
++	memset_io(c, 0, sizeof(*c));
+ 	for (cpu = 0; cpu < 2; cpu++) {
+ 		fg->checked[cpu] = false;
+ 		writel(FG_CANARY, fg->sram + FG_STACK(cpu));
+@@ -84,31 +158,49 @@
+ 	asm volatile("memw\n\tisync" ::: "memory");
+ 	ret = stop_machine_cpuslocked(fg_cpu, fg, cpu_online_mask);
+ 	for (cpu = 0; cpu < 2; cpu++) {
+-		void __iomem *control = fg->sram + FG_CONTROL;
+-		u32 sp = readl(control + offsetof(struct fg_control, sp) + cpu * 4);
+-		u32 pc = readl(control + offsetof(struct fg_control, pc) + cpu * 4);
+-		u32 status = readl(control + offsetof(struct fg_control, result) + cpu * 4);
+-		u32 ready = readl(control + cpu * 4);
++		u32 sp = readl(&c->sp[cpu]);
++		u32 pc = readl(&c->pc[cpu]);
++		u32 status = readl(&c->result[cpu]);
++		u32 ready = readl(&c->ready[cpu]);
+ 		unsigned long low = FG_BASE + FG_STACK(cpu);
+-
+-		/* CALL0 records its return PC using the Xtensa return-address
+-		 * encoding; reconstruct the top address bits from this I-bus.
+-		 */
++		unsigned long code = fg->iram + (value == 2 ? FG_CACHE_CODE : 0);
++		u32 bytes = value == 2 ? fg->cache_bytes : fg->code_bytes;
++
+ 		pc = (pc & 0x3fffffff) | (fg->iram & 0xc0000000);
+ 		fg->checked[cpu] = ready == 1 && !status && sp >= low + 32 &&
+-			sp < low + FG_STACK_BYTES && pc >= fg->iram &&
+-			pc < fg->iram + fg->code_bytes &&
++			sp < low + FG_STACK_BYTES && pc >= code && pc < code + bytes &&
+ 			readl(fg->sram + FG_STACK(cpu)) == FG_CANARY;
+ 		if (!fg->checked[cpu] && !ret)
+ 			ret = -EIO;
+ 	}
++	if (value == 2) {
++		fg->psram_ok = true;
++		for (i = 0; i < 1024; i++)
++			if (probe[i] != (0x5639a721 ^ (i * 0x10201)))
++				fg->psram_ok = false;
++		if (!ret && (!fg->psram_ok || readl(&c->stage) != 5 ||
++		    readl(&c->attempt) != 1 || readl(&c->mutated) != 3 ||
++		    readl(&c->peer_off) != 1 || readl(&c->irq_off[0]) ||
++		    readl(&c->irq_off[1]) || readl(&c->nmi[0]) || readl(&c->nmi[1]) ||
++		    (readl(&c->suspended[0]) & 1) || (readl(&c->suspended[1]) & 1) ||
++		    (readl(&c->suspended[2]) & 3) != 3 || (readl(&c->suspended[3]) & 3) != 3 ||
++		    readl(&c->state_off) != 0x1001 || readl(&c->hold_cycles) < FG_HOLD_CYCLES))
++			ret = -EIO;
++		for (i = 0; i < 3; i++)
++			if (readl(&c->errors_before[i]) || readl(&c->errors_after[i]))
++				ret = -EIO;
++	}
+ 	fg->runs++;
+- out:
++out:
+ 	cpus_read_unlock();
++	kfree(probe);
++unlock:
+ 	fg->last_result = ret;
+ 	mutex_unlock(&fg->lock);
+ 	if (ret)
+-		dev_warn(dev, "internal-memory dry run failed: %d\n", ret);
++		dev_warn(dev, "non-writing guard mode %u failed: %d\n", value, ret);
++	else if (value == 2)
++		dev_info(dev, "cache suspend/resume passed on both CPUs; PSRAM intact, no flash commands\n");
+ 	else
+ 		dev_info(dev, "internal-memory dry run passed on both CPUs; no flash/cache changes\n");
+ 	return ret ? ret : count;
+@@ -116,21 +208,41 @@
+ static DEVICE_ATTR_WO(test);
+ 
+ static struct attribute *fg_attrs[] = {
+-	&dev_attr_result.attr, &dev_attr_test.attr, NULL,
++	&dev_attr_result.attr, &dev_attr_cache_state.attr, &dev_attr_test.attr, NULL,
+ };
+ static const struct attribute_group fg_group = { .attrs = fg_attrs };
++
++static int fg_copy(struct fg_device *fg, unsigned int offset, const u8 *src, u32 bytes)
++{
++	unsigned int i;
++
++	memcpy_toio(fg->sram + offset, src, bytes);
++	for (i = 0; i < bytes; i++)
++		if (readb(fg->sram + offset + i) != src[i])
++			return -EIO;
++	return 0;
++}
+ 
+ static int fg_probe(struct platform_device *pdev)
+ {
+ 	struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	struct fg_device *fg;
+-	unsigned int i;
+-
+-	static_assert(offsetof(struct fg_control, release) == 8);
+-	static_assert(offsetof(struct fg_control, result) == 12);
+-	static_assert(offsetof(struct fg_control, sp) == 20);
+-	static_assert(offsetof(struct fg_control, pc) == 28);
+-	static_assert(offsetof(struct fg_control, elapsed) == 36);
++	int ret;
++
++	static_assert(offsetof(struct fg_control, release) == FGC_FINAL);
++	static_assert(offsetof(struct fg_control, result) == FGC_RESULT);
++	static_assert(offsetof(struct fg_control, sp) == FGC_SP);
++	static_assert(offsetof(struct fg_control, pc) == FGC_PC);
++	static_assert(offsetof(struct fg_control, elapsed) == FGC_ELAPSED);
++	static_assert(offsetof(struct fg_control, abort_request) == FGC_ABORT);
++	static_assert(offsetof(struct fg_control, before) == FGC_BEFORE);
++	static_assert(offsetof(struct fg_control, after) == FGC_AFTER);
++	static_assert(offsetof(struct fg_control, errors_before) == FGC_ERRORS_BEFORE);
++	static_assert(offsetof(struct fg_control, errors_after) == FGC_ERRORS_AFTER);
++	static_assert(offsetof(struct fg_control, suspended) == FGC_SUSPENDED);
++	static_assert(offsetof(struct fg_control, peer_off) == FGC_PEER_OFF);
++	static_assert(sizeof(struct fg_control) == FGC_BYTES);
++	static_assert(FG_CONTROL + FGC_BYTES <= FG_STACK(0));
+ 	if (!res || res->start != FG_BASE || resource_size(res) != FG_BYTES)
+ 		return -EINVAL;
+ 	fg = devm_kzalloc(&pdev->dev, sizeof(*fg), GFP_KERNEL);
+@@ -142,13 +254,16 @@
+ 	fg->iram = FG_BASE + FG_ALIAS;
+ 	fg->last_result = -ENODATA;
+ 	fg->code_bytes = esp32_flash_guard_template_end - esp32_flash_guard_template_start;
+-	if (!fg->code_bytes || fg->code_bytes > FG_CONTROL)
++	fg->cache_bytes = esp32_flash_cache_template_end - esp32_flash_cache_template_start;
++	if (!fg->code_bytes || fg->code_bytes > FG_CACHE_CODE ||
++	    !fg->cache_bytes || fg->cache_bytes > FG_CONTROL - FG_CACHE_CODE)
+ 		return -E2BIG;
+ 	mutex_init(&fg->lock);
+-	memcpy_toio(fg->sram, esp32_flash_guard_template_start, fg->code_bytes);
+-	for (i = 0; i < fg->code_bytes; i++)
+-		if (readb(fg->sram + i) != esp32_flash_guard_template_start[i])
+-			return -EIO;
++	ret = fg_copy(fg, 0, esp32_flash_guard_template_start, fg->code_bytes);
++	if (!ret)
++		ret = fg_copy(fg, FG_CACHE_CODE, esp32_flash_cache_template_start, fg->cache_bytes);
++	if (ret)
++		return ret;
+ 	asm volatile("memw\n\tisync" ::: "memory");
+ 	platform_set_drvdata(pdev, fg);
+ 	return devm_device_add_group(&pdev->dev, &fg_group);
+@@ -163,4 +278,4 @@
+ };
+ module_platform_driver(fg_driver);
+ MODULE_LICENSE("GPL");
+-MODULE_DESCRIPTION("Non-writing ESP32-S3 flash guard SRAM/IRAM dry run");
++MODULE_DESCRIPTION("Non-writing ESP32-S3 SRAM and cache suspend/resume test");
+--- /dev/null
++++ b/drivers/mtd/devices/esp32s3-flash-guard-layout.h
+@@ -0,0 +1,53 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef ESP32S3_FLASH_GUARD_LAYOUT_H
++#define ESP32S3_FLASH_GUARD_LAYOUT_H
++
++#define FG_BASE 0x3fcc8000
++#define FG_BYTES 0x2000
++#define FG_ALIAS 0x6f0000
++#define FG_CACHE_CODE 0x100
++#define FG_CONTROL 0xe00
++#define FG_STACK(cpu) (0x1000 + (cpu) * 0x800)
++#define FG_STACK_BYTES 0x800
++#define FG_CANARY 0x9b21a55a
++#define FG_RENDEZVOUS_CYCLES 12000000
++#define FG_POLL_CYCLES 245760
++#define FG_HOLD_CYCLES 4800
++#define FG_IRQ_SOURCES 99
++
++/* First eleven words retain the hardware-tested dry-run ABI. */
++#define FGC_READY 0
++#define FGC_FINAL 8
++#define FGC_RESULT 12
++#define FGC_SP 20
++#define FGC_PC 28
++#define FGC_ELAPSED 36
++#define FGC_ABORT 44
++#define FGC_ATTEMPT 48
++#define FGC_STAGE 52
++#define FGC_MUTATED 56
++#define FGC_HOLD 60
++#define FGC_IRQ_OFF 64
++#define FGC_IRQ_SAVED 72
++#define FGC_PS 80
++#define FGC_NMI 88
++#define FGC_WINDOWS 96
++#define FGC_BEFORE 104
++#define FGC_AFTER 136
++#define FGC_ERRORS_BEFORE 168
++#define FGC_ERRORS_AFTER 180
++#define FGC_SUSPENDED 192
++#define FGC_STATE_OFF 208
++#define FGC_PEER_OFF 212
++#define FGC_BYTES 216
++
++#ifndef __ASSEMBLER__
++struct fg_control {
++	u32 ready[2], release, result[2], sp[2], pc[2], elapsed[2];
++	u32 abort_request, attempt, stage, mutated, hold_cycles;
++	u32 irq_off[2], irq_saved[2], ps[2], nmi[2], windows[2];
++	u32 before[8], after[8], errors_before[3], errors_after[3];
++	u32 suspended[4], state_off, peer_off;
++};
++#endif
++#endif
+--- /dev/null
++++ b/drivers/mtd/devices/esp32s3-flash-guard-cache.S
+@@ -0,0 +1,400 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Manual non-writing cache gate. Derived from pinned S3 ROM suspend/resume
++ * bodies and IDF's ESP_ROM_HAS_CACHE_SUSPEND_WAITI_BUG workaround.
++ * C masks INTENABLE, spills live windows while caches are on, then calls us.
++ * No windowed calls, tag/MMU changes, or external-memory accesses after entry.
++ * CPU0 alone publishes final. A timed-out peer stays internal until final.
++ * An irrecoverable freeze/restore failure stays internal until user reset.
++ */
++#include "esp32s3-flash-guard-layout.h"
++
++    .section .text.esp32_flash_cache_template,"ax",@progbits
++    .balign 4
++    .global esp32_flash_cache_template_start
++    .global esp32_flash_cache_template_end
++    .type esp32_flash_cache_template_start,@function
++    .begin no-transform
++
++    .macro FG_READ reg, off
++    memw
++    l32i \reg, a3, \off
++    .endm
++    .macro FG_WRITE reg, off
++    memw
++    s32i \reg, a3, \off
++    memw
++    .endm
++    .macro FG_BNEZ reg, target
++    beqz \reg, .Lzero_\@
++    j \target
++.Lzero_\@:
++    .endm
++    .macro FG_POLL off, shift, bits, value, fail
++    rsr a10, ccount
++.Lpoll_\@:
++    FG_READ a7, \off
++    extui a7, a7, \shift, \bits
++    movi a8, \value
++    beq a7, a8, .Lpolled_\@
++    rsr a11, ccount
++    sub a11, a11, a10
++    movi a8, 240
++    slli a8, a8, 10
++    bltu a11, a8, .Lpoll_\@
++    j \fail
++.Lpolled_\@:
++    .endm
++    .macro FG_SNAPSHOT dest, ctrl, bus, auto, freeze
++    FG_READ a7, \ctrl
++    s32i a7, a2, \dest
++    FG_READ a7, \bus
++    s32i a7, a2, (\dest + 4)
++    FG_READ a7, \auto
++    s32i a7, a2, (\dest + 8)
++    FG_READ a7, \freeze
++    s32i a7, a2, (\dest + 12)
++    .endm
++    .macro FG_PREFLIGHT saved, auto, preload, freeze
++    l32i a7, a2, \saved
++    bbsi a7, 0, .Lenabled_\@
++    j .Lprecondition
++.Lenabled_\@:
++    l32i a7, a2, (\saved + 4)
++    extui a7, a7, 0, 2
++    FG_BNEZ a7, .Lprecondition
++    l32i a7, a2, (\saved + 8)
++    bbci a7, 9, .Lbuffer_clear_\@
++    j .Lprecondition
++.Lbuffer_clear_\@:
++    l32i a7, a2, (\saved + 12)
++    extui a7, a7, 0, 1
++    FG_BNEZ a7, .Lprecondition
++    FG_POLL \freeze, 2, 1, 0, .Lpreflight_timeout
++    FG_POLL \auto, 3, 1, 1, .Lpreflight_timeout
++    FG_POLL \preload, 1, 1, 1, .Lpreflight_timeout
++    .endm
++    .macro FG_SUSPEND saved, ctrl, bus, auto, preload, freeze, shift
++    l32i a7, a2, (\saved + 4)
++    movi a8, 3
++    or a7, a7, a8
++    FG_WRITE a7, \bus
++    l32i a7, a2, \saved
++    movi a8, -2
++    and a7, a7, a8
++    FG_WRITE a7, \ctrl
++    l32i a7, a2, (\saved + 8)
++    bbci a7, 2, .Lautoload_off_\@
++    movi a8, -5
++    and a7, a7, a8
++    FG_WRITE a7, \auto
++    movi a8, 512
++    or a7, a7, a8
++    FG_WRITE a7, \auto
++    FG_POLL \auto, 3, 1, 1, .Lrestore_timeout
++    FG_READ a7, \auto
++    movi a8, -513
++    and a7, a7, a8
++    FG_WRITE a7, \auto
++.Lautoload_off_\@:
++    FG_POLL \auto, 3, 1, 1, .Lrestore_timeout
++    FG_POLL \preload, 1, 1, 1, .Lrestore_timeout
++    l32i a7, a2, (\saved + 12)
++    movi a8, -3
++    and a7, a7, a8
++    FG_WRITE a7, \freeze
++    movi a8, 1
++    or a7, a7, a8
++    FG_WRITE a7, \freeze
++    FG_POLL \freeze, 2, 1, 1, .Lrestore_timeout
++    FG_READ a7, \freeze
++    movi a8, -2
++    and a7, a7, a8
++    FG_WRITE a7, \freeze
++    FG_POLL \freeze, 2, 1, 0, .Lrestore_timeout
++    FG_POLL 0x130, \shift, 12, 1, .Lrestore_timeout
++    .endm
++    .macro FG_RESTORE saved, ctrl, bus, auto, preload, freeze
++    FG_READ a7, \freeze
++    movi a8, -2
++    and a7, a7, a8
++    FG_WRITE a7, \freeze
++    FG_POLL \freeze, 2, 1, 0, .Lfatal
++    l32i a7, a2, (\saved + 12)
++    FG_WRITE a7, \freeze
++    FG_READ a7, \auto
++    /* Keep BUFFER_CLEAR asserted until the outstanding queue is done.
++     * An IDLE cache FSM alone does not prove preload/autoload completion.
++     */
++    movi a8, -5
++    and a7, a7, a8
++    FG_WRITE a7, \auto
++    FG_POLL \auto, 3, 1, 1, .Lfatal
++    FG_POLL \preload, 1, 1, 1, .Lfatal
++    FG_READ a7, \auto
++    movi a8, -513
++    and a7, a7, a8
++    FG_WRITE a7, \auto
++    l32i a7, a2, \saved
++    FG_WRITE a7, \ctrl
++    l32i a7, a2, (\saved + 4)
++    FG_WRITE a7, \bus
++    l32i a7, a2, (\saved + 8)
++    FG_WRITE a7, \auto
++    .endm
++    .macro FG_COMPARE saved, after, mask
++    l32i a7, a2, \saved
++    l32i a8, a2, \after
++    xor a7, a7, a8
++    movi a8, \mask
++    and a7, a7, a8
++    bnez a7, .Lfatal
++    .endm
++    .macro FG_ERRORS dest
++    FG_READ a7, 0xe4
++    s32i a7, a2, \dest
++    FG_READ a7, 0xf0
++    s32i a7, a2, (\dest + 4)
++    FG_READ a7, 0xfc
++    s32i a7, a2, (\dest + 8)
++    .endm
++
++esp32_flash_cache_template_start:
++    entry a1, 32
++    mov a8, a1
++    mov a1, a3
++    addi a1, a1, -32
++    s32i a8, a1, 0
++    s32i a0, a1, 4
++    s32i a5, a1, 8
++    movi a6, 0
++    s32i a6, a1, 12
++    slli a9, a4, 2
++    add a14, a2, a9
++    s32i a1, a14, FGC_SP
++    call0 .Linternal_pc
++    .balign 4
++.Linternal_pc:
++    mov a7, a0
++    s32i a7, a14, FGC_PC
++    l32i a0, a1, 4
++    rsr a12, ccount
++    rsr a7, intenable
++    s32i a7, a14, FGC_IRQ_OFF
++    bnez a7, .Lunsafe_entry
++    rsr a7, interrupt
++    extui a7, a7, 14, 1
++    s32i a7, a14, FGC_NMI
++    bnez a7, .Lunsafe_entry
++    movi a6, 1
++    j .Lpublish_ready
++.Lunsafe_entry:
++    movi a6, 2
++.Lpublish_ready:
++    s32i a6, a14, FGC_READY
++    memw
++    FG_BNEZ a4, .Lpeer
++    /* Construct MMIO base without literals or relocations. */
++    movi a3, 0x600
++    slli a3, a3, 20
++    movi a8, 0xc4
++    slli a8, a8, 12
++    add a3, a3, a8
++.Lmaster_wait:
++    l32i a7, a2, FGC_READY
++    movi a8, 1
++    beq a7, a8, .Lmaster_usable
++    j .Lprecondition
++.Lmaster_usable:
++    l32i a7, a2, (FGC_READY + 4)
++    beq a7, a8, .Lmaster_ready
++    FG_BNEZ a7, .Lprecondition
++    l32i a7, a2, FGC_ABORT
++    FG_BNEZ a7, .Lpreflight_timeout
++    rsr a11, ccount
++    sub a11, a11, a12
++    bltu a11, a5, .Lmaster_wait
++    j .Lpreflight_timeout
++.Lmaster_ready:
++    l32i a7, a2, FGC_ABORT
++    FG_BNEZ a7, .Lpreflight_timeout
++    /* No driver may leave a live peripheral source routed to true NMI14. */
++    movi a8, 32
++    slli a8, a8, 8
++    sub a9, a3, a8
++    movi a6, 2
++.Lmatrix:
++    movi a10, FG_IRQ_SOURCES
++.Lroute:
++    memw
++    l32i a7, a9, 0
++    extui a7, a7, 0, 5
++    movi a8, 14
++    bne a7, a8, .Lroute_usable
++    j .Lprecondition
++.Lroute_usable:
++    addi a9, a9, 4
++    addi a10, a10, -1
++    bnez a10, .Lroute
++    movi a8, FG_IRQ_SOURCES
++    slli a8, a8, 2
++    sub a9, a9, a8
++    movi a8, 8
++    slli a8, a8, 8
++    add a9, a9, a8
++    addi a6, a6, -1
++    bnez a6, .Lmatrix
++    movi a6, 1
++    s32i a6, a2, FGC_STAGE
++    FG_SNAPSHOT FGC_BEFORE, 0x60, 0x64, 0xa0, 0x154
++    FG_SNAPSHOT (FGC_BEFORE + 16), 0, 4, 0x4c, 0x150
++    FG_ERRORS FGC_ERRORS_BEFORE
++    l32i a7, a2, FGC_ERRORS_BEFORE
++    l32i a8, a2, (FGC_ERRORS_BEFORE + 4)
++    or a7, a7, a8
++    l32i a8, a2, (FGC_ERRORS_BEFORE + 8)
++    or a7, a7, a8
++    FG_BNEZ a7, .Lprecondition
++    FG_PREFLIGHT FGC_BEFORE, 0xa0, 0x94, 0x154
++    FG_PREFLIGHT (FGC_BEFORE + 16), 0x4c, 0x40, 0x150
++    l32i a7, a2, FGC_ABORT
++    FG_BNEZ a7, .Lpreflight_timeout
++    movi a6, 1
++    s32i a6, a2, FGC_ATTEMPT
++    s32i a6, a2, FGC_MUTATED
++    movi a6, 2
++    s32i a6, a2, FGC_STAGE
++    memw
++    FG_SUSPEND FGC_BEFORE, 0x60, 0x64, 0xa0, 0x94, 0x154, 0
++    movi a6, 3
++    s32i a6, a2, FGC_MUTATED
++    FG_SUSPEND (FGC_BEFORE + 16), 0, 4, 0x4c, 0x40, 0x150, 12
++    FG_READ a7, 0x60
++    s32i a7, a2, FGC_SUSPENDED
++    FG_READ a7, 0
++    s32i a7, a2, (FGC_SUSPENDED + 4)
++    FG_READ a7, 0x64
++    s32i a7, a2, (FGC_SUSPENDED + 8)
++    FG_READ a7, 4
++    s32i a7, a2, (FGC_SUSPENDED + 12)
++    FG_READ a7, 0x130
++    s32i a7, a2, FGC_STATE_OFF
++    movi a6, 3
++    s32i a6, a2, FGC_STAGE
++    memw
++    rsr a13, ccount
++    s32i a13, a1, 16
++.Lhold:
++    l32i a7, a2, FGC_PEER_OFF
++    bnez a7, .Lhold_minimum
++    l32i a7, a2, FGC_ABORT
++    bnez a7, .Lrestore_timeout
++    rsr a11, ccount
++    sub a11, a11, a13
++    movi a8, 240
++    slli a8, a8, 10
++    bltu a11, a8, .Lhold
++    j .Lrestore_timeout
++.Lhold_minimum:
++    rsr a11, ccount
++    sub a11, a11, a13
++    movi a8, 300
++    slli a8, a8, 4
++    bltu a11, a8, .Lhold_minimum
++    s32i a11, a2, FGC_HOLD
++    j .Lrestore
++.Lrestore_timeout:
++    movi a6, 3
++    s32i a6, a1, 12
++.Lrestore:
++    movi a6, 4
++    s32i a6, a2, FGC_STAGE
++    memw
++    FG_RESTORE FGC_BEFORE, 0x60, 0x64, 0xa0, 0x94, 0x154
++    l32i a7, a2, FGC_MUTATED
++    bbsi a7, 1, .Ld_restore
++    j .Ld_unchanged
++.Ld_restore:
++    FG_RESTORE (FGC_BEFORE + 16), 0, 4, 0x4c, 0x40, 0x150
++.Ld_unchanged:
++    /* Readback alone cannot prove that accesses will resume. Both
++     * controllers must also reach IDLE before either CPU is released.
++     */
++    FG_POLL 0x130, 0, 12, 1, .Lfatal
++    FG_POLL 0x130, 12, 12, 1, .Lfatal
++    FG_SNAPSHOT FGC_AFTER, 0x60, 0x64, 0xa0, 0x154
++    FG_SNAPSHOT (FGC_AFTER + 16), 0, 4, 0x4c, 0x150
++    FG_COMPARE FGC_BEFORE, FGC_AFTER, -1
++    FG_COMPARE (FGC_BEFORE + 4), (FGC_AFTER + 4), -1
++    FG_COMPARE (FGC_BEFORE + 8), (FGC_AFTER + 8), -9
++    FG_COMPARE (FGC_BEFORE + 12), (FGC_AFTER + 12), -5
++    FG_COMPARE (FGC_BEFORE + 16), (FGC_AFTER + 16), -1
++    FG_COMPARE (FGC_BEFORE + 20), (FGC_AFTER + 20), -1
++    FG_COMPARE (FGC_BEFORE + 24), (FGC_AFTER + 24), -9
++    FG_COMPARE (FGC_BEFORE + 28), (FGC_AFTER + 28), -5
++    FG_ERRORS FGC_ERRORS_AFTER
++    movi a6, 5
++    s32i a6, a2, FGC_STAGE
++    memw
++    j .Lmaster_final
++.Lprecondition:
++    movi a6, 5
++    s32i a6, a1, 12
++    j .Lmaster_final
++.Lpreflight_timeout:
++    movi a6, 3
++    s32i a6, a1, 12
++.Lmaster_final:
++    l32i a6, a1, 12
++    bnez a6, .Lpublish_final
++    l32i a7, a2, FGC_ABORT
++    beqz a7, .Lsuccess
++    movi a6, 3
++    j .Lpublish_final
++.Lsuccess:
++    movi a6, 1
++.Lpublish_final:
++    s32i a6, a2, FGC_FINAL
++    memw
++    j .Lfinish
++.Lpeer:
++    l32i a6, a2, FGC_FINAL
++    bnez a6, .Lfinish
++    l32i a7, a2, FGC_STAGE
++    movi a8, 3
++    bne a7, a8, .Lpeer_timeout
++    movi a7, 1
++    s32i a7, a2, FGC_PEER_OFF
++    memw
++.Lpeer_timeout:
++    rsr a11, ccount
++    sub a11, a11, a12
++    bltu a11, a5, .Lpeer
++    movi a7, 1
++    s32i a7, a2, FGC_ABORT
++    memw
++    j .Lpeer
++.Lfinish:
++    movi a7, 1
++    bne a6, a7, .Lstatus
++    movi a6, 0
++.Lstatus:
++    s32i a6, a14, FGC_RESULT
++    rsr a11, ccount
++    sub a11, a11, a12
++    s32i a11, a14, FGC_ELAPSED
++    memw
++    l32i a0, a1, 4
++    l32i a8, a1, 0
++    mov a1, a8
++    mov a2, a6
++    retw
++.Lfatal:
++    movi a6, 7
++    s32i a6, a2, FGC_STAGE
++    memw
++.Lfatal_wait:
++    j .Lfatal_wait
++
++esp32_flash_cache_template_end:
++    .end no-transform
++    .size esp32_flash_cache_template_start, .-esp32_flash_cache_template_start

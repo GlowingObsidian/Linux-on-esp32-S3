@@ -1,0 +1,152 @@
+Subject: [PATCH] xtensa esp32 serialize existing userspace and futex PSRAM CAS
+
+diff --git a/arch/xtensa/kernel/esp32-atomic.c b/arch/xtensa/kernel/esp32-atomic.c
+--- a/arch/xtensa/kernel/esp32-atomic.c
++++ b/arch/xtensa/kernel/esp32-atomic.c
+@@ -1,27 +1,38 @@
+ // SPDX-License-Identifier: GPL-2.0
+-/* S32C1I cannot serialize external PSRAM accesses. Keep its sole guard in
+- * the data-bus alias of the firmware-reserved vector SRAM, and serialize
+- * software read/modify/write operations with local IRQs masked.
+- * Do not use Linux atomics/spinlocks here: they call this implementation.
++/* Two-CPU Peterson gate in the four reserved internal-SRAM bytes. Native
++ * S32C1I-backed exclusion failed the board's cross-core counter test.
++ * Byte intent/turn stores plus MEMW avoid native CAS and ATOMCTL windows.
++ * IRQ exclusion gives each CPU one participant; do not call Linux locks here.
+  */
+ #include <linux/compiler.h>
++#include <linux/smp.h>
+ #include <asm/irqflags.h>
+ #include <asm/esp32-atomic.h>
+ 
+-static u32 esp32_atomic_guard __section(".esp32.atomic.lock") = 0;
++struct esp32_atomic_gate {
++ u8 intent[2];
++ u8 turn;
++ u8 reserved;
++};
++static struct esp32_atomic_gate esp32_atomic_guard
++ __section(".esp32.atomic.lock") __aligned(4);
+ 
+ unsigned long notrace esp32_atomic_update(volatile void *ptr, unsigned long arg,
+  unsigned long compare, enum esp32_atomic_op op, unsigned int size)
+ {
+  unsigned long flags;
+- u32 previous, desired, old, next;
++ unsigned int cpu, peer;
++ u32 old, next;
+  flags = arch_local_irq_save();
+- do {
+-  previous = 0;
+-  desired = 1;
+-  asm volatile("wsr %2, scompare1\n\ts32c1i %0, %1\n"
+-   : "+a"(desired), "+m"(esp32_atomic_guard) : "a"(previous) : "memory");
+- } while (desired != 0);
++ cpu = raw_smp_processor_id();
++ peer = cpu ^ 1;
++ WRITE_ONCE(esp32_atomic_guard.intent[cpu], 1);
++ asm volatile("memw" ::: "memory");
++ WRITE_ONCE(esp32_atomic_guard.turn, peer);
++ asm volatile("memw" ::: "memory");
++ while (READ_ONCE(esp32_atomic_guard.intent[peer]) &&
++        READ_ONCE(esp32_atomic_guard.turn) == peer)
++  asm volatile("memw" ::: "memory");
+  asm volatile("memw" ::: "memory");
+  if (size == 1) old = *(volatile u8 *)ptr;
+  else if (size == 2) old = *(volatile u16 *)ptr;
+@@ -40,7 +51,7 @@
+  else if (size == 2) *(volatile u16 *)ptr = next;
+  else *(volatile u32 *)ptr = next;
+  asm volatile("memw" ::: "memory");
+- esp32_atomic_guard = 0;
++ WRITE_ONCE(esp32_atomic_guard.intent[cpu], 0);
+  asm volatile("memw" ::: "memory");
+  arch_local_irq_restore(flags);
+  return old;
+diff --git a/arch/xtensa/kernel/traps.c b/arch/xtensa/kernel/traps.c
+--- a/arch/xtensa/kernel/traps.c
++++ b/arch/xtensa/kernel/traps.c
+@@ -44,6 +44,10 @@
+ #include <asm/processor.h>
+ #include <asm/traps.h>
+ #include <asm/hw_breakpoint.h>
++#ifdef CONFIG_XTENSA_SMP_ESP32
++#include <asm/esp32-atomic.h>
++#include <asm/page.h>
++#endif
+ 
+ /*
+  * Machine specific interrupt handlers
+@@ -373,9 +377,58 @@
+ 	force_sig_fault(SIGFPE, FPE_INTDIV, (void __user *)regs->pc);
+ }
+ 
++#ifdef CONFIG_XTENSA_SMP_ESP32
++/* ATOMCTL rejects PIF compare-and-swap operations on this port. Existing
++ * userspace and futex instructions therefore use the same SRAM-guarded
++ * transaction as kernel atomics. Local SRAM is accepted for vendor locks.
++ */
++static bool esp32_emulate_s32c1i(struct pt_regs *regs)
++{
++	u32 instruction, first, second = 0, address, old;
++	unsigned int target, source, shift;
++	unsigned long pc = regs->pc & ~3UL;
++	unsigned long fault = regs->excvaddr;
++	bool internal = fault >= 0x3fc88000UL && fault <= 0x3fd00000UL - 4;
++
++	if ((fault & 3) ||
++	    (!internal && (!virt_addr_valid((void *)fault) ||
++			  !virt_addr_valid((void *)(fault + 3)))))
++		return false;
++
++	/* I-bus SRAM supports aligned word reads, not byte instruction fetches. */
++	if (get_kernel_nofault(first, (u32 *)pc))
++		return false;
++	shift = (regs->pc & 3) * 8;
++	if (shift > 8 && get_kernel_nofault(second, (u32 *)(pc + 4)))
++		return false;
++	instruction = first >> shift;
++	if (shift > 8)
++		instruction |= second << (32 - shift);
++	if ((instruction & 0xf00f) != 0xe002)
++		return false;
++
++	target = (instruction >> 4) & 15;
++	source = (instruction >> 8) & 15;
++	address = (u32)regs->areg[source] + ((instruction >> 16) & 255) * 4;
++	if (address != fault)
++		return false;
++
++	old = esp32_atomic_update((void *)(unsigned long)address,
++				  regs->areg[target], regs->scompare1,
++				  ESP32_ATOMIC_cmpxchg, 4);
++	regs->areg[target] = old;
++	regs->pc += 3;
++	return true;
++}
++#endif
++
+ #ifdef CONFIG_XTENSA_LOAD_STORE
+ static void do_load_store(struct pt_regs *regs)
+ {
++#ifdef CONFIG_XTENSA_SMP_ESP32
++	if (esp32_emulate_s32c1i(regs))
++		return;
++#endif
+ 	__die_if_kernel("Unhandled load/store exception in kernel",
+ 			regs, SIGKILL);
+ 
+@@ -458,6 +511,13 @@
+ static void trap_init_excsave(void)
+ {
+ 	xtensa_set_sr(this_cpu_ptr(&exc_table), excsave1);
++#ifdef CONFIG_XTENSA_SMP_ESP32
++	/* Primary and secondary CPUs reach this after installing exception
++	 * dispatch. Existing userspace and futex CAS must trap on both CPUs;
++	 * keep the early boot policy until its handler is available.
++	 */
++	asm volatile("wsr %0, atomctl\n\trsync" :: "a"(0) : "memory");
++#endif
+ }
+ 
+ static void trap_init_debug(void)

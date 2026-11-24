@@ -1,0 +1,446 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: paulneja <207793167+paulneja@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 12:30:00 -0300
+Subject: [PATCH 64/64] hwmon: the ESP32-S3's own temperature sensor
+
+The S3 measures its own temperature in the SENS block: a bipolar junction
+whose reading appears in a register once the block is powered, clocked
+and its range DAC set. The digital half is plain register access, but the
+DAC lives in an analog register behind the SoC's internal I2C master,
+which has no driver in this tree. That sequence is the ROM routine the
+ESP32, ESP32-S2 and ESP32-S3 share as rom_i2c_writeReg(), and only the S2
+copy is published; probe() writes the DAC and reads it straight back, so
+a wrong guess fails with an error in dmesg instead of reporting a number
+that merely looks plausible.
+
+SENS is shared silicon -- core 0's ESP-IDF touches the same analog block
+during Wi-Fi and ADC calibration, and nothing here can arbitrate that --
+so the sensor is powered up, sampled and powered down again per read.
+
+HWMON was off in this configuration; the menu comes back to hold this.
+
+---
+ drivers/hwmon/Kconfig |   14 ++++++++++++++
+ drivers/hwmon/Makefile |    1 +
+ drivers/hwmon/esp32s3-tsens.c |  371 +++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 386 insertions(+)
+ create mode 100644 drivers/hwmon/esp32s3-tsens.c
+
+diff --git a/drivers/hwmon/Kconfig b/drivers/hwmon/Kconfig
+index 2bfbcc033d599ce2eacd57c8ca64746f87519353..9b77e26be40cd35ca80662ca322d6df5e209df82 100644
+--- a/drivers/hwmon/Kconfig
++++ b/drivers/hwmon/Kconfig
+@@ -2125,6 +2125,20 @@
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called emc6w201.
+ 
++config SENSORS_ESP32S3_TSENS
++	tristate "ESP32-S3 internal temperature sensor"
++	depends on XTENSA_PLATFORM_ESP32
++	help
++	  If you say yes here you get support for the temperature sensor built
++	  into the ESP32-S3, exposed as temp1_input in millidegrees Celsius.
++
++	  It is not a precision part: Espressif's own calibration table concedes
++	  1-3 degrees C of error depending on the range, and the SENS block it
++	  reads is shared with the other core's radio calibration.
++
++	  This driver can also be built as a module. If so, the module will be
++	  called esp32s3-tsens.
++
+ config SENSORS_SMSC47M1
+ 	tristate "SMSC LPC47M10x and compatibles"
+ 	depends on HAS_IOPORT
+diff --git a/drivers/hwmon/Makefile b/drivers/hwmon/Makefile
+index 63effc0ab8d11..fa7c0af517aef 100644
+--- a/drivers/hwmon/Makefile
++++ b/drivers/hwmon/Makefile
+@@ -76,6 +76,7 @@
+ obj-$(CONFIG_SENSORS_EMC1812)	+= emc1812.o
+ obj-$(CONFIG_SENSORS_EMC2103)	+= emc2103.o
+ obj-$(CONFIG_SENSORS_EMC2305)	+= emc2305.o
++obj-$(CONFIG_SENSORS_ESP32S3_TSENS)	+= esp32s3-tsens.o
+ obj-$(CONFIG_SENSORS_EMC6W201)	+= emc6w201.o
+ obj-$(CONFIG_SENSORS_F71805F)	+= f71805f.o
+ obj-$(CONFIG_SENSORS_F71882FG)	+= f71882fg.o
+diff --git a/drivers/hwmon/esp32s3-tsens.c b/drivers/hwmon/esp32s3-tsens.c
+new file mode 100644
+index 0000000000000..809e4b952398c
+--- /dev/null
++++ b/drivers/hwmon/esp32s3-tsens.c
+@@ -0,0 +1,372 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * ESP32-S3 internal temperature sensor, exposed through hwmon as
++ * temp1_input in millidegrees Celsius.
++ *
++ * The chip measures temperature with the SENS block's TSENS sub-block: a
++ * bipolar junction whose reading is available in a register, with a range
++ * and offset chosen by a DAC field in an analog register that is not on the
++ * ordinary bus at all -- it sits behind the SoC's internal I2C master.
++ *
++ * Everything the digital side does is in the ESP32-S3's own headers and is
++ * implemented here directly:
++ *
++ *   SENS_SAR_TSENS_CTRL_REG   0x60008850  tsens_out, tsens_ready,
++ *                                         tsens_clk_div, tsens_power_up,
++ *                                         tsens_power_up_force, tsens_dump_out
++ *   SENS_SAR_TSENS_CTRL2_REG  0x60008854  tsens_xpd_force
++ *   SENS_SAR_PERI_CLK_GATE_CONF_REG
++ *                             0x60008904  tsens_clk_en
++ *
++ * The analog side is the one part of the sequence with no S3 header to read
++ * it from. It is the register block the ESP32, ESP32-S2 and ESP32-S3 ROMs
++ * share as rom_i2c_writeReg(); only the S2's implementation is published
++ * (components/esp_rom/patches/esp_rom_regi2c_esp32s2.c in ESP-IDF), and the
++ * S3's ANA_CONFIG and ANA_CONFIG2 registers sit at exactly the offsets that
++ * file uses, so its sequence is the one implemented in tsens_ana_write().
++ * probe() writes the DAC and reads it straight back; a mismatch fails the
++ * probe with an error in dmesg rather than registering a sensor that would
++ * return plausible-looking nonsense.
++ *
++ * Two limits worth stating rather than discovering later:
++ *
++ *  - This is not a precision part. Espressif's own calibration table (in
++ *    soc/esp32s3/temperature_sensor_periph.c) concedes 1-3 degrees C of
++ *    error depending on the range, and this driver uses the row with the
++ *    smallest error, which is the one that covers -10..80 C.
++ *  - SENS is shared silicon. core 0's ESP-IDF touches the same analog block
++ *    during Wi-Fi and ADC calibration, and nothing on the Linux side can
++ *    arbitrate that. The sensor is powered up, sampled and powered down
++ *    again per read to keep the window as small as it can be.
++ */
++
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/hwmon.h>
++#include <linux/io.h>
++#include <linux/math.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/platform_device.h>
++
++/* SENS block, the node's first reg region. */
++#define SENS_TSENS_CTRL		0x050
++#define SENS_TSENS_CTRL2	0x054
++#define SENS_PERI_CLK_GATE	0x104
++
++#define TSENS_OUT		0x000000ff	/* [7:0]  raw reading */
++#define TSENS_READY		0x00000100	/* [8]    reading is valid (RO) */
++#define TSENS_CLK_DIV		0x003fc000	/* [21:14] */
++#define TSENS_POWER_UP		0x00400000	/* [22] */
++#define TSENS_POWER_UP_FORCE	0x00800000	/* [23] */
++#define TSENS_DUMP_OUT		0x01000000	/* [24] */
++#define TSENS_XPD_FORCE		0x00003000	/* ctrl2 [13:12] */
++#define TSENS_CLK_DIV_DEFAULT	6
++
++#define PERI_TSENS_CLK_EN	0x20000000	/* clk gate [29] */
++#define PERI_RTC_I2C_CLK_EN	0x08000000	/* clk gate [27] */
++
++/* Analog I2C master and the two gates in front of it, in region two. */
++#define ANA_I2C_CMD		0x000
++#define ANA_I2C_BUSY		0x02000000	/* [25] */
++#define ANA_I2C_WRITE		0x01000000	/* [24] */
++#define ANA_I2C_DATA_S		16		/* [23:16] */
++#define ANA_I2C_DATA_M		0x00ff0000
++#define ANA_I2C_ADDR_S		8		/* [15:8] */
++#define ANA_I2C_BLOCK_S		0		/* [7:0] */
++#define ANA_CONFIG		0x044
++#define ANA_CONFIG_I2C_SAR	0x00040000	/* [18], clear to allow access */
++#define ANA_CONFIG2		0x048
++#define ANA_CONFIG2_SAR		0x00010000	/* [16], set to allow access */
++
++/* The analog register holding the range/offset DAC. */
++#define I2C_SAR_ADC		0x69
++#define I2C_SARADC_TSENS_DAC	0x06
++#define I2C_SARADC_TSENS_DAC_M	0x0f		/* bits [3:0] */
++
++/*
++ * Calibration. celsius = ADC_FACTOR * raw - DAC_FACTOR * offset
++ *                            - OFFSET_FACTOR
++ * with the factors scaled by 10000 so the arithmetic stays in integers.
++ */
++#define TSENS_ADC_FACTOR	4386
++#define TSENS_DAC_FACTOR	278800
++#define TSENS_OFFSET_FACTOR	205200
++
++/*
++ * Espressif's table, and the only thing that gives a raw register value a
++ * temperature. This driver pins the third row: its range covers ordinary
++ * ambient conditions and its error is the smallest of the five. A board
++ * expected to run outside -10..80 C would have to select another row -- and
++ * note that the DAC value is not ordered by range, so the row cannot be
++ * inferred, it has to be taken from the table.
++ */
++#define TSENS_RANGE_OFFSET	0
++#define TSENS_RANGE_DAC		15
++#define TSENS_RANGE_MIN		-10
++#define TSENS_RANGE_MAX		80
++
++#define TSENS_POWER_UP_US	2000	/* settle after power-up */
++#define TSENS_POLL_US		10
++#define TSENS_POLL_TRIES	100	/* 1 ms for a reading to appear */
++
++struct esp32s3_tsens {
++	struct device *hwmon;
++	void __iomem *sens;
++	void __iomem *ana;
++	/* One measurement at a time: this powers a shared block up and down. */
++	struct mutex lock;
++};
++
++static int tsens_ana_cmd(struct esp32s3_tsens *ts, u32 cmd)
++{
++	int i;
++
++	writel(cmd, ts->ana + ANA_I2C_CMD);
++	for (i = 0; i < TSENS_POLL_TRIES; i++) {
++		if (!(readl(ts->ana + ANA_I2C_CMD) & ANA_I2C_BUSY))
++			return 0;
++		udelay(TSENS_POLL_US);
++	}
++	return -ETIMEDOUT;
++}
++
++static int tsens_ana_read(struct esp32s3_tsens *ts, u8 block, u8 addr, u8 *val)
++{
++	int ret;
++
++	ret = tsens_ana_cmd(ts, ((u32)block << ANA_I2C_BLOCK_S) |
++				    ((u32)addr << ANA_I2C_ADDR_S));
++	if (ret)
++		return ret;
++
++	*val = (readl(ts->ana + ANA_I2C_CMD) & ANA_I2C_DATA_M) >>
++	       ANA_I2C_DATA_S;
++	return 0;
++}
++
++static int tsens_ana_write(struct esp32s3_tsens *ts, u8 block, u8 addr,
++			   u8 val)
++{
++	return tsens_ana_cmd(ts, ((u32)block << ANA_I2C_BLOCK_S) |
++				 ((u32)addr << ANA_I2C_ADDR_S) |
++				 ANA_I2C_WRITE |
++				 ((u32)val << ANA_I2C_DATA_S));
++}
++
++static int tsens_ana_write_bits(struct esp32s3_tsens *ts, u8 block, u8 addr,
++				u8 mask, u8 val)
++{
++	u8 old;
++	int ret;
++
++	/* The ROM's writeReg_Mask is a read-modify-write: only the named
++	 * field changes, the rest of the analog register is preserved. */
++	ret = tsens_ana_read(ts, block, addr, &old);
++	if (ret)
++		return ret;
++
++	return tsens_ana_write(ts, block, addr,
++			       (old & ~mask) | (val & mask));
++}
++
++static void tsens_power(struct esp32s3_tsens *ts, bool on)
++{
++	u32 v;
++
++	v = readl(ts->sens + SENS_TSENS_CTRL);
++	if (on)
++		v |= TSENS_POWER_UP | TSENS_POWER_UP_FORCE;
++	else
++		v &= ~(TSENS_POWER_UP | TSENS_POWER_UP_FORCE);
++	writel(v, ts->sens + SENS_TSENS_CTRL);
++
++	v = readl(ts->sens + SENS_TSENS_CTRL2);
++	if (on)
++		v |= TSENS_XPD_FORCE;
++	else
++		v &= ~TSENS_XPD_FORCE;
++	writel(v, ts->sens + SENS_TSENS_CTRL2);
++}
++
++static int esp32s3_tsens_measure(struct esp32s3_tsens *ts, int *raw)
++{
++	u32 v;
++	int i, ret = 0;
++
++	/* Clock first: nothing below works with the gate shut. */
++	writel(readl(ts->sens + SENS_PERI_CLK_GATE) | PERI_TSENS_CLK_EN |
++	       PERI_RTC_I2C_CLK_EN, ts->sens + SENS_PERI_CLK_GATE);
++
++	v = readl(ts->sens + SENS_TSENS_CTRL) & ~TSENS_CLK_DIV;
++	writel(v | (TSENS_CLK_DIV_DEFAULT << 14), ts->sens + SENS_TSENS_CTRL);
++
++	tsens_power(ts, true);
++	usleep_range(TSENS_POWER_UP_US, TSENS_POWER_UP_US * 2);
++
++	/* Open the analog bus, set the range, sample, and put it all back. */
++	writel(readl(ts->ana + ANA_CONFIG) & ~ANA_CONFIG_I2C_SAR,
++	       ts->ana + ANA_CONFIG);
++	writel(readl(ts->ana + ANA_CONFIG2) | ANA_CONFIG2_SAR,
++	       ts->ana + ANA_CONFIG2);
++
++	ret = tsens_ana_write_bits(ts, I2C_SAR_ADC, I2C_SARADC_TSENS_DAC,
++				   I2C_SARADC_TSENS_DAC_M, TSENS_RANGE_DAC);
++	if (ret)
++		goto out;
++
++	writel(readl(ts->sens + SENS_TSENS_CTRL) | TSENS_DUMP_OUT,
++	       ts->sens + SENS_TSENS_CTRL);
++
++	for (i = 0; i < TSENS_POLL_TRIES; i++) {
++		if (readl(ts->sens + SENS_TSENS_CTRL) & TSENS_READY)
++			break;
++		udelay(TSENS_POLL_US);
++	}
++
++	v = readl(ts->sens + SENS_TSENS_CTRL);
++	if (!(v & TSENS_READY)) {
++		ret = -ETIMEDOUT;
++	} else {
++		*raw = v & TSENS_OUT;
++		ret = 0;
++	}
++
++	writel(readl(ts->sens + SENS_TSENS_CTRL) & ~TSENS_DUMP_OUT,
++	       ts->sens + SENS_TSENS_CTRL);
++
++out:
++	writel(readl(ts->ana + ANA_CONFIG2) & ~ANA_CONFIG2_SAR,
++	       ts->ana + ANA_CONFIG2);
++	writel(readl(ts->ana + ANA_CONFIG) | ANA_CONFIG_I2C_SAR,
++	       ts->ana + ANA_CONFIG);
++	tsens_power(ts, false);
++	writel(readl(ts->sens + SENS_PERI_CLK_GATE) & ~PERI_TSENS_CLK_EN,
++	       ts->sens + SENS_PERI_CLK_GATE);
++	return ret;
++}
++
++static int esp32s3_tsens_read_channel(struct device *dev,
++				      enum hwmon_sensor_types type, u32 attr,
++				      int channel, long *val)
++{
++	struct esp32s3_tsens *ts = dev_get_drvdata(dev);
++	int raw, ret;
++
++	if (type != hwmon_temp || attr != hwmon_temp_input)
++		return -EOPNOTSUPP;
++
++	mutex_lock(&ts->lock);
++	ret = esp32s3_tsens_measure(ts, &raw);
++	mutex_unlock(&ts->lock);
++	if (ret)
++		return ret;
++
++	*val = DIV_ROUND_CLOSEST(TSENS_ADC_FACTOR * raw -
++				 TSENS_DAC_FACTOR * TSENS_RANGE_OFFSET -
++				 TSENS_OFFSET_FACTOR, 10);
++	return 0;
++}
++
++/*
++ * hwmon_device_register_with_info() rejects a chip whose ops set neither
++ * .visible nor .is_visible, so this attribute must be declared here even
++ * though the channel set is fixed.
++ */
++static const struct hwmon_ops esp32s3_tsens_ops = {
++	.visible = 0444,
++	.read = esp32s3_tsens_read_channel,
++};
++
++static const struct hwmon_channel_info * const esp32s3_tsens_info[] = {
++	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT),
++	NULL
++};
++
++static const struct hwmon_chip_info esp32s3_tsens_chip = {
++	.ops = &esp32s3_tsens_ops,
++	.info = esp32s3_tsens_info,
++};
++
++static int esp32s3_tsens_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct esp32s3_tsens *ts;
++	u8 dac;
++	int ret;
++
++	ts = devm_kzalloc(dev, sizeof(*ts), GFP_KERNEL);
++	if (!ts)
++		return -ENOMEM;
++
++	ts->sens = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(ts->sens))
++		return PTR_ERR(ts->sens);
++
++	ts->ana = devm_platform_ioremap_resource(pdev, 1);
++	if (IS_ERR(ts->ana))
++		return PTR_ERR(ts->ana);
++
++	mutex_init(&ts->lock);
++	platform_set_drvdata(pdev, ts);
++
++	/*
++	 * One round trip through the analog bus before registering anything.
++	 * If this block is not where this driver thinks it is, the write
++	 * lands nowhere and the read-back says so, which is a great deal
++	 * easier to act on than a temperature that is quietly wrong.
++	 */
++	writel(readl(ts->ana + ANA_CONFIG) & ~ANA_CONFIG_I2C_SAR,
++	       ts->ana + ANA_CONFIG);
++	writel(readl(ts->ana + ANA_CONFIG2) | ANA_CONFIG2_SAR,
++	       ts->ana + ANA_CONFIG2);
++
++	ret = tsens_ana_write_bits(ts, I2C_SAR_ADC, I2C_SARADC_TSENS_DAC,
++				   I2C_SARADC_TSENS_DAC_M, TSENS_RANGE_DAC);
++	if (ret == 0) {
++		ret = tsens_ana_read(ts, I2C_SAR_ADC, I2C_SARADC_TSENS_DAC,
++				     &dac);
++		if (ret == 0 && (dac & I2C_SARADC_TSENS_DAC_M) !=
++				TSENS_RANGE_DAC) {
++			dev_err(dev, "analog bus reads back 0x%02x, wrote 0x%02x\n",
++				dac, TSENS_RANGE_DAC);
++			ret = -EIO;
++		}
++	}
++	if (ret) {
++		dev_err(dev, "the analog bus is not answering (%d)\n", ret);
++		return ret;
++	}
++
++	ts->hwmon = devm_hwmon_device_register_with_info(dev, "esp32s3_tsens",
++							 ts, &esp32s3_tsens_chip,
++							 NULL);
++	if (IS_ERR(ts->hwmon)) {
++		dev_err(dev, "could not register the hwmon device\n");
++		return PTR_ERR(ts->hwmon);
++	}
++
++	dev_info(dev, "ranges %d..%d C, error +/-1 C\n",
++		 TSENS_RANGE_MIN, TSENS_RANGE_MAX);
++	return 0;
++}
++
++static const struct of_device_id esp32s3_tsens_of_match[] = {
++	{ .compatible = "esp,esp32s3-tsens" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, esp32s3_tsens_of_match);
++
++static struct platform_driver esp32s3_tsens_driver = {
++	.probe = esp32s3_tsens_probe,
++	.driver = {
++		.name = "esp32s3-tsens",
++		.of_match_table = esp32s3_tsens_of_match,
++	},
++};
++module_platform_driver(esp32s3_tsens_driver);
++
++MODULE_DESCRIPTION("ESP32-S3 internal temperature sensor");
++MODULE_LICENSE("GPL");
+-- 
+2.55.0
+

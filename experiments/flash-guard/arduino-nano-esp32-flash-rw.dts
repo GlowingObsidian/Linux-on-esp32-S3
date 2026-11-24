@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "arduino-nano-esp32-hybrid-wifi.dts"
+
+/ {
+	chosen {
+		bootargs = "earlycon=esp32s3uart,mmio32,0x60000000,115200n8,40000000 console=ttyS0,115200n8 root=mtd:rootfs rootfstype=cramfs ro esp32s3_rsa.selftest=1 panic=10 panic_console_replay";
+	};
+	flash-guard@3fcc8000 {
+		compatible = "espressif,esp32s3-flash-guard-test";
+		reg = <0x3fcc8000 0x2000>, <0x3fcc7000 0x1000>;
+		reg-names = "guard-sram", "nor-sram";
+		status = "okay";
+	};
+};
+
+/* Flash etc/home persistence replaces the SD state device in this profile. */
+&spi2 {
+	status = "disabled";
+	/delete-node/ mmc@0;
+};
+
+/* With SPI2 and its DMA buffers disabled, the complete former display
+ * SRAM region belongs to Wi-Fi. Stop before the bootloader/ROM region.
+ */
+&{/wifi_blob} {
+	reg = <0x3fccc700 0x10000>;
+};
+
+/* The Nano's common-anode RGB LED is active low. Keep every colour off
+ * until an application selects its brightness through the LED class.
+ * gpio-leds also drives the LEDs off at shutdown without releasing the pads.
+ */
+/ {
+	leds {
+		compatible = "gpio-leds";
+		led-0 {
+			label = "nano:red";
+			gpios = <&gpio0 46 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+		led-1 {
+			label = "nano:green";
+			gpios = <&gpio0 0 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+		led-2 {
+			label = "nano:blue";
+			gpios = <&gpio0 45 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+	};
+};

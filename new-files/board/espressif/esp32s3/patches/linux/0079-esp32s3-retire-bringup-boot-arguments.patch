@@ -1,0 +1,23 @@
+diff --git a/arch/xtensa/boot/dts/arduino-nano-esp32.dts b/arch/xtensa/boot/dts/arduino-nano-esp32.dts
+--- a/arch/xtensa/boot/dts/arduino-nano-esp32.dts
++++ b/arch/xtensa/boot/dts/arduino-nano-esp32.dts
+@@ -55,6 +55,7 @@
+  */
+ &{/} {
+ 	wifi_blob {
++		status = "disabled";
+ 		compatible = "esp,esp32-wifi-blob";
+ 		osi-funcs-address = <0x3fcef940>;
+ 	};
+diff --git a/arch/xtensa/boot/dts/esp32s3.dtsi b/arch/xtensa/boot/dts/esp32s3.dtsi
+--- a/arch/xtensa/boot/dts/esp32s3.dtsi
++++ b/arch/xtensa/boot/dts/esp32s3.dtsi
+@@ -7,7 +7,7 @@
+ 	interrupt-parent = <&pic>;
+ 
+ 	chosen {
+-		bootargs = "earlycon=esp32s3uart,mmio32,0x60000000,115200n8,40000000 console=tty1 console=ttyS0,115200n8 fbcon=font:ProFont6x11 rw root=mtd:rootfs rootfstype=cramfs panic=10 panic_console_replay no_hash_pointers memmap=64K$0x3fccc700 ";
++		bootargs = "earlycon=esp32s3uart,mmio32,0x60000000,115200n8,40000000 console=tty1 console=ttyS0,115200n8 fbcon=font:ProFont6x11 rw root=mtd:rootfs rootfstype=cramfs panic=10 panic_console_replay memmap=64K$0x3fccc700 ";
+ 	};
+ 
+ 	aliases {

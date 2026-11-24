@@ -16,12 +16,7 @@ test "$(id -u)" != 0 || { echo 'Run as a regular user with Docker access.' >&2; 
 # docker ate a whole disk once (#12)
 LOG_CAP_BYTES=${LOG_CAP_BYTES:-50000000}
 
-free_kb=$(df -Pk "$repo" | awk 'NR==2 {print $4}')
-if [[ "$free_kb" =~ ^[0-9]+$ ]]; then
-    free_gb=$((free_kb / 1024 / 1024))
-else
-    free_gb=""
-fi
+free_gb=$(df -PBG "$repo" 2>/dev/null | awk 'NR==2 {gsub("G","",$4); print $4}')
 if [ -z "$free_gb" ] || [ "$free_gb" -lt 25 ] 2>/dev/null; then
 	echo "error: ${free_gb:-an unknown amount of} GB free; one build takes about 21 GB." >&2
 	echo 'Free some space (build-output/ is the usual place) before building.' >&2
@@ -33,6 +28,7 @@ work=$(mktemp -d "$repo/build-output/reproduce.XXXXXX")
 mkdir -p "$work/Linux-on-esp32-S3" "$work/logs"
 git archive HEAD | tar -x --exclude=images -C "$work/Linux-on-esp32-S3"
 git rev-parse HEAD > "$work/source-commit.txt"
+git show -s --format=%ct HEAD > "$work/source-epoch.txt"
 git ls-tree -r HEAD > "$work/source-tree.txt"
 image=linux-esp32s3-reproduce:local
 docker build --network host --build-arg BUILDER_UID="$(id -u)" --build-arg BUILDER_GID="$(id -g)" \

@@ -1,0 +1,41 @@
+--- a/fs/proc/task_nommu.c
++++ b/fs/proc/task_nommu.c
+@@ -112,26 +112,21 @@
+ {
+ 	VMA_ITERATOR(vmi, mm, 0);
+ 	struct vm_area_struct *vma;
+-	struct vm_region *region;
+-	unsigned long size = kobjsize(mm);
+-
++	unsigned long size = 0, pages;
++
++	*shared = *text = *data = 0;
+ 	mmap_read_lock(mm);
+ 	for_each_vma(vmi, vma) {
+-		size += kobjsize(vma);
+-		region = vma->vm_region;
+-		if (region) {
+-			size += kobjsize(region);
+-			size += region->vm_end - region->vm_start;
+-		}
+-	}
+-
+-	*text = (PAGE_ALIGN(mm->end_code) - (mm->start_code & PAGE_MASK))
+-		>> PAGE_SHIFT;
+-	*data = (PAGE_ALIGN(mm->start_stack) - (mm->start_data & PAGE_MASK))
+-		>> PAGE_SHIFT;
++		pages = vma_pages(vma);
++		size += pages;
++		if (vma->vm_flags & VM_EXEC)
++			*text += pages;
++		if (vma->vm_flags & VM_WRITE)
++			*data += pages;
++		if (is_nommu_shared_mapping(vma->vm_flags))
++			*shared += pages;
++	}
+ 	mmap_read_unlock(mm);
+-	size >>= PAGE_SHIFT;
+-	size += *text + *data;
+ 	*resident = size;
+ 	return size;
+ }

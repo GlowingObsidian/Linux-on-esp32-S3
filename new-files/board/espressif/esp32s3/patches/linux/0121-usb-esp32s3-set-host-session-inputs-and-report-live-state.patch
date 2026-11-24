@@ -1,0 +1,87 @@
+diff --git a/arch/xtensa/boot/dts/arduino-nano-esp32.dts b/arch/xtensa/boot/dts/arduino-nano-esp32.dts
+--- a/arch/xtensa/boot/dts/arduino-nano-esp32.dts
++++ b/arch/xtensa/boot/dts/arduino-nano-esp32.dts
+@@ -122,6 +122,17 @@
+ 
+ &gpio_in_mux {
+ 	status = "ok";
++
++	/* Pinned IDF usb_phy_otg_set_mode(HOST): stable A-side session.
++	 * GPIO matrix CONST0=0x3c, CONST1=0x38, matrix-select bit=0x80.
++	 */
++	usb_host_pins: usb_host_pins {
++		pinctrl-single,pins = <
++			PIN(58) 0xbc  /* IDDIG = 0 */
++			PIN(59) 0xb8  /* AVALID = 1 */
++			PIN(60) 0xbc  /* BVALID = 0 */
++			PIN(61) 0xb8> /* VBUSVALID = 1 */;
++	};
+ 
+ 	spi2_in_pins: spi2_in_pins {
+ 		pinctrl-single,pins = <
+@@ -236,6 +247,8 @@
+ };
+ 
+ &usb {
++	pinctrl-0 = <&usb_host_pins>;
++	pinctrl-names = "default";
+ 	/* Host-only: this image has no gadget stack to be a device with. */
+ 	dr_mode = "host";
+ 	status = "ok";
+diff --git a/drivers/phy/phy-esp32s3-usb.c b/drivers/phy/phy-esp32s3-usb.c
+--- a/drivers/phy/phy-esp32s3-usb.c
++++ b/drivers/phy/phy-esp32s3-usb.c
+@@ -113,6 +113,7 @@
+ 	struct device *dev;
+ 	void __iomem *wrap;	/* USB_WRAP: OTG_CONF */
+ 	void __iomem *rtc;	/* RTC_CNTL: USB_CONF */
++	void __iomem *core, *system, *host_inputs;
+ };
+ 
+ static void esp32s3_usb_phy_set(void __iomem *reg, u32 mask, u32 val)
+@@ -190,6 +191,20 @@
+ 	.owner		= THIS_MODULE,
+ };
+ 
++static ssize_t usb_state_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct esp32s3_usb_phy *p = dev_get_drvdata(dev);
++	return sysfs_emit(buf, "wrap=%08x rtc=%08x clock=%08x reset=%08x gotgctl=%08x gusbcfg=%08x grstctl=%08x gintsts=%08x gintmsk=%08x hprt=%08x iddig=%08x avalid=%08x bvalid=%08x vbusvalid=%08x\n",
++		readl(p->wrap), readl(p->rtc), readl(p->system + 0x18),
++		readl(p->system + 0x20), readl(p->core), readl(p->core + 0x0c),
++		readl(p->core + 0x10), readl(p->core + 0x14), readl(p->core + 0x18),
++		readl(p->core + 0x440), readl(p->host_inputs),
++		readl(p->host_inputs + 4), readl(p->host_inputs + 8), readl(p->host_inputs + 12));
++}
++static DEVICE_ATTR_RO(usb_state);
++static struct attribute *esp32s3_usb_attrs[] = { &dev_attr_usb_state.attr, NULL };
++static const struct attribute_group esp32s3_usb_group = { .attrs = esp32s3_usb_attrs };
++
+ static int esp32s3_usb_phy_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -202,6 +217,13 @@
+ 		return -ENOMEM;
+ 
+ 	p->dev = dev;
++	/* Read-only diagnostics for the existing controller and gate owners. */
++	p->core = devm_ioremap(dev, 0x60080000, 0x444);
++	p->system = devm_ioremap(dev, 0x600c0000, 0x24);
++	p->host_inputs = devm_ioremap(dev, 0x6000423c, 0x10);
++	if (!p->core || !p->system || !p->host_inputs)
++		return -ENOMEM;
++	platform_set_drvdata(pdev, p);
+ 
+ 	/*
+ 	 * The device tree's reg order, which is RTC_CNTL first and USB_WRAP
+@@ -234,7 +256,9 @@
+ 	 */
+ 	provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
+ 
+-	return PTR_ERR_OR_ZERO(provider);
++	if (IS_ERR(provider))
++		return PTR_ERR(provider);
++	return devm_device_add_group(dev, &esp32s3_usb_group);
+ }
+ 
+ static const struct of_device_id esp32s3_usb_phy_of_match[] = {

@@ -67,7 +67,7 @@ user files. Back up a used board privately before any full-image test.
 Never publish raw board backups: they may contain credentials and user data.
 
 Point `flash.sh` at this directory with `--images`; without it the script
-reads `images/`, which holds the 0.9.1 release. Its default combined-image
+reads `images/`, which holds the 0.10.0 release. Its default combined-image
 write replaces `/etc` and `/home` even without `--erase`. `--parts` preserves
 `/home` but still replaces `/etc`, including accounts, password hashes and
 network configuration. `--parts --erase` resets both, writing `home.jffs2`
@@ -90,9 +90,10 @@ The older `build-linux.yml` builds the base system only and is kept for
 rebuilding that path; it is not the pipeline that produces the released image.
 
 Run the host-only regression tests with `python3 build/test-*.py` -- flash,
-shell fallback, keepconfig, kernel config, bash's vfork patch, `bootlog`, the
-`wifi` script, the first login, `remote-login`/`ssh-server`/`web-server`, the
-clock, NTP, BLE and USB console services, and the soak runner's classifier.
+shell fallback, keepconfig, kernel config, the display console, bash's vfork
+patch, `bootlog`, the
+`wifi` script, `remote-login`/`ssh-server`, the
+clock, NTP and USB console services, and the soak runner's classifier.
 The board runs its scripts under BusyBox hush, not bash: `build/host-hush.sh`
 builds the image's hush for the host, and `BOARD_SH=<that path>` runs the
 script tests under it. hush exits a `set -e` script when a `while read` loop
@@ -107,7 +108,7 @@ Three tools drive the board itself, all through the serial console:
   tied to the exact image by reading the kernel and rootfs partitions back
   and hashing them.
 - `build/extra-board-tests.py PORT [DIR]` is what a person does with the
-  board and the suite does not: a detached session, cron firing, `passwd` and
+  board and the suite does not: a detached session, `passwd` and
   a fresh login, a reboot that keeps `/home`, jffs2 written and read back,
   the shell under fork load, a subshell with 30 KiB of arguments (#22),
   `bootlog` across reboots.
@@ -128,11 +129,11 @@ scan this kernel does not build). It turns SSH on with password and key on
 whatever port `remote-login` has, and puts the settings back when done. It
 needs `paramiko` on the host in addition to `pyserial` and `esptool`.
 
-`build/test-network-services.py PORT` does the same for `remote-login` and
-`web-server`: it moves SSH to 2222, tries password-only, key-only and both
-with a throwaway key, moves Telnet to 2323 and the web page to 8080, checks
+`build/test-network-services.py PORT` does the same for `remote-login`:
+it moves SSH to 2222, tries password-only, key-only and both
+with a throwaway key, moves SSH to another port, checks
 each from the host, and puts the board's settings back. Both log in with the
-password the harness set on the first login; on a board with its own, pass it
+password the harness set; on a board with its own, pass it
 as `MMU_BOARD_PASSWORD`.
 
 `./run.sh --test`, and so `--all`, runs all of them in that order: the
@@ -142,10 +143,13 @@ console; without them they are reported as skipped, not passed), then the
 soak, `SOAK_ROUNDS` rounds, 20 by default. The summary at the end names each
 part.
 
-All of them answer the first login themselves, with the password
-`esp32s3-board-test` and SSH. `./run.sh` runs `build/factory-login.py PORT`
-at the end, which puts back `changeme123` and nothing listening, so the next
-console login asks again; after running a script by hand, run it by hand too.
+All of them log in with the password the image ships, `arduino`, since nothing
+prompts for a different one and the board is console-only until someone
+deliberately turns a way in on. The two network ones do that for themselves
+through `remote-login`, and put the settings back when done. `./run.sh` runs
+`build/factory-login.py PORT` at the end, which puts back `arduino` and nothing
+listening, so the board is console-only again; after running a script by hand,
+run it by hand too.
 
 The fork backend is built by `experiments/mmu-poc/fork/build-kernel-reclaim.sh`
 with the page-set exchange on; `FORK_SWAP_BANKS=0` builds the copying model.
@@ -170,7 +174,7 @@ The output directory must not exist. The runner verifies the local artifact
 checksums and reads the installed kernel/rootfs through their MTD devices to
 compare their hashes. It then tests remapping, fork, process compatibility,
 the selected programs, job admission, benchmarks, users and permissions,
-HTTP, cron, detached sessions, COM reconnects and persistence across reboots.
+HTTP, detached sessions, COM reconnects and persistence across reboots.
 
 Before anything else the runner quiesces the board: it lowers the console
 shell's `oom_score_adj` and stops the DHCP client. On an idle test image that
@@ -196,19 +200,20 @@ RAM even for `session list`; two interactive Bash consoles could not fork
 two sessions. This suite does not claim those combined workloads are safe.
 
 It creates temporary users and jobs and removes them on the normal cleanup
-path. It requires root access, the default Bash login policy, cron enabled
+path. It requires root access, the default Bash login policy,
 and HTTP initially disabled; do not run it against an unrelated production
 installation. Cleanup is best effort: when the console itself times out, the
 temporary accounts stay on the board and the next run stops on its own
 precondition check. Rewrite the two writable partitions to return the board
 to the factory state before retrying, which is faster than the full image and
-leaves the kernel and rootfs untouched:
+leaves the kernel and rootfs untouched. Use these offsets only with the new
+factory layout and matching JFFS2 seed artifacts:
 
 ```sh
 ./flash.sh --backup somewhere/private     # first, if the board has data on it
 esptool --chip esp32s3 --port YOUR_COM_ADAPTER \
     --before default_reset --after hard_reset \
-    write_flash 0xd0000 ARTIFACTS/etc.jffs2 0xcc0000 ARTIFACTS/home.jffs2
+    write_flash 0xd0000 ARTIFACTS/etc.jffs2 0xc00000 ARTIFACTS/home.jffs2
 ```
 
 The underscore spellings are deliberate: `build/Dockerfile` pins esptool
@@ -239,8 +244,21 @@ The exact 16 MiB image SHA256 is
 See the [verification record](verification/2026-09-06.md) and its archived
 machine-readable results for scope and limitations. This result applies to
 that artifact, not automatically to future code changes or other profiles.
-The committed `images/` are the 0.9.1 release, a clean `./run.sh` build of
-`71244b2` on the release branch. The board suite, the extra tests, the soak,
-SSH and the network tests under `verification/2026-10-05-clean-*` ran on
-those exact bytes ([record](verification/2026-10-05-fix-22.md)); what came
-after that commit is tests and docs only.
+The committed `images/` are the 0.10.0 release, the Arduino Nano ESP32 image
+built on this branch and assembled here by `make-images.sh`. The board suite
+and the extra tests ran on those exact bytes — **35 board tests, 0 failed**,
+and 13/13 beyond the suite — on the combined image
+`1feff1907a94e73296534b7057c32a1d1b3bf7a1747fe6725a0c1fec6718c644`. The
+20-boot soak, the SSH and network tests, and the factory first-login test were
+not run on this release: they need a configured network or a factory board,
+and 0.9.1 under `verification/2026-10-05-clean-*` remains the last release
+those cover. [The record](verification/2026-10-10-nano-esp32.md) says what was
+run, what was not, and why.
+
+Four files under `rootfs_overlay/` were edited after this image was built: the
+comments in `usr/sbin/bootlog` and `etc/init.d/S00bootlog`, the
+`BOOTLOG_CMDLINE`/`BOOTLOG_LEVEL` and `LOWMEM_MEMINFO` test seams, and one
+`bootlog status` message. None changes what the board does — checked by
+extracting the files from the shipped cramfs and diffing them, not by their
+timestamps. The image's `source-commit.txt` records the tree it came from,
+`b8977c8-dirty`, since the correction pass was committed after it was built.

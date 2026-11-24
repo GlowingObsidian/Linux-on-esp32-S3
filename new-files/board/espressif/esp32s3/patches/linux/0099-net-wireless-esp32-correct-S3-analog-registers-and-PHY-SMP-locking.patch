@@ -1,0 +1,505 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob_phy.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob_phy.c
+@@ -1,58 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+-/*
+- * The glue libphy.a needs, and the order the radio comes up in.
+- *
+- * libphy.a is not self-contained. Measured with nm over the archive:
+- * subtracting what it defines leaves fifteen names, of which nine are
+- * satisfiable elsewhere --
+- *
+- *   memcpy, memset        the kernel's
+- *   sprintf, ets_delay_us this port's (see esp32-wifi-blob-support.c)
+- *   __divdf3, __divdi3, __fixdfsi, __floatsidf, __subdf3
+- *                         libgcc soft-float, and the Xtensa cross libgcc
+- *                         provides all five
+- *   phy_get_romfuncs      = 0x40005c58 in esp32s3.rom.ld
+- *   rom_phy_param_addr    = 0x40006324
+- *   rom_rx_gain_force     = 0x4000642c
+- *
+- * and six are real work, which is this file:
+- *
+- *   phy_enter_critical, phy_exit_critical
+- *   phy_printf
+- *   set_xpd_sar, phy_set_pwdet_power, phy_set_tsens_power
+- *
+- * The three set_* are the ones worth reading. In the IDF build they live
+- * in phy_override.c and they exist because the PHY library calls back into
+- * the SoC layer to power the SAR ADC, the power detector and the
+- * temperature sensor on and off as calibration needs them. They are not
+- * optional decorations: the PHY's calibration sequence calls them, and a
+- * stub that does nothing leaves the analog blocks powered down and the
+- * calibration reading garbage.
+- *
+- * This file therefore drives the same registers IDF's
+- * sar_periph_ctrl_*_power_acquire()/release() pair drives. The register
+- * addresses and bit positions come from the S3 TRM, section 37 (SENS),
+- * and match IDF's soc/esp32s3/include/soc/sens_reg.h:
+- *
+- *   SENS_SAR_POWER_XPD_SAR_REG   0x60008800 + 0x00  -- SAR ADC power
+- *     SENS_FORCE_XPD_SAR           bits 30:29
+- *       0 = no force, 1 = force off, 3 = force on
+- *   SENS_SAR_PWDET_CTRL_REG      0x60008800 + 0x34  -- power detector
+- *     SENS_PWDET_SAR_POWER_CTRL    bit 17  (1 = powered)
+- *   SENS_SAR_TSENS_CTRL_REG      0x60008800 + 0x3c  -- temperature sensor
+- *     SENS_TSENS_CLK_DIV           bits 13:8
+- *     SENS_TSENS_POWER_UP          bit 7
+- *     SENS_TSENS_POWER_UP_FORCE    bit 6
+- *     SENS_TSENS_DUMP_OUT          bit 5
+- *     SENS_TSENS_READY             bit 4  (read-only)
+- *     SENS_TSENS_OUT               bits 3:0 (read-only)
+- *
+- * The PHY also needs the SAR peripheral clock gated on, which is
+- * SENS_SAR_PERI_CLK_GATE_CONF_REG at 0x60008800 + 0x20, bit
+- * SENS_SARADC_CLK_EN (bit 19) and SENS_TSENS_CLK_EN (bit 20).
+- *
+- * Every one of these is logged on the first transition, so a board run
+- * shows the order the PHY asks for power and whether it ever asks at all.
++/* Espressif PHY host callbacks for the pinned ESP32-S3 blob.
++ * ABI: IDF esp_phy/include/esp_phy_init.h. Hardware operations follow
++ * hal/esp32s3/{sar_ctrl_ll,temperature_sensor_ll}.h, not ESP32 registers.
++ * NuttX delegates the corresponding lifecycle to Espressif's third-party HAL.
+  */
+ 
+ #define pr_fmt(fmt) "esp32-wifi-phy: " fmt
+@@ -62,36 +12,27 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/smp.h>
++#include <linux/preempt.h>
+ #include <linux/spinlock.h>
+ #include <linux/types.h>
+ 
+-/* SENS block, from the S3 TRM's peripheral map. */
+-#define ESP32_SENS_BASE			0x60008800
+-#define SENS_SAR_POWER_XPD_SAR_REG	0x00
+-#define SENS_SAR_PERI_CLK_GATE_CONF	0x20
+-#define SENS_SAR_PWDET_CTRL_REG		0x34
+-#define SENS_SAR_TSENS_CTRL_REG		0x3c
+-
+-#define SENS_FORCE_XPD_SAR_SHIFT	29
+-#define SENS_FORCE_XPD_SAR_MASK		0x3
+-#define SENS_FORCE_XPD_SAR_OFF		1
+-#define SENS_FORCE_XPD_SAR_ON		3
+-
+-#define SENS_PWDET_SAR_POWER_CTRL	BIT(17)
+-
+-#define SENS_TSENS_CLK_DIV_SHIFT	8
+-#define SENS_TSENS_CLK_DIV_MASK		0x3f
+-#define SENS_TSENS_POWER_UP		BIT(7)
+-#define SENS_TSENS_POWER_UP_FORCE	BIT(6)
+-#define SENS_TSENS_DUMP_OUT		BIT(5)
+-#define SENS_TSENS_READY		BIT(4)
+-#define SENS_TSENS_OUT_MASK		0xf
+-
+-#define SENS_SARADC_CLK_EN		BIT(19)
+-#define SENS_TSENS_CLK_EN		BIT(20)
+-
+-/* The PHY's own clock divider, from IDF's phy_init.c. */
+-#define ESP_PHY_TSENS_CLK_DIV		6
++#define ESP32_SENS_BASE 0x60008800
++#define SENS_SAR_POWER_XPD_SAR_REG 0x3c
++#define SENS_SAR_TSENS_CTRL_REG 0x50
++#define SENS_SAR_TSENS_CTRL2_REG 0x54
++#define SENS_SAR_PERI_CLK_GATE_CONF 0x104
++#define SENS_FORCE_XPD_SAR_SHIFT 29
++#define SENS_FORCE_XPD_SAR_MASK 3
++#define SENS_TSENS_POWER_UP BIT(22)
++#define SENS_TSENS_POWER_UP_FORCE BIT(23)
++#define SENS_TSENS_XPD_FORCE_SHIFT 12
++#define SENS_TSENS_XPD_FORCE_MASK 3
++#define SENS_TSENS_DUMP_OUT BIT(24)
++#define SENS_TSENS_READY BIT(8)
++#define SENS_TSENS_OUT_MASK 0xff
++#define SENS_SARADC_CLK_EN BIT(30)
++#define SENS_TSENS_CLK_EN BIT(29)
+ 
+ static void __iomem *sens_base;
+ static DEFINE_SPINLOCK(phy_lock);
+@@ -124,91 +65,59 @@
+ /* The three power hooks the PHY calls.                                */
+ /* ------------------------------------------------------------------ */
+ 
+-/*
+- * set_xpd_sar -- the SAR ADC's power. IDF's sar_periph_ctrl_pwdet_power_*
+- * also touches the RTC I2C registers, but those are for the ESP32; on the
+- * S3 the SAR ADC's power is this one field. Force-on is 3, force-off is 1,
+- * and 0 hands it back to the automatic controller.
+- */
++/* Both SAR and PWDET callbacks share the S3 SAR power domain. A release
++ * returns it to hardware FSM control only after both clients release it.
++ */
++static void phy_update_sar_power(void)
++{
++	u32 v = sens_read(SENS_SAR_POWER_XPD_SAR_REG);
++
++	sens_set_bits(SENS_SAR_PERI_CLK_GATE_CONF, SENS_SARADC_CLK_EN);
++	v &= ~(SENS_FORCE_XPD_SAR_MASK << SENS_FORCE_XPD_SAR_SHIFT);
++	if (sar_adc_on || pwdet_on)
++		v |= 3U << SENS_FORCE_XPD_SAR_SHIFT;
++	sens_write(SENS_SAR_POWER_XPD_SAR_REG, v);
++}
++
+ void set_xpd_sar(bool en)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&phy_lock, flags);
++	sar_adc_on = en;
++	phy_update_sar_power();
++	spin_unlock_irqrestore(&phy_lock, flags);
++}
++
++void phy_set_pwdet_power(bool en)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&phy_lock, flags);
++	pwdet_on = en;
++	phy_update_sar_power();
++	spin_unlock_irqrestore(&phy_lock, flags);
++}
++
++void phy_set_tsens_power(bool en)
+ {
+ 	unsigned long flags;
+ 	u32 v;
+ 
+ 	spin_lock_irqsave(&phy_lock, flags);
+-	if (sar_adc_on == en) {
+-		spin_unlock_irqrestore(&phy_lock, flags);
+-		return;
+-	}
+-	sar_adc_on = en;
+-
+-	v = sens_read(SENS_SAR_POWER_XPD_SAR_REG);
+-	v &= ~(SENS_FORCE_XPD_SAR_MASK << SENS_FORCE_XPD_SAR_SHIFT);
+-	v |= (en ? SENS_FORCE_XPD_SAR_ON : SENS_FORCE_XPD_SAR_OFF)
+-	     << SENS_FORCE_XPD_SAR_SHIFT;
+-	sens_write(SENS_SAR_POWER_XPD_SAR_REG, v);
+-
+-	pr_info("SAR ADC power %s (XPD_SAR=0x%08x)\n", en ? "on" : "off", v);
+-	spin_unlock_irqrestore(&phy_lock, flags);
+-}
+-
+-void phy_set_pwdet_power(bool en)
+-{
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&phy_lock, flags);
+-	if (pwdet_on == en) {
+-		spin_unlock_irqrestore(&phy_lock, flags);
+-		return;
+-	}
+-	pwdet_on = en;
+-
++	tsens_on = en;
+ 	if (en)
+-		sens_set_bits(SENS_SAR_PWDET_CTRL_REG, SENS_PWDET_SAR_POWER_CTRL);
+-	else
+-		sens_clr_bits(SENS_SAR_PWDET_CTRL_REG, SENS_PWDET_SAR_POWER_CTRL);
+-
+-	pr_info("power detector %s\n", en ? "on" : "off");
+-	spin_unlock_irqrestore(&phy_lock, flags);
+-}
+-
+-/*
+- * phy_set_tsens_power -- the temperature sensor. This one is not a
+- * courtesy call: the PHY uses the die temperature to correct its own
+- * calibration, so it must actually read the sensor, which means
+- * phy_get_tsens_value() below has to return a real number.
+- */
+-void phy_set_tsens_power(bool en)
+-{
+-	unsigned long flags;
+-	u32 v;
+-
+-	spin_lock_irqsave(&phy_lock, flags);
+-	if (tsens_on == en) {
+-		spin_unlock_irqrestore(&phy_lock, flags);
+-		return;
+-	}
+-	tsens_on = en;
+-
++		sens_set_bits(SENS_SAR_PERI_CLK_GATE_CONF, SENS_TSENS_CLK_EN);
+ 	v = sens_read(SENS_SAR_TSENS_CTRL_REG);
+-	v &= ~(SENS_TSENS_CLK_DIV_MASK << SENS_TSENS_CLK_DIV_SHIFT);
+-	v |= ESP_PHY_TSENS_CLK_DIV << SENS_TSENS_CLK_DIV_SHIFT;
++	v &= ~(SENS_TSENS_POWER_UP | SENS_TSENS_POWER_UP_FORCE);
+ 	if (en)
+ 		v |= SENS_TSENS_POWER_UP | SENS_TSENS_POWER_UP_FORCE;
+-	else
+-		v &= ~(SENS_TSENS_POWER_UP | SENS_TSENS_POWER_UP_FORCE);
+ 	sens_write(SENS_SAR_TSENS_CTRL_REG, v);
+-
+-	if (en) {
+-		/* The sensor needs its clock; IDF gates it with the SAR
+-		 * peripheral clock, which is the same gate the ADC uses.
+-		 */
+-		sens_set_bits(SENS_SAR_PERI_CLK_GATE_CONF,
+-			      SENS_SARADC_CLK_EN | SENS_TSENS_CLK_EN);
+-	}
+-
+-	pr_info("temperature sensor %s (TSENS_CTRL=0x%08x)\n",
+-		en ? "on" : "off", v);
++	v = sens_read(SENS_SAR_TSENS_CTRL2_REG);
++	v &= ~(SENS_TSENS_XPD_FORCE_MASK << SENS_TSENS_XPD_FORCE_SHIFT);
++	if (en)
++		v |= 1U << SENS_TSENS_XPD_FORCE_SHIFT;
++	sens_write(SENS_SAR_TSENS_CTRL2_REG, v);
+ 	spin_unlock_irqrestore(&phy_lock, flags);
+ }
+ 
+@@ -258,17 +167,36 @@
+ /* the saved flags, which is what phy_exit_critical gets back.          */
+ /* ------------------------------------------------------------------ */
+ 
++static DEFINE_RAW_SPINLOCK(phy_critical_lock);
++static int phy_critical_owner = -1;
++static unsigned int phy_critical_depth[NR_CPUS];
++
+ uint32_t phy_enter_critical(void)
+ {
+ 	unsigned long flags;
+-
++	unsigned int cpu;
++
++	preempt_disable();
+ 	local_irq_save(flags);
++	cpu = raw_smp_processor_id();
++	if (READ_ONCE(phy_critical_owner) != cpu) {
++		raw_spin_lock(&phy_critical_lock);
++		WRITE_ONCE(phy_critical_owner, cpu);
++	}
++	phy_critical_depth[cpu]++;
+ 	return (uint32_t)flags;
+ }
+ 
+ void phy_exit_critical(uint32_t level)
+ {
++	unsigned int cpu = raw_smp_processor_id();
++
++	if (--phy_critical_depth[cpu] == 0) {
++		WRITE_ONCE(phy_critical_owner, -1);
++		raw_spin_unlock(&phy_critical_lock);
++	}
+ 	local_irq_restore((unsigned long)level);
++	preempt_enable();
+ }
+ 
+ /* ------------------------------------------------------------------ */
+@@ -423,7 +351,7 @@
+ int esp32_wifi_phy_init(void)
+ {
+ 	if (!sens_base) {
+-		sens_base = ioremap(ESP32_SENS_BASE, 0x100);
++		sens_base = ioremap(ESP32_SENS_BASE, 0x200);
+ 		if (!sens_base)
+ 			return -ENOMEM;
+ 	}
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -2702,162 +2702,41 @@
+ 	pr_info("[%s] %s", tag ? tag : "wifi", buf);
+ }
+ 
+-/* ------------------------------------------------------------------ */
+-/* PHY and clock. These are the hooks libphy.a and the Wi-Fi task call */
+-/* back into the host for. They were all no-ops, and that is the second */
+-/* half of why the radio never came up: wifi_rf_phy_enable() calls     */
+-/* _wifi_apb80m_request, then _wifi_clock_enable, then _phy_enable, and */
+-/* with all three doing nothing the MAC and PHY blocks stayed gated    */
+-/* off and the calibration wrote into a dead peripheral.               */
+-/*                                                                     */
+-/* The register map is the S3's, from the TRM's system/peripheral      */
+-/* clock chapter and IDF's soc/esp32s3/include/soc/system_reg.h:       */
+-/*                                                                     */
+-/*   SYSTEM_WIFI_CLK_EN_REG      0x60026000 + 0x14                     */
+-/*     bit 0  WIFI_BT_COMMON, bits 1..2 WIFI_BT_SDIO, ...              */
+-/*     the Wi-Fi block's own clock gate; IDF writes 0xffffffff here    */
+-/*     in esp_phy_enable_clock() and that is what this does.           */
+-/*   SYSTEM_WIFI_RST_EN_REG      0x60026000 + 0x18                     */
+-/*     bit 5  WIFI_RST, bit 6  MAC_RST                                 */
+-/*   SYSTEM_PERIP_CLK_EN0_REG    0x600c0000 + 0x10                     */
+-/*     bit 22 WIFI_CLK_EN, bit 21 FE_CLK_EN                            */
+-/*   SYSTEM_PERIP_RST_EN0_REG    0x600c0000 + 0x18                     */
+-/*     the matching reset bits                                         */
+-/*   SYSTEM_WIFI_CLK_EN_REG's APB bit is what apb80m_request means:    */
+-/*     IDF's periph_module_enable(PERIPH_WIFI_MODULE) path raises the  */
+-/*     APB 80 MHz clock so the CPU can reach the MAC registers at all. */
+-/*                                                                     */
+-/* These are plain MMIO writes. CONFIG_MMU is off in this kernel, so   */
+-/* ioremap is identity and the peripheral window is reachable as-is.   */
+-/* ------------------------------------------------------------------ */
+-
+-#define ESP32_SYSTEM_BASE		0x60026000
+-#define SYSTEM_WIFI_CLK_EN_REG		0x14
+-#define SYSTEM_WIFI_RST_EN_REG		0x18
+-
+-#define ESP32_PERIP_BASE		0x600c0000
+-#define SYSTEM_PERIP_CLK_EN0_REG	0x10
+-#define SYSTEM_PERIP_RST_EN0_REG	0x18
+-
+-/* SYSTEM_PERIP_CLK_EN0: the Wi-Fi and front-end gates. */
+-#define PERIP_WIFI_CLK_EN		BIT(22)
+-#define PERIP_FE_CLK_EN			BIT(21)
+-
+-/* SYSTEM_WIFI_CLK_EN: the Wi-Fi/BT common gate is bit 0. */
+-#define WIFI_BT_COMMON_CLK_EN		BIT(0)
+-
+-/* SYSTEM_WIFI_RST_EN: the two resets this port drives. */
+-#define WIFI_RST			BIT(5)
+-#define MAC_RST				BIT(6)
+-
+-#define ESP32_SYSTEM_REG(off)	((void __iomem *)(ESP32_SYSTEM_BASE + (off)))
+-#define ESP32_PERIP_REG(off)	((void __iomem *)(ESP32_PERIP_BASE + (off)))
+-
+-static bool wifi_apb80m_on;
+-static bool wifi_clock_on;
+-
+-/*
+- * osi_wifi_apb80m_request -- raise the APB 80 MHz clock so the CPU can
+- * reach the MAC's register file. Without it every store the blob makes
+- * to the MAC block is lost, and the first read back is whatever the bus
+- * returns for an unclocked peripheral.
+- *
+- * IDF does this through periph_module_enable(PERIPH_WIFI_MODULE), which
+- * sets both the peripheral clock gate and the Wi-Fi APB gate; both are
+- * written here.
+- */
+-static void osi_wifi_apb80m_request(void)
+-{
+-	u32 v;
+-
+-	if (wifi_apb80m_on) {
+-		osi_note("_wifi_apb80m_request (already on)");
+-		return;
+-	}
+-	wifi_apb80m_on = true;
+-
+-	v = readl(ESP32_PERIP_REG(SYSTEM_PERIP_CLK_EN0_REG));
+-	v |= PERIP_WIFI_CLK_EN | PERIP_FE_CLK_EN;
+-	writel(v, ESP32_PERIP_REG(SYSTEM_PERIP_CLK_EN0_REG));
+-
+-	/* Take the MAC out of reset, then let it settle. The reset is
+-	 * asserted-low in effect: writing the bit releases it.
+-	 */
+-	v = readl(ESP32_SYSTEM_REG(SYSTEM_WIFI_RST_EN_REG));
+-	v &= ~(WIFI_RST | MAC_RST);
+-	writel(v, ESP32_SYSTEM_REG(SYSTEM_WIFI_RST_EN_REG));
+-
+-	pr_info("osi: APB 80M on: PERIP_CLK_EN0=0x%08x WIFI_RST_EN=0x%08x\n",
+-		readl(ESP32_PERIP_REG(SYSTEM_PERIP_CLK_EN0_REG)),
+-		readl(ESP32_SYSTEM_REG(SYSTEM_WIFI_RST_EN_REG)));
+-}
+-
+-static void osi_wifi_apb80m_release(void)
+-{
+-	if (!wifi_apb80m_on)
+-		return;
+-	wifi_apb80m_on = false;
+-	osi_note("_wifi_apb80m_release");
+-}
+-
+-/*
+- * osi_wifi_clock_enable -- the Wi-Fi block's own clock gate. IDF's
+- * esp_phy_enable_clock() writes 0xffffffff to SYSTEM_WIFI_CLK_EN; the
+- * field is a gate per sub-block and every one of them is wanted here.
+- */
++/* Fixed-frequency, no-modem-sleep baseline. APB already runs at 80MHz;
++ * NuttX/IDF's apb80m callbacks are PM locks, not peripheral gate writes.
++ */
++#define ESP32_SYSTEM_BASE 0x60026000
++#define SYSTEM_WIFI_CLK_EN_REG 0x14
++#define SYSTEM_WIFI_RST_EN_REG 0x18
++#define WIFI_COMMON_CLK_MASK 0x78078f
++#define MAC_RST BIT(2)
++#define ESP32_SYSTEM_REG(off) ((void __iomem *)(ESP32_SYSTEM_BASE + (off)))
++
++static void osi_wifi_apb80m_request(void) { }
++static void osi_wifi_apb80m_release(void) { }
++
+ static void osi_wifi_clock_enable(void)
+ {
+-	if (wifi_clock_on) {
+-		osi_note("_wifi_clock_enable (already on)");
+-		return;
+-	}
+-	wifi_clock_on = true;
+-
+-	writel(0xffffffff, ESP32_SYSTEM_REG(SYSTEM_WIFI_CLK_EN_REG));
+-	pr_info("osi: Wi-Fi clock on: WIFI_CLK_EN=0x%08x\n",
+-		readl(ESP32_SYSTEM_REG(SYSTEM_WIFI_CLK_EN_REG)));
+-}
+-
+-static void osi_wifi_clock_disable(void)
+-{
+-	if (!wifi_clock_on)
+-		return;
+-	wifi_clock_on = false;
+-	osi_note("_wifi_clock_disable");
+-}
+-
+-/*
+- * osi_wifi_reset_mac -- pulse the MAC reset. The blob calls this when it
+- * wants the MAC back at its power-on state; asserting and releasing the
+- * reset bit is what the hardware wants, and a short settle after it.
+- */
++	u32 v = readl(ESP32_SYSTEM_REG(SYSTEM_WIFI_CLK_EN_REG));
++
++	writel(v | WIFI_COMMON_CLK_MASK, ESP32_SYSTEM_REG(SYSTEM_WIFI_CLK_EN_REG));
++}
++
++/* Common clocks stay on for this no-sleep bring-up; preserve RNG and
++ * other Linux users. Modem sleep needs an explicit shared clock owner.
++ */
++static void osi_wifi_clock_disable(void) { }
++
+ static void osi_wifi_reset_mac(void)
+ {
+-	u32 v;
+-
+-	v = readl(ESP32_SYSTEM_REG(SYSTEM_WIFI_RST_EN_REG));
++	u32 v = readl(ESP32_SYSTEM_REG(SYSTEM_WIFI_RST_EN_REG));
++
+ 	writel(v | MAC_RST, ESP32_SYSTEM_REG(SYSTEM_WIFI_RST_EN_REG));
+ 	udelay(10);
+ 	writel(v & ~MAC_RST, ESP32_SYSTEM_REG(SYSTEM_WIFI_RST_EN_REG));
+ 	udelay(10);
+-	osi_note("_wifi_reset_mac");
+-}
+-
+-/*
+- * osi_phy_enable -- the PHY's own enable. wifi_rf_phy_enable() reaches
+- * this through the OS interface table once the clocks above are up, and
+- * it is the last thing before ic_mac_init().
+- *
+- * The PHY library has already been brought up by
+- * esp32_wifi_phy_init() -> register_chipv7_phy_init_param() by the time
+- * this is called, so there is no second calibration here: this is the
+- * power-on of the analog front end that the calibration assumed.
+- *
+- * The SAR ADC and the power detector are the two analog blocks the PHY
+- * reads through, and they are powered by the SENS hooks in
+- * esp32-wifi-blob-phy.c; this only has to make sure the PHY's own
+- * register window is clocked, which is the FE gate above.
+- */
++}
++
+ static void osi_phy_enable(void)
+ {
+ 	int ret = esp32_wifi_phy_enable();
+@@ -2866,10 +2745,7 @@
+ 		pr_err("full PHY initialization failed: %d\n", ret);
+ }
+ 
+-static void osi_phy_disable(void)
+-{
+-	osi_note("_phy_disable");
+-}
++static void osi_phy_disable(void) { }
+ 
+ static int osi_phy_update_country_info(const char *country)
+ {

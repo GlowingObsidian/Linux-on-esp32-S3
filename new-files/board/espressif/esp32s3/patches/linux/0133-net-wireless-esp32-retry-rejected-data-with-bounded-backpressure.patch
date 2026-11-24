@@ -1,0 +1,45 @@
+Subject: [PATCH] net: wireless: esp32: retain rejected TX data across buffer shortages
+
+The asynchronous transport previously freed a data skb after the vendor
+returned ESP_ERR_NO_MEM. Retry only that documented transient error, in
+the existing sleepable CPU0 worker, with a finite retry budget and a stop
+check before every submission. Preserve FIFO order and command ownership.
+
+diff --git a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -4248,6 +4248,8 @@
+ 	struct command_header *cmd;
+ 	u16 offset;
+ 	u16 len;
++	struct esp_wifi_blob *hw = READ_ONCE(g_blob);
++	unsigned int retries = 0;
+ 	int ret;
+ 
+ 	if (!skb || !skb->data || skb->len < sizeof(*hdr)) {
+@@ -4300,7 +4302,24 @@
+ 
+ 	skb_pull(skb, offset);
+ 
+-	ret = esp_wifi_internal_tx(NULL, skb->data, skb->len);
++	/* ESP_ERR_NO_MEM means that no radio buffer accepted this data frame.
++	 * Retain its skb and give the CPU0 radio tasks time to recycle buffers.
++	 * Control commands above run once; only rejected data is retried.
++	 */
++	if (!hw || adapter != &hw->adapter) {
++		dev_kfree_skb(skb);
++		return -ENODEV;
++	}
++	for (;;) {
++		if (READ_ONCE(hw->tx_stopping)) {
++			ret = -ESHUTDOWN;
++			break;
++		}
++		ret = esp_wifi_internal_tx(NULL, skb->data, skb->len);
++		if (ret != 0x101 || retries++ == 16)
++			break;
++		usleep_range(1000, 2000);
++	}
+ 	dev_kfree_skb(skb);
+ 	return ret;
+ }

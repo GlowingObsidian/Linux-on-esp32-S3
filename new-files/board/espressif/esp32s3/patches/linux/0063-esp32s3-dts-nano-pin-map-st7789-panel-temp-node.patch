@@ -1,0 +1,214 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: paulneja <207793167+paulneja@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 12:00:00 -0300
+Subject: [PATCH 63/63] esp32s3 dts: Nano pin map, ST7789 panel, temp node
+
+Move I2C to A4/A5 and SPI2 to D10-D13, which needs the GPIO matrix
+because the FSPI IO_MUX function only reaches GPIO9-14. Drop the
+mmc_spi slot, which cannot bind with MMC off and held CS0, and put an
+ST7789 panel on that chip select instead. Add the temperature sensor
+node.
+
+---
+ arch/xtensa/boot/dts/arduino-nano-esp32.dts | 141 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 130 insertions(+), 11 deletions(-)
+
+--- a/arch/xtensa/boot/dts/arduino-nano-esp32.dts
++++ b/arch/xtensa/boot/dts/arduino-nano-esp32.dts
+@@ -19,12 +19,22 @@
+ 		#size-cells = <0>;
+ 		compatible = "i2c-gpio";
+ 
+-		sda-gpios = <&gpio0 6 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+-		scl-gpios = <&gpio0 7 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		sda-gpios = <&gpio0 11 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&gpio0 12 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+ 
+ 		pinctrl-0 = <&i2c0_pins>;
+ 		pinctrl-names = "default";
+ 	};
++
++	/* The S3's temperature sensor. The first region is the SENS block:
++	 * tsens control/status at 0x50/0x54 and the peripheral clock gate at
++	 * 0x104. The second is the analog I2C master and the two ANA_CONFIG
++	 * registers that gate SAR/BBPLL access to it. */
++	tsens@60008800 {
++		compatible = "esp,esp32s3-tsens";
++		reg = <0x60008800 0x108>,
++		      <0x6000e000 0x4c>;
++	};
+ };
+ 
+ &iomux {
+@@ -32,15 +42,16 @@
+ 
+ 	i2c0_pins: i2c0_pins {
+ 		pinctrl-single,pins = <
+-			PIN(6) FUN0_20MA_IE_WPU			/* SDA */
+-			PIN(7) FUN0_20MA_IE_WPU>;		/* SCL */
++			PIN(11) FUN0_20MA_IE_WPU		/* A4, SDA */
++			PIN(12) FUN0_20MA_IE_WPU>;		/* A5, SCL */
+ 	};
+ 	spi2_pins: spi2_pins {
+ 		pinctrl-single,pins = <
+-			PIN(10) (FUN_SEL(4) | FUN_DRV_20MA)	/* CS0 */
+-			PIN(11) (FUN_SEL(4) | FUN_DRV_40MA)	/* MOSI */
+-			PIN(12) (FUN_SEL(4) | FUN_DRV_40MA)	/* SCK */
+-			PIN(13) (FUN_SEL(4) | FUN0_20MA_IE_WPU)>;/* MISO */
++			PIN(21) (FUN_SEL(1) | FUN_DRV_20MA)	/* D10, CS0 */
++			PIN(38) (FUN_SEL(1) | FUN_DRV_20MA)	/* D11, COPI */
++			PIN(47) (FUN_SEL(1) | FUN_DRV_20MA | FUN_IE | FUN_WPU)
++								/* D12, CIPO */
++			PIN(48) (FUN_SEL(1) | FUN_DRV_20MA)>;	/* D13, SCK */
+ 	};
+ 	uart0_pins: uart0_pins {
+ 		pinctrl-single,pins = <
+@@ -53,6 +64,49 @@
+ 	status = "ok";
+ };
+ 
++/*
++ * None of the four SPI2 pads is reachable by the FSPI IO_MUX function: that
++ * function is 4 and exists only on GPIO9..GPIO14. So the pads are put into
++ * their GPIO (matrix) function above, and the FSPI signals are routed to
++ * them here by hand.
++ *
++ * Note the asymmetry between the two muxes. An output is selected at the
++ * *pad's* register, GPIO_FUNCn_OUT_SEL_CFG, and the value written is the
++ * signal index, which is FSPICLK_OUT 101, FSPID_OUT 103 and FSPICS0_OUT 110
++ * (esp32s3 TRM table "Peripheral Signals via GPIO Matrix"). Writing the bare
++ * index leaves OUT_INV/OEN_SEL/OEN_INV clear, i.e. the output enable stays
++ * with the peripheral, which is what SPI wants -- that is also what gpio_ll's
++ * own peripheral-output helpers write, and it is why CS is asserted by the
++ * FSPI block rather than by gpiolib.
++ *
++ * An input is selected at the *signal's* register, GPIO_FUNCn_IN_SEL_CFG.
++ * Its low six bits are the GPIO number, but the signal also needs bit 7,
++ * GPIO_SIGn_IN_SEL: with that bit clear the signal takes the IO_MUX path and
++ * ignores the pad entirely (gpio_ll_iomux_in() is this same write with the
++ * bit cleared). So CIPO on D12 is 47 | 0x80, not 47.
++ */
++&gpio_out_mux {
++	status = "ok";
++
++	spi2_out_pins: spi2_out_pins {
++		pinctrl-single,pins = <
++			PIN(21) 110	/* FSPICS0_OUT -> D10 */
++			PIN(38) 103	/* FSPID_OUT   -> D11, COPI */
++			PIN(48) 101>;	/* FSPICLK_OUT -> D13, SCK */
++	};
++};
++
++&gpio_in_mux {
++	status = "ok";
++
++	spi2_in_pins: spi2_in_pins {
++		pinctrl-single,pins = <
++			/* 47 = D12; 0x80 = GPIO_SIGn_IN_SEL, without which
++			 * the signal takes the IO_MUX path and ignores the pad */
++			PIN(102) (47 | 0x80)>;
++	};
++};
++
+ &uart0 {
+ 	pinctrl-0 = <&uart0_pins>;
+ 	pinctrl-names = "default";
+@@ -60,13 +114,90 @@
+ };
+ 
+ &spi2 {
+-	pinctrl-0 = <&spi2_pins>;
++	pinctrl-0 = <&spi2_pins &spi2_out_pins &spi2_in_pins>;
+ 	pinctrl-names = "default";
+-	status = "ok";
++	status = "disabled";
+ 
+-	mmc_spi@0 {
+-		compatible = "mmc-spi-slot";
++	panel@0 {
++		compatible = "sitronix,st7789v";
+ 		reg = <0>;
++		spi-max-frequency = <20000000>;
++		/* SPI_MODE3, which is what this panel wants and what the
++		 * Adafruit sketch that brought it up passes to tft.init().
++		 * The two properties are the devicetree spelling of that mode:
++		 * spi-cpol is CPOL=1, spi-cpha is CPHA=1. Mode 0 leaves the
++		 * panel blank -- it latches on the wrong clock edge, so the
++		 * command bytes arrive shifted and nothing it is sent is
++		 * understood.
++		 *
++		 * spi-esp32.c supports all four modes: CPOL sets
++		 * SPI_CK_IDLE_EDGE in SPI_MISC_REG, CPHA sets SPI_CK_OUT_EDGE
++		 * in SPI_USER_REG. */
++		spi-cpol;
++		spi-cpha;
++		/* fb_st7789v.c's own display struct says 240x320, which is the
++		 * controller's full column count; this module is a 240x240
++		 * window onto it. fbtft takes width and height from the driver
++		 * and only lets the devicetree override them through these two
++		 * properties, so both have to be here or the framebuffer comes
++		 * up 80 rows too tall and the bottom of every frame is off the
++		 * glass.
++		 *
++		 * The names are bare `width` and `height`, not
++		 * `fbtft,width`: fbtft_properties_read() reads them with
++		 * device_property_read_u32(dev, "width", ...) and there is no
++		 * vendor prefix anywhere in that function. */
++		width  = <240>;
++		height = <240>;
++		/* Which 240 of the controller's 320 rows are on the glass is a
++		 * property of the module's own wiring, and it cannot be read
++		 * out of the module -- it has to be tried. 0 is what this
++		 * module turned out to want: it is top-aligned, visible rows
++		 * 0..239, and the image is flush to the top edge with the
++		 * bottom line unclipped. Adafruit's library hardcodes 80 for
++		 * every 240x240 module (`_rowstart = 320 - height`), i.e.
++		 * bottom-aligned, visible rows 80..319 -- that assumption does
++		 * not hold here, and it is why the first boot left the top
++		 * third of the glass blank.
++		 *
++		 * 0 is also the value with no property at all:
++		 * fbtft_framebuffer_alloc() only copies pdata->display.row_offset
++		 * when it is non-zero, so `row-offset = <0>` and an absent
++		 * property are the same thing. It is written out because the
++		 * value is a finding about this module, not a default.
++		 *
++		 * Patch 0069 adds the property and a sysfs knob beside it, so
++		 * this can be changed on the board with `echo` rather than by
++		 * reflashing.
++		 *
++		 * The name is bare `row-offset`, like width and height above:
++		 * fbtft_property_value() is device_property_read_u32() with no
++		 * vendor prefix. */
++		row-offset = <0>;
++		/* fbtft_probe_common() rejects the device with "buswidth is
++		 * not set" when display->buswidth is 0, and fb_st7789v.c sets
++		 * no default, so the node has to carry it. The controller's
++		 * register width is 8 and its data bus over SPI is 8 bits. */
++		buswidth = <8>;
++		dc-gpios    = <&gpio0 6 GPIO_ACTIVE_HIGH>;	/* D3 */
++		reset-gpios = <&gpio0 7 GPIO_ACTIVE_LOW>;	/* D4 */
++		/* No led-gpios: this module has no backlight pad. It is
++		 * broken out as SCL SDA RES DC plus power, and BLK is tied to
++		 * VCC on the board, so the light is on whenever the module is
++		 * powered. fbtft_properties_read() registers a backlight
++		 * device on a led-gpios line, and pointing that at a spare
++		 * header pin would give userspace a /sys/class/backlight
++		 * entry that controls nothing -- so the property is left out
++		 * and no backlight device is created.
++		 *
++		 * No cs-gpios either, for the same reason: the module has no
++		 * CS pad and its CS is tied low, so it is selected
++		 * permanently. That is fine on a bus with one device.
++		 * `reg = <0>` stays because it is what tells the SPI core
++		 * which chip select to claim, whether or not the pad is
++		 * wired; spi-esp32.c drives CS itself through SPI_MISC_REG
++		 * and never consults cs-gpios, so the FSPICS0_OUT route on
++		 * D10 is simply unconnected. */
+ 	};
+ };
+ 
+
+-- 
+2.55.0
+

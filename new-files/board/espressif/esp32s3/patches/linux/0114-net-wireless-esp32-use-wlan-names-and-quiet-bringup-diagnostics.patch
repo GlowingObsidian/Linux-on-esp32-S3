@@ -1,0 +1,238 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -332,7 +332,7 @@
+ 	if (!osi_log_once[h]) {
+ 		osi_log_once[h] = true;
+ 		spin_unlock_irqrestore(&osi_log_lock, flags);
+-		pr_info("osi: %s (first call)\n", what);
++		pr_debug("osi: %s (first call)\n", what);
+ 		return;
+ 	}
+ 	spin_unlock_irqrestore(&osi_log_lock, flags);
+@@ -811,7 +811,7 @@
+ 	if (!m)
+ 		return NULL;
+ 	mutex_init(&m->lock);
+-	pr_info("osi: _mutex_create -> %p (caller %pS)\n", m,
++	pr_debug("osi: _mutex_create -> %p (caller %pS)\n", m,
+ 		__builtin_return_address(0));
+ 	return m;
+ }
+@@ -838,7 +838,7 @@
+ {
+ 	struct osi_mutex *m = mutex;
+ 
+-	pr_info("osi: _mutex_delete(%p) task %s caller %pS\n", m, current->comm,
++	pr_debug("osi: _mutex_delete(%p) task %s caller %pS\n", m, current->comm,
+ 		__builtin_return_address(0));
+ 
+ 	if (!m)
+@@ -994,7 +994,7 @@
+ 	 * the object was overwritten between the two, and this line is the
+ 	 * only record of what it held when it was made.
+ 	 */
+-	pr_info("osi: _semphr_create(%u, %u) -> %p count=%u\n",
++	pr_debug("osi: _semphr_create(%u, %u) -> %p count=%u\n",
+ 		max, init, s, s->sem.count);
+ 	return s;
+ }
+@@ -1191,7 +1191,7 @@
+ 	list_for_each_entry(ts, &osi_thread_sems, node) {
+ 		if (ts->task == task) {
+ 			spin_unlock(&osi_thread_sems_lock);
+-			pr_info("osi: thread semphr get -> %p (task %s, existing)\n",
++			pr_debug("osi: thread semphr get -> %p (task %s, existing)\n",
+ 				&ts->sem, task->comm);
+ 			return &ts->sem;
+ 		}
+@@ -1210,7 +1210,7 @@
+ 	list_add(&ts->node, &osi_thread_sems);
+ 	spin_unlock(&osi_thread_sems_lock);
+ 
+-	pr_info("osi: thread semphr get -> %p (task %s, new)\n", &ts->sem,
++	pr_debug("osi: thread semphr get -> %p (task %s, new)\n", &ts->sem,
+ 		task->comm);
+ 	return &ts->sem;
+ }
+@@ -1589,7 +1589,7 @@
+ 		if (!left)
+ 			break;
+ 		/* The third ___wait_event site. See osi_queue_recv. */
+-		pr_info("osi: %s(%p) sp=%p ticks=%u wq=%p next=%p prev=%p\n",
++		pr_debug("osi: %s(%p) sp=%p ticks=%u wq=%p next=%p prev=%p\n",
+ 			__func__, g, __builtin_frame_address(0), ticks,
+ 			&g->wait, g->wait.head.next, g->wait.head.prev);
+ 		left = wait_event_killable_timeout(g->wait,
+@@ -2082,7 +2082,7 @@
+ 		enable_irq(virq);
+ 	spin_unlock_irqrestore(&osi_isr_lock, flags);
+ 
+-	pr_info("osi: core int %d <- matrix row %d, Linux IRQ %d, handler %ps\n",
++	pr_debug("osi: core int %d <- matrix row %d, Linux IRQ %d, handler %ps\n",
+ 		n, osi_intr_source[n], virq, s->fn);
+ }
+ 
+@@ -2095,7 +2095,7 @@
+ 		return;
+ 	}
+ 
+-	pr_info("osi: _set_intr(cpu=%d, source=%u, num=%u, prio=%d)\n",
++	pr_debug("osi: _set_intr(cpu=%d, source=%u, num=%u, prio=%d)\n",
+ 		cpu_no, intr_source, intr_num, intr_prio);
+ 
+ 	/* Keep every source, rather than overwriting BB row2 with MAC row0.
+@@ -2141,7 +2141,7 @@
+ 		return;
+ 	}
+ 
+-	pr_info("osi: _set_isr(n=%d, f=%ps, arg=%p)\n", n, f, arg);
++	pr_debug("osi: _set_isr(n=%d, f=%ps, arg=%p)\n", n, f, arg);
+ 
+ 	osi_isrs[n].fn = f;
+ 	osi_isrs[n].arg = arg;
+@@ -2253,7 +2253,7 @@
+ 
+ 	if (l)
+ 		spin_lock_init(l);
+-	pr_info("osi: _spin_lock_create -> %p (caller %pS)\n", l,
++	pr_debug("osi: _spin_lock_create -> %p (caller %pS)\n", l,
+ 		__builtin_return_address(0));
+ 	return l;
+ }
+@@ -2895,7 +2895,7 @@
+ 		return -0x106;		/* ESP_ERR_NOT_SUPPORTED */
+ 	}
+ 
+-	pr_info("osi: mac type %u = %pM\n", idx, mac);
++	pr_debug("osi: mac type %u = %pM\n", idx, mac);
+ 	return 0;
+ }
+ 
+@@ -3492,7 +3492,7 @@
+ 
+ 	switch (event_id) {
+ 	case WIFI_EVENT_STA_START:
+-		pr_info("event: station started\n");
++		pr_debug("event: station started\n");
+ 		break;
+ 
+ 	case WIFI_EVENT_STA_STOP:
+@@ -3557,7 +3557,7 @@
+ 		ev.status = 0;
+ 		ev.len = 0;
+ 
+-		pr_info("event: scan done\n");
++		pr_debug("event: scan done\n");
+ 		blob_schedule_scan_cleanup();
+ 		blob_post_event(hw, &ev, sizeof(ev));
+ 		break;
+@@ -3664,7 +3664,7 @@
+ 		ret = blob_post_cmd_resp(hw, cmd_code, NULL, 0, CMD_RESPONSE_SUCCESS);
+ 		if (ret)
+ 			return false;
+-		pr_info("cmd: init interface answered\n");
++		pr_debug("cmd: init interface answered\n");
+ 		return true;
+ 
+ 	case CMD_GET_MAC:
+@@ -3683,7 +3683,7 @@
+ 					  CMD_RESPONSE_SUCCESS);
+ 		if (ret)
+ 			return false;
+-		pr_info("cmd: get mac answered %pM\n", mac);
++		pr_debug("cmd: get mac answered %pM\n", mac);
+ 		return true;
+ 
+ 	default:
+@@ -4521,8 +4521,8 @@
+ 	if (ret || !wifi_blob_enable)
+ 		return ret;
+ 	if (!g_blob) {
+-		pr_err("osi: no probe yet; cannot start the blob\n");
+-		return -ENODEV;
++		/* Probe will honor a command-line request once ready. */
++		return 0;
+ 	}
+ 	schedule_work_on(0, &wifi_blob_work);
+ 	return 0;
+@@ -4881,15 +4881,15 @@
+ 	 * rest: if a blocking take is what never returns, the log ends on
+ 	 * "blocking take" and names the handle.
+ 	 */
+-	pr_info("osi: coex: adapter_register enter\n");
++	pr_debug("osi: coex: adapter_register enter\n");
+ 	ret = esp_coex_adapter_register(&g_coex_adapter_funcs);
+-	pr_info("osi: coex: adapter_register leave: %d\n", ret);
++	pr_debug("osi: coex: adapter_register leave: %d\n", ret);
+ 	if (ret)
+ 		dev_warn(hw->adapter.dev, "esp_coex_adapter_register: %d\n", ret);
+ 
+-	pr_info("osi: coex: pre_init enter\n");
++	pr_debug("osi: coex: pre_init enter\n");
+ 	ret = coex_pre_init();
+-	pr_info("osi: coex: pre_init leave: %d\n", ret);
++	pr_debug("osi: coex: pre_init leave: %d\n", ret);
+ 	if (ret)
+ 		dev_warn(hw->adapter.dev, "coex_pre_init: %d\n", ret);
+ 
+@@ -4926,7 +4926,7 @@
+ 		dev_err(hw->adapter.dev, "esp_wifi_init_internal: %d\n", ret);
+ 		goto err_adapter;
+ 	}
+-	dev_info(hw->adapter.dev, "blob initialised\n");
++	dev_dbg(hw->adapter.dev, "blob initialised\n");
+ 
+ 	/*
+ 	 * What the blob left in the ROM slots, now that its init has run.
+@@ -4994,7 +4994,7 @@
+ 		dev_err(hw->adapter.dev, "esp_wifi_internal_reg_rxcb: %d\n", ret);
+ 		goto err_blob_deinit;
+ 	}
+-	dev_info(hw->adapter.dev, "rx callback registered\n");
++	dev_dbg(hw->adapter.dev, "rx callback registered\n");
+ 
+ 	/*
+ 	 * Bring the driver's own upper half up: the wiphy and espsta0.
+@@ -5023,7 +5023,7 @@
+ 		dev_err(hw->adapter.dev, "esp_add_card: %d\n", ret);
+ 		goto err_blob_deinit;
+ 	}
+-	dev_info(hw->adapter.dev, "wiphy and espsta0 registered\n");
++	dev_info(hw->adapter.dev, "wlan0 registered\n");
+ 
+ 	return 0;
+ 
+--- a/drivers/net/wireless/espressif/esp32-ng/main.c
++++ b/drivers/net/wireless/espressif/esp32-ng/main.c
+@@ -483,7 +483,7 @@
+ 	}
+ 
+ 	rtnl_lock();
+-	wdev = esp_cfg80211_add_iface(adapter->wiphy, "espsta%d", 1, NL80211_IFTYPE_STATION, NULL);
++	wdev = esp_cfg80211_add_iface(adapter->wiphy, "wlan%d", 1, NL80211_IFTYPE_STATION, NULL);
+ 	rtnl_unlock();
+ 
+ 	/* Return success if network added successfully */
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_cfg80211.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_cfg80211.c
+@@ -118,7 +118,7 @@
+ {
+ 	struct in_ifaddr *ifa = data;
+ 	struct net_device *netdev = ifa && ifa->ifa_dev ? ifa->ifa_dev->dev : NULL;
+-	struct esp_wifi_device *priv;
++	struct esp_wifi_device *priv = container_of(nb, struct esp_wifi_device, nb);
+ 
+ 	/* This notifier is global: it fires for lo and for every other netdev
+ 	 * in the system, and ifa_dev can be NULL. netdev_priv(NULL) was being
+@@ -127,10 +127,8 @@
+ 	if (!netdev)
+ 		return NOTIFY_DONE;
+ 
+-	if (!strstr(netdev->name, "espsta"))
++	if (netdev != priv->ndev)
+ 		return NOTIFY_DONE;
+-
+-	priv = netdev_priv(netdev);
+ 
+ 	switch (event) {
+ 

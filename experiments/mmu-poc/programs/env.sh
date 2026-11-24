@@ -11,7 +11,7 @@ export CFLAGS='-Os -mfdpic -mauto-litpools -fPIC -ffunction-sections -fdata-sect
 export CXXFLAGS="$CFLAGS"
 export LDFLAGS="-Wl,--gc-sections,-z,stack-size=65536 -L$experiment_dir/out"
 export LIBS='-l:libfork.so.0'
-host_dir="$build_dir/build-buildroot-esp32s3_devkit_c1_16m/host"
+host_dir="$build_dir/build-buildroot-arduino_nano_esp32/host"
 
 apply_program_patch() {
     local source_dir=$1 patch_name=$2

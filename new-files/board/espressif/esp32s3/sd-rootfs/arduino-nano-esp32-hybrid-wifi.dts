@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "arduino-nano-esp32-hybrid-pio.dts"
+
+&{/wifi_blob} {
+	status = "okay";
+	/* Reserve the tail of the former 64 KiB display SRAM area. The first
+	 * 0x2040 bytes remain exclusively assigned to SPI's DMA descriptors
+	 * and bounce buffers, even though this profile deliberately uses PIO.
+	 * Stop below the bootloader/ROM region at 0x3fcdc700.
+	 */
+	reg = <0x3fcce800 0xdf00>;
+	reg-names = "wifi-sram";
+};

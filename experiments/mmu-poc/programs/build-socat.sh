@@ -7,7 +7,10 @@ if [[ ! -d "$source_dir" ]]; then
     tar -xjf "$programs_out/downloads/socat-1.8.1.3.tar.bz2" -C "$programs_out"
 fi
 apply_program_patch "$source_dir" socat-fork.patch
-export CFLAGS="$CFLAGS -Oz -flto"
+# -flto-partition=none: see the long note in build-bash.sh. The pinned GCC's
+# LTO aborts in return_token (opts-common.cc:2158) when lto-wrapper runs its
+# jobs through the make jobserver; a single partition avoids the jobserver.
+export CFLAGS="$CFLAGS -Oz -flto -flto-partition=none"
 cd "$source_dir"
 if [[ -f Makefile ]]; then make clean; fi
 ac_cv_have_c99_snprintf=yes ac_cv_have_z_modifier=yes \

@@ -1,0 +1,14 @@
+--- a/fs/iomap/ioend.c
++++ b/fs/iomap/ioend.c
+@@ -521,9 +521,9 @@
+ 			   BIOSET_NEED_BVECS);
+ 	if (error)
+ 		return error;
++	/* bio_split() clones the source bvec; this pool only needs bios. */
+ 	error = bioset_init(&iomap_ioend_split_bioset, nr_mempool_entries,
+-			   offsetof(struct iomap_ioend, io_bio),
+-			   BIOSET_NEED_BVECS);
++			   offsetof(struct iomap_ioend, io_bio), 0);
+ 	if (error)
+ 		goto out_exit_ioend_bioset;
+ 	return 0;

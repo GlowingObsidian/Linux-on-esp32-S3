@@ -1,0 +1,14 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -4761,10 +4761,7 @@
+ 	 * esp32-wifi.o, and the sysfs directory follows the object name.
+ 	 */
+ 	if (!wifi_blob_enable) {
+-		dev_info(&pdev->dev,
+-			 "blob disabled; booting without it. Start it with:\n");
+-		dev_info(&pdev->dev,
+-			 "  echo 1 > /sys/module/esp32_wifi/parameters/enable\n");
++		dev_dbg(&pdev->dev, "radio awaits userspace initialization\n");
+ 		return 0;
+ 	}
+ 

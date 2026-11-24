@@ -26,6 +26,12 @@ args.output.mkdir(parents=True, exist_ok=False)
 spec = importlib.util.spec_from_file_location('probe', exp / 'serial-probe.py')
 probe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe)
+
+# getty builds its prompt out of the hostname, so matching "buildroot login:"
+# would tie this test to the stock image's name. The image under test is called
+# arduino, and the hostname is a configurable value rather than a
+# fact about the board, so the pattern takes whatever name is there.
+LOGIN_PROMPT = re.compile(rb'[\w.-]+ login: ?')
 results = {'image_sha256': manifest['sha256']['linux-esp32s3-native-full.bin'],
            'source_commit': manifest['source_commit'],
            'test_runner_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -34,7 +40,7 @@ results['test_files_sha256'] = {
     str(path.relative_to(repo)): hashlib.sha256(path.read_bytes()).hexdigest()
     for path in [exp / 'serial-probe.py', *[
         exp / 'programs' / (name + '.py')
-        for name in ('test-home-users-board', 'test-cron-board', 'test-com-reconnect', 'test-home-reboot')
+        for name in ('test-home-users-board', 'test-com-reconnect', 'test-home-reboot')
     ]]
 }
 console = None
@@ -94,7 +100,7 @@ def boot_from_flash():
             log.flush()
             print(chunk.decode(errors='replace'), end='', flush=True)
             data = (data + chunk)[-256:]
-            if re.search(rb'buildroot login: ?', data):
+            if LOGIN_PROMPT.search(data):
                 return
     raise RuntimeError('No login within 240 seconds; complete output saved in boot.log')
 
@@ -196,7 +202,7 @@ def jffs2_write_timing():
 
 def benchmarks():
     console.port.write(b'exec /usr/bin/dash -c \'trap "sleep 1" EXIT; . /usr/share/program-tests/benchmark-suite.sh\'\n')
-    output, _ = console.until(rb'buildroot login: ?', 180)
+    output, _ = console.until(LOGIN_PROMPT, 180)
     text = output.decode(errors='replace')
     print(text, flush=True)
     (args.output / 'benchmarks.log').write_text(text)
@@ -232,7 +238,7 @@ try:
          'esp32s3'),
         ('no-driver-timeout', '! dmesg | grep -q "accelerator did not report ready" && echo RSA_OK', 'RSA_OK'),
         ('shell-policy', 'test -n "$BASH_VERSION" && test "$(readlink /bin/sh)" = busybox && test "$HOME" = /home/root', None),
-        ('first-boot-home', 'test -f /home/root/README.txt && test "$(stat -c %a /home/root)" = 700 && test -f /home/www/index.html && test -x /home/www/cgi-bin/status && test ! -e /www && set -- /home/.www-seed.* && test ! -e "$1"', None),
+        ('first-boot-home', 'test -d /home/root && test -z "$(ls -A /home/root)" && test "$(stat -c %a /home/root)" = 700 && test ! -e /home/www && test ! -e /www && test ! -e /usr/sbin/web-server && ! busybox --list 2>/dev/null | grep -qx httpd && ! grep -q "^www-data:" /etc/passwd && ! grep -q "^www-data:" /etc/group && set -- /home/.www-seed.* && test ! -e "$1"', None),
         ('excluded-programs', 'test ! -e /usr/bin/sqlite3 && test ! -e /usr/bin/sudo && test ! -e /usr/bin/doas && test ! -e /usr/bin/nvim && test ! -e /usr/bin/python3', None),
         ('mmu-executable-remap', 'mmu-run self-test', 'PASS: executable A -> B -> A -> B'),
         ('mmu-fibonacci', 'mmu-run run /usr/share/mmu/fib.elf 20', 'Result: 6765'),
@@ -247,13 +253,15 @@ try:
         ('network-tools', '/usr/bin/dash /usr/share/program-tests/network-tools-test.sh', 'PASS'),
         ('hush-login', '/usr/bin/dash /usr/share/program-tests/hush-login-test.sh', 'PASS'),
         ('jobq', '/usr/bin/dash /usr/share/program-tests/jobq-test.sh', 'PASS'),
-        # The console switch: default quiet, verbose raises the level for real,
-        # and it goes back. Left as it was found, which is the default.
-        ('bootlog-default-is-quiet', 'bootlog status', 'quiet (the default)'),
-        ('bootlog-verbose-raises-the-level',
-         'bootlog verbose >/dev/null && cut -f1 /proc/sys/kernel/printk', '8'),
-        ('bootlog-quiet-restores-it',
+        # The console switch. This image ships /etc/bootlog/verbose, so the
+        # boot is read as it happens; the kernel command line carries no
+        # `quiet` either (patches 0049 and 0060). Checked in the order that
+        # leaves the setting where it was found: verbose, which is the default.
+        ('bootlog-default-is-verbose', 'bootlog status', 'setting: verbose'),
+        ('bootlog-quiet-lowers-the-level',
          'bootlog quiet >/dev/null && cut -f1 /proc/sys/kernel/printk', '4'),
+        ('bootlog-verbose-raises-it-again',
+         'bootlog verbose >/dev/null && cut -f1 /proc/sys/kernel/printk', '8'),
     ]
     for name, text, expected in checks:
         record(name, lambda text=text, expected=expected: command(text, 180, expected))
@@ -264,7 +272,7 @@ try:
     record('memory-final', record_memory_after)
     console.close()
     console = None
-    for name in ('test-home-users-board', 'test-cron-board', 'test-com-reconnect', 'test-home-reboot'):
+    for name in ('test-home-users-board', 'test-com-reconnect', 'test-home-reboot'):
         record(name, lambda name=name: external(name))
     console = probe.Console(args.port)
     console.login()
@@ -276,7 +284,7 @@ try:
         'finished_utc': results['finished_utc'],
         'report': os.path.relpath(args.output.resolve() / 'results.json', args.artifacts.resolve()),
         'test_runner_sha256': results['test_runner_sha256'],
-        'scope': 'Local COM, memory, programs, users, loopback network, cron and persistence; no external WiFi test',
+        'scope': 'Local COM, memory, programs, users, loopback network and persistence; no external WiFi test',
     }
     (args.artifacts / 'build-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
 except BaseException:

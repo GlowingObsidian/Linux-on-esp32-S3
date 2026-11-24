@@ -1,0 +1,186 @@
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob_phy.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob_phy.c
+@@ -61,6 +61,7 @@
+ #include <linux/io.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/spinlock.h>
+ #include <linux/types.h>
+ 
+@@ -350,16 +351,15 @@
+ /* Bring-up.                                                           */
+ /* ------------------------------------------------------------------ */
+ 
+-/*
+- * The PHY's own init entry point, from libphy.a. It is what IDF's
+- * esp_phy_init() calls after it has copied the PHY init data out of the
+- * phy_init partition. The signature is IDF's, from
+- * esp_phy/include/esp_phy_init.h, with the calibration-data structs
+- * passed as opaque pointers because this port does not include IDF's
+- * headers.
+- */
+-extern int register_chipv7_phy_init_param(void *param, void *cal_data,
+-					  bool full_cal);
++/* The full host-side entry point used by NuttX's Espressif HAL and
++ * the pinned IDF. The similarly named _init_param only copies parameters;
++ * it does not initialize g_phyFuns or calibrate the radio.
++ */
++extern int register_chipv7_phy(const void *init_data, void *cal_data, int mode);
++extern void *g_phyFuns;
++#define PHY_RF_CAL_FULL 2
++static DEFINE_MUTEX(phy_init_lock);
++static bool phy_calibrated;
+ 
+ /*
+  * The PHY needs the ROM's own function table before anything else: it
+@@ -401,7 +401,7 @@
+  * 76 of this with no validation, so 112 bytes is IDF's length with room
+  * past the highest byte it touches. See the comment at the call site.
+  */
+-#define PHY_INIT_DATA_LEN	112
++#define PHY_INIT_DATA_LEN	128
+ 
+ static const u8 phy_init_data[PHY_INIT_DATA_LEN] __aligned(4) = {
+ 	0x00, 0x00, 0x50, 0x50, 0x50, 0x4c, 0x4c, 0x48, 0x4c, 0x48, 0x48, 0x44,
+@@ -413,86 +413,39 @@
+ 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+ 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+ 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+-	0x00, 0x00, 0x00, 0x74,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x74,
+ };
+ 
++/* Probe only maps the analog block. Radio calibration must wait until
++ * the OS interface is installed and the Wi-Fi clocks are enabled.
++ */
+ int esp32_wifi_phy_init(void)
+ {
+-	int ret;
+-
+ 	if (!sens_base) {
+ 		sens_base = ioremap(ESP32_SENS_BASE, 0x100);
+-		if (!sens_base) {
+-			pr_err("ioremap(0x%x) failed\n", ESP32_SENS_BASE);
++		if (!sens_base)
+ 			return -ENOMEM;
+-		}
+-	}
+-
+-	pr_info("SENS at %p, XPD_SAR=0x%08x TSENS_CTRL=0x%08x PWDET=0x%08x\n",
+-		sens_base,
+-		sens_read(SENS_SAR_POWER_XPD_SAR_REG),
+-		sens_read(SENS_SAR_TSENS_CTRL_REG),
+-		sens_read(SENS_SAR_PWDET_CTRL_REG));
+-	esp32_wifi_phy_check_rom();
+-
+-	/*
+-	 * Run the PHY's own bring-up. This is the call the whole file exists
+-	 * for and it was missing: everything above is preparation, and
+-	 * without this the radio is never calibrated and never enabled.
+-	 *
+-	 * It is the host's job, not the blob's. Traced through the linked
+-	 * image, register_chipv7_phy() has no caller anywhere -- the Wi-Fi
+-	 * task's init path (esp_wifi_init_internal -> wifi_init_in_caller_task
+-	 * -> ic_create_wifi_task -> pp_create_task) only creates the task and
+-	 * returns, and wifi_init_process(), which does reach ic_init ->
+-	 * hal_init, runs later inside that task and expects the PHY to be up
+-	 * already. IDF's esp_phy_init() is what calls this, and IDF's
+-	 * esp_phy_init() is the host.
+-	 *
+-	 * The first argument is the PHY init data, and it is NOT optional.
+-	 *
+-	 * An earlier version passed NULL, on the theory that the function
+-	 * falls back to a default table. That fallback belongs to
+-	 * register_chipv7_phy(), a different function this port does not
+-	 * call. register_chipv7_phy_init_param() dereferences its first
+-	 * argument at +0x46 with no check of any kind:
+-	 *
+-	 *     423a5176:  l8ui a8, a2, 0        ; a2 is the first argument
+-	 *
+-	 * With NULL the load faults at excvaddr 0. The function has no
+-	 * magic compare, no CRC and no error return path; it reads the
+-	 * table and returns. Function size is 0x12f, the last read is
+-	 * a2[76] at 423a5257, then retw.n -- so the argument must point at
+-	 * at least 77 readable bytes.
+-	 *
+-	 * The blob builds its own 14-byte table at a1+2..a1+15 before it
+-	 * reads a2 (423a5140..423a5173):
+-	 *
+-	 *     52 52 50 4c 4c 48 4c 48 48 46 4a 46 46 44
+-	 *
+-	 * That table is a CAP, not a default. The loop at 423a5195 clamps
+-	 * the caller's value down to it (bge a13, a3, skip / s8i a13, a8,
+-	 * 244), so passing the blob's own table would make every value
+-	 * equal its own cap and the loop a no-op.
+-	 *
+-	 * This is IDF's phy_init_data for the S3, from
+-	 * components/esp_phy/esp32s3/include/phy_init_data.h, with
+-	 * CONFIG_ESP_PHY_MAX_TX_POWER=20 so LIMIT(20*4, 0, cap) gives the
+-	 * caps below. The board has no phy_init partition, so the table is
+-	 * compiled in rather than read from flash. IDF's esp_phy_init()
+-	 * passes this same table on a real system.
+-	 *
+-	 * The third argument is the calibration mode. 1 is PHY_RF_CAL_FULL,
+-	 * which is what IDF uses on a first boot with no stored calibration
+-	 * and what TheButlah's bare-metal S3 port passes.
+-	 */
+-	ret = register_chipv7_phy_init_param((void *)phy_init_data,
+-					     phy_rf_cal_data, true);
+-	pr_info("register_chipv7_phy_init_param -> %d\n", ret);
+-	if (ret)
+-		return ret;
+-
++	}
+ 	return 0;
++}
++
++int esp32_wifi_phy_enable(void)
++{
++	int ret = 0;
++
++	mutex_lock(&phy_init_lock);
++	if (!phy_calibrated) {
++		ret = register_chipv7_phy(phy_init_data, phy_rf_cal_data, PHY_RF_CAL_FULL);
++		if (!ret && !READ_ONCE(g_phyFuns))
++			ret = -EIO;
++		if (!ret)
++			phy_calibrated = true;
++		pr_info("full PHY initialization: ret=%d function_table=%s\n",
++			ret, READ_ONCE(g_phyFuns) ? "ready" : "NULL");
++	}
++	mutex_unlock(&phy_init_lock);
++	return ret;
+ }
+ 
+ void esp32_wifi_phy_deinit(void)
+--- a/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
++++ b/drivers/net/wireless/espressif/esp32-ng/esp_blob.c
+@@ -63,6 +63,7 @@
+ 
+ /* From esp_blob_phy.c. */
+ int esp32_wifi_phy_init(void);
++int esp32_wifi_phy_enable(void);
+ void esp32_wifi_phy_deinit(void);
+ void esp32_wifi_phy_check_rom(void);
+ 
+@@ -2859,14 +2860,10 @@
+  */
+ static void osi_phy_enable(void)
+ {
+-	u32 v;
+-
+-	v = readl(ESP32_PERIP_REG(SYSTEM_PERIP_CLK_EN0_REG));
+-	v |= PERIP_FE_CLK_EN | PERIP_WIFI_CLK_EN;
+-	writel(v, ESP32_PERIP_REG(SYSTEM_PERIP_CLK_EN0_REG));
+-
+-	pr_info("osi: phy enable: PERIP_CLK_EN0=0x%08x\n",
+-		readl(ESP32_PERIP_REG(SYSTEM_PERIP_CLK_EN0_REG)));
++	int ret = esp32_wifi_phy_enable();
++
++	if (ret)
++		pr_err("full PHY initialization failed: %d\n", ret);
+ }
+ 
+ static void osi_phy_disable(void)

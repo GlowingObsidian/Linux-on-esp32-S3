@@ -1,0 +1,273 @@
+--- a/drivers/mtd/devices/Kconfig
++++ b/drivers/mtd/devices/Kconfig
+@@ -225,3 +225,11 @@
+ endif
+ 
+ endmenu
++
++config MTD_ESP32_FLASH_GUARD_TEST
++	bool "ESP32-S3 non-writing internal-memory flash guard test"
++	depends on XTENSA && SMP && OF
++	default n
++	help
++	  Tests a relocated SRAM/IRAM two-CPU rendezvous and internal stacks.
++	  Does not program flash or disable caches. Development hardware gate.
+--- a/drivers/mtd/devices/Makefile
++++ b/drivers/mtd/devices/Makefile
+@@ -22,3 +22,6 @@
+ 
+ 
+ CFLAGS_docg3.o			+= -I$(src)
++
++obj-$(CONFIG_MTD_ESP32_FLASH_GUARD_TEST) += esp32s3-flash-guard-test.o
++esp32s3-flash-guard-test-y := esp32s3-flash-guard-main.o esp32s3-flash-guard-template.o
+--- /dev/null
++++ b/drivers/mtd/devices/esp32s3-flash-guard-main.c
+@@ -0,0 +1,166 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* First hardware gate only: no flash programming or cache-disable calls. */
++#include <linux/cpu.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/stop_machine.h>
++
++#define FG_BASE 0x3fcc8000UL
++#define FG_BYTES 0x2000
++#define FG_ALIAS 0x6f0000UL
++#define FG_CONTROL 0x800
++#define FG_STACK(cpu) (0x1000 + (cpu) * 0x800)
++#define FG_STACK_BYTES 0x800
++#define FG_CANARY 0x9b21a55a
++
++struct fg_control {
++	u32 ready[2], release, result[2], sp[2], pc[2], elapsed[2];
++};
++struct fg_device {
++	void __iomem *sram;
++	unsigned long iram;
++	struct mutex lock;
++	u32 code_bytes, runs;
++	int last_result;
++	bool checked[2];
++};
++extern const u8 esp32_flash_guard_template_start[];
++extern const u8 esp32_flash_guard_template_end[];
++
++static int fg_cpu(void *arg)
++{
++	struct fg_device *fg = arg;
++	unsigned int cpu = raw_smp_processor_id();
++	typedef int (*fg_entry)(struct fg_control *, void *, unsigned int, u32);
++	fg_entry entry = (fg_entry)fg->iram;
++	int ret;
++
++	if (cpu > 1)
++		return -EINVAL;
++	ret = entry((void __force *)(fg->sram + FG_CONTROL),
++		     (void __force *)(fg->sram + FG_STACK(cpu) + FG_STACK_BYTES),
++		     cpu, 120000000);
++	return ret == 0 ? 0 : (ret == 3 ? -ETIMEDOUT : -EIO);
++}
++
++static ssize_t result_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct fg_device *fg = dev_get_drvdata(dev);
++	ssize_t n;
++
++	mutex_lock(&fg->lock);
++	n = sysfs_emit(buf, "runs=%u result=%d code_bytes=%u cpu0_internal=%u cpu1_internal=%u flash_operations=0 cache_changes=0\n",
++		fg->runs, fg->last_result, fg->code_bytes, fg->checked[0], fg->checked[1]);
++	mutex_unlock(&fg->lock);
++	return n;
++}
++static DEVICE_ATTR_RO(result);
++
++static ssize_t test_store(struct device *dev, struct device_attribute *attr,
++			  const char *buf, size_t count)
++{
++	struct fg_device *fg = dev_get_drvdata(dev);
++	unsigned int value, cpu;
++	int ret;
++
++	ret = kstrtouint(buf, 0, &value);
++	if (ret || value != 1)
++		return -EINVAL;
++	mutex_lock(&fg->lock);
++	cpus_read_lock();
++	if (num_online_cpus() != 2 || !cpu_online(0) || !cpu_online(1)) {
++		ret = -ENODEV;
++		goto out;
++	}
++	memset_io(fg->sram + FG_CONTROL, 0, sizeof(struct fg_control));
++	for (cpu = 0; cpu < 2; cpu++) {
++		fg->checked[cpu] = false;
++		writel(FG_CANARY, fg->sram + FG_STACK(cpu));
++	}
++	asm volatile("memw\n\tisync" ::: "memory");
++	ret = stop_machine_cpuslocked(fg_cpu, fg, cpu_online_mask);
++	for (cpu = 0; cpu < 2; cpu++) {
++		void __iomem *control = fg->sram + FG_CONTROL;
++		u32 sp = readl(control + offsetof(struct fg_control, sp) + cpu * 4);
++		u32 pc = readl(control + offsetof(struct fg_control, pc) + cpu * 4);
++		u32 status = readl(control + offsetof(struct fg_control, result) + cpu * 4);
++		u32 ready = readl(control + cpu * 4);
++		unsigned long low = FG_BASE + FG_STACK(cpu);
++
++		/* CALL0 records its return PC using the Xtensa return-address
++		 * encoding; reconstruct the top address bits from this I-bus.
++		 */
++		pc = (pc & 0x3fffffff) | (fg->iram & 0xc0000000);
++		fg->checked[cpu] = ready == 1 && !status && sp >= low + 32 &&
++			sp < low + FG_STACK_BYTES && pc >= fg->iram &&
++			pc < fg->iram + fg->code_bytes &&
++			readl(fg->sram + FG_STACK(cpu)) == FG_CANARY;
++		if (!fg->checked[cpu] && !ret)
++			ret = -EIO;
++	}
++	fg->runs++;
++ out:
++	cpus_read_unlock();
++	fg->last_result = ret;
++	mutex_unlock(&fg->lock);
++	if (ret)
++		dev_warn(dev, "internal-memory dry run failed: %d\n", ret);
++	else
++		dev_info(dev, "internal-memory dry run passed on both CPUs; no flash/cache changes\n");
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_WO(test);
++
++static struct attribute *fg_attrs[] = {
++	&dev_attr_result.attr, &dev_attr_test.attr, NULL,
++};
++static const struct attribute_group fg_group = { .attrs = fg_attrs };
++
++static int fg_probe(struct platform_device *pdev)
++{
++	struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	struct fg_device *fg;
++	unsigned int i;
++
++	static_assert(offsetof(struct fg_control, release) == 8);
++	static_assert(offsetof(struct fg_control, result) == 12);
++	static_assert(offsetof(struct fg_control, sp) == 20);
++	static_assert(offsetof(struct fg_control, pc) == 28);
++	static_assert(offsetof(struct fg_control, elapsed) == 36);
++	if (!res || res->start != FG_BASE || resource_size(res) != FG_BYTES)
++		return -EINVAL;
++	fg = devm_kzalloc(&pdev->dev, sizeof(*fg), GFP_KERNEL);
++	if (!fg)
++		return -ENOMEM;
++	fg->sram = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(fg->sram))
++		return PTR_ERR(fg->sram);
++	fg->iram = FG_BASE + FG_ALIAS;
++	fg->last_result = -ENODATA;
++	fg->code_bytes = esp32_flash_guard_template_end - esp32_flash_guard_template_start;
++	if (!fg->code_bytes || fg->code_bytes > FG_CONTROL)
++		return -E2BIG;
++	mutex_init(&fg->lock);
++	memcpy_toio(fg->sram, esp32_flash_guard_template_start, fg->code_bytes);
++	for (i = 0; i < fg->code_bytes; i++)
++		if (readb(fg->sram + i) != esp32_flash_guard_template_start[i])
++			return -EIO;
++	asm volatile("memw\n\tisync" ::: "memory");
++	platform_set_drvdata(pdev, fg);
++	return devm_device_add_group(&pdev->dev, &fg_group);
++}
++static const struct of_device_id fg_match[] = {
++	{ .compatible = "espressif,esp32s3-flash-guard-test" }, {},
++};
++MODULE_DEVICE_TABLE(of, fg_match);
++static struct platform_driver fg_driver = {
++	.probe = fg_probe,
++	.driver = { .name = "esp32s3-flash-guard-test", .of_match_table = fg_match },
++};
++module_platform_driver(fg_driver);
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Non-writing ESP32-S3 flash guard SRAM/IRAM dry run");
+--- /dev/null
++++ b/drivers/mtd/devices/esp32s3-flash-guard-template.S
+@@ -0,0 +1,78 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Relocatable Xtensa windowed-ABI rendezvous. NO flash/cache operations.
++ * a2: internal control block, a3: internal stack top,
++ * a4: CPU index (0 or 1), a5: timeout in CCOUNT cycles.
++ * Fields: ready[2], release, result[2], sp[2], pc[2], elapsed[2].
++ * Every access between publication and return is to registers/internal RAM.
++ */
++    .section .text.esp32_flash_guard_template,"ax",@progbits
++    .balign 4
++    .global esp32_flash_guard_template_start
++    .global esp32_flash_guard_template_end
++    .type esp32_flash_guard_template_start,@function
++    .begin no-transform
++esp32_flash_guard_template_start:
++    entry a1, 32
++    mov a8, a1
++    mov a1, a3
++    addi a1, a1, -32
++    s32i a2, a1, 0
++    s32i a4, a1, 4
++    slli a9, a4, 2
++    add a14, a2, a9
++    s32i a1, a14, 20
++    mov a10, a0
++    call0 .Lpc
++    .balign 4
++.Lpc:
++    mov a11, a0
++    mov a0, a10
++    s32i a11, a14, 28
++    rsr a12, ccount
++    movi a6, 1
++    s32i a6, a14, 0
++    memw
++    bnez a4, .Lpeer
++.Lmaster:
++    l32i a6, a2, 4
++    bnez a6, .Lready
++    rsr a13, ccount
++    sub a13, a13, a12
++    bltu a13, a5, .Lmaster
++    j .Labort
++.Lready:
++    l32i a6, a2, 8
++    bnez a6, .Lfinish
++    movi a6, 1
++    s32i a6, a2, 8
++    memw
++    j .Lfinish
++.Lpeer:
++    l32i a6, a2, 8
++    bnez a6, .Lfinish
++    rsr a13, ccount
++    sub a13, a13, a12
++    bltu a13, a5, .Lpeer
++.Labort:
++    movi a6, 2
++    s32i a6, a2, 8
++    memw
++.Lfinish:
++    l32i a6, a2, 8
++    movi a7, 1
++    xor a6, a6, a7
++    l32i a7, a1, 4
++    beq a7, a4, .Lstack_ok
++    movi a6, 4
++.Lstack_ok:
++    s32i a6, a14, 12
++    rsr a13, ccount
++    sub a13, a13, a12
++    s32i a13, a14, 36
++    memw
++    mov a1, a8
++    mov a2, a6
++    retw
++esp32_flash_guard_template_end:
++    .end no-transform
++    .size esp32_flash_guard_template_start, .-esp32_flash_guard_template_start

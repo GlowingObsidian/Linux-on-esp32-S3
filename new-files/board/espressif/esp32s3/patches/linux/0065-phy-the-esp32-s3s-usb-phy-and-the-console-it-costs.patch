@@ -1,0 +1,352 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: paulneja <207793167+paulneja@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 12:00:00 -0300
+Subject: [PATCH 65/66] phy: the ESP32-S3's USB PHY, and the console it costs
+
+The S3 has one USB PHY on the die and two peripherals that can drive it:
+the OTG controller, and the USB-Serial/JTAG block the ROM uses to flash the
+chip. It comes out of reset belonging to Serial/JTAG, and the device tree
+already describes both the controller and the registers that decide
+ownership -- usb@60080000 carries "snps,dwc2", so drivers/usb/dwc2 picks it
+up with no work at all, and usb_phy@60008120 maps exactly the two registers
+that hand the pads over. What was missing was something to drive them:
+devm_phy_get() in dwc2's probe finds a phy node whose provider never
+registers, which is -EPROBE_DEFER, so the controller waits forever for a
+driver that does not exist.
+
+This is that driver, and it is small on purpose: a read-modify-write raises
+the pad enable and points phy_sel at the internal PHY, then two bits in
+RTC_CNTL hand the choice from hardware to software and pick the OTG core.
+The order and the bits are ESP-IDF's usb_phy_ll_int_otg_enable(), the
+vendor's own sequence for this part, and the file says at each step where
+the value came from.
+
+Two things it deliberately does not do. It does not touch the eFuses that
+pin the same choice at silicon level -- efuse usb_phy_sel, and
+EFUSE_DIS_USB_OTG_DOWNLOAD_MODE which on modules made before date code 2219
+disables the ROM's USB download mode for good. A register write is undone by
+a chip reset, which is the whole reason the board stays flashable over USB
+afterwards. And it never stores a constant into either register: both have
+bits set in their reset values, the two clk_force_on bits in OTG_CONF among
+them, and clearing those would stop the wrap's own clock.
+
+The pads are driven the way a host drives them rather than left to the
+IO_MUX: pull-downs on D- and D+ with both pull-ups off, enabled by the
+override bit, which is what a host holds its lines at while nothing is
+attached -- the device's own pull-up is what signals an attach. power_off
+clears the override again, so unloading the driver leaves the pads where the
+SoC brought them up.
+
+The cost is the console. Once the OTG core owns the PHY the Serial/JTAG tty
+is gone for the life of the boot, which is why the next patch turns the acm
+node off and drops console=ttyGS3.
+
+---
+ drivers/phy/Kconfig           |  15 +++++++++++++++
+ drivers/phy/Makefile          |   1 +
+ drivers/phy/phy-esp32s3-usb.c | 256 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 272 insertions(+)
+ create mode 100644 drivers/phy/phy-esp32s3-usb.c
+
+diff --git a/drivers/phy/Kconfig b/drivers/phy/Kconfig
+index 19f3b7d12b7d4..2edd5789ff14f 100644
+--- a/drivers/phy/Kconfig
++++ b/drivers/phy/Kconfig
+@@ -91,6 +91,21 @@ config PHY_ECONET_PCIE
+ 	  callback for PCIe GEN1 and GEN2 ports. This PHY is found on
+ 	  EcoNet SoCs including EN751221 and EN7528.
+ 
++config PHY_ESP32S3_USB
++	tristate "Espressif ESP32-S3 USB PHY driver"
++	depends on XTENSA_PLATFORM_ESP32 || COMPILE_TEST
++	select GENERIC_PHY
++	help
++	  Enable this to support the USB PHY built into the ESP32-S3. The
++	  SoC has one, and the USB-OTG controller shares it with the
++	  USB-Serial/JTAG block, which owns it out of reset. This driver
++	  hands it to the OTG core, which usb@60080000 cannot probe without.
++
++	  Only one of the two can hold the PHY at a time, so enabling this
++	  costs the USB console for the life of the boot.
++
++	  If M is selected, the module will be called phy-esp32s3-usb.
++
+ config PHY_GOOGLE_USB
+ 	tristate "Google Tensor SoC USB PHY driver"
+ 	select GENERIC_PHY
+diff --git a/drivers/phy/Makefile b/drivers/phy/Makefile
+index d7aa516bcc49e..42a509452242a 100644
+--- a/drivers/phy/Makefile
++++ b/drivers/phy/Makefile
+@@ -10,6 +10,7 @@ obj-$(CONFIG_GENERIC_PHY_MIPI_DPHY)	+= phy-core-mipi-dphy.o
+ obj-$(CONFIG_PHY_AIROHA_PCIE)		+= phy-airoha-pcie.o
+ obj-$(CONFIG_PHY_CAN_TRANSCEIVER)	+= phy-can-transceiver.o
+ obj-$(CONFIG_PHY_ECONET_PCIE)		+= phy-econet-pcie.o
++obj-$(CONFIG_PHY_ESP32S3_USB)		+= phy-esp32s3-usb.o
+ obj-$(CONFIG_PHY_EYEQ5_ETH)		+= phy-eyeq5-eth.o
+ obj-$(CONFIG_PHY_GOOGLE_USB)		+= phy-google-usb.o
+ obj-$(CONFIG_USB_LGM_PHY)		+= phy-lgm-usb.o
+diff --git a/drivers/phy/phy-esp32s3-usb.c b/drivers/phy/phy-esp32s3-usb.c
+new file mode 100644
+index 0000000000000..8f0fa95248cf8
+--- /dev/null
++++ b/drivers/phy/phy-esp32s3-usb.c
+@@ -0,0 +1,256 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * USB PHY for the ESP32-S3
++ *
++ * The S3's USB-OTG controller is a Synopsys DWC2 core, and drivers/usb/dwc2
++ * already knows it: the device tree node carries "snps,dwc2" as its second
++ * compatible so the generic match in dwc2_of_match_table applies. Nothing in
++ * this file concerns the controller. What was missing is the PHY, and this is
++ * the whole of it.
++ *
++ * The S3 has exactly one USB PHY on the die. Two peripherals can drive it --
++ * the OTG controller, and the USB-Serial/JTAG block that shares the same D-
++ * and D+ pads (GPIO19 and GPIO20) -- and the port comes out of reset belonging
++ * to the Serial/JTAG half, because that is the half the ROM uses to flash the
++ * chip. Handing the pads to the OTG controller is therefore a small, specific
++ * piece of register work, and it is the difference between the port being a
++ * console and the port being a host controller.
++ *
++ * Two registers decide it, and the device tree node's two reg windows map
++ * exactly those two, in this order:
++ *
++ *   reg[0]  RTC_CNTL USB_CONF   at 0x60008120   (32-bit)
++ *   reg[1]  USB_WRAP OTG_CONF   at 0x60039000   (32-bit)
++ *
++ * In USB_WRAP's OTG_CONF:
++ *
++ *   bit  2  phy_sel             0 = the internal PHY (which is the only
++ *                               kind this part has)
++ *   bit 12  pad_pull_override   when set, the four bits below decide the
++ *                               pads' pulls instead of the IO_MUX
++ *   bit 13  dp_pullup
++ *   bit 14  dp_pulldown
++ *   bit 15  dm_pullup
++ *   bit 16  dm_pulldown
++ *   bit 17  pullup_value        device-mode D+ pull-up strength
++ *   bit 18  pad_enable
++ *   bit 19  ahb_clk_force_on    set in the reset value
++ *   bit 20  phy_clk_force_on    set in the reset value
++ *   bit 31  clk_en
++ *
++ * In RTC_CNTL's USB_CONF:
++ *
++ *   bit  5  usb_pad_pull_override
++ *   bit  6  usb_dp_pullup
++ *   bit  8  usb_dm_pullup
++ *   bit 12  usb_pad_enable
++ *   bit 19  sw_usb_phy_sel      software's choice of PHY
++ *   bit 20  sw_hw_usb_phy_sel   set = software chooses, clear = hardware does
++ *
++ * The sequence in ->init is ESP-IDF's usb_phy_ll_int_otg_enable(), in that
++ * function's order: raise pad_enable first, then point phy_sel at the internal
++ * PHY, then take the choice away from hardware and make it -- sw_hw_usb_phy_sel
++ * and sw_usb_phy_sel both set. The order is copied rather than reasoned about
++ * because the two halves are in different clock domains and the vendor's own
++ * order is the one that is known to work; there is no delay or poll in it, and
++ * none is added here. Everything outside those bits is left alone: the two
++ * clk_force_on bits in particular are set in the reset value and clearing them
++ * would stop the wrap's own clock, so every write below is a read-modify-write
++ * and never a store of a constant. The vref fields in RTC_CNTL's USB_CONF are
++ * likewise left at reset; nothing here has a way to know a better value for
++ * them.
++ *
++ * This switches the PHY at runtime by writing registers only. It deliberately
++ * does not touch the two eFuses that can pin the same choice at silicon level
++ * -- esp_efuse_usb_phy_sel, and EFUSE_DIS_USB_OTG_DOWNLOAD_MODE which on
++ * modules made before date code 2219 disables the ROM's USB download mode for
++ * good. A register write is undone by a chip reset, so the board can still be
++ * flashed over USB-Serial/JTAG after being put into download mode by hand.
++ * Making this Strap or eFuse-based would make the board unflashable over USB,
++ * so it must not be done.
++ *
++ * The price of the switch is the console. Once the OTG core owns the PHY, the
++ * USB-Serial/JTAG tty is gone for the life of the boot, which is why this
++ * image's console is UART0 on D0/D1.
++ *
++ * The pads' pulls are set here rather than by any hardware default, because a
++ * host has to hold both lines low at idle: the host end of a USB cable carries
++ * 15k pull-downs and it is the device's 1.5k pull-up that signals an attach.
++ * So ->power_on turns the override on and enables both pull-downs with both
++ * pull-ups off, and ->power_off clears the override again so the pads go back
++ * to whatever the IO_MUX brings them up with.
++ */
++
++#include <linux/bitops.h>
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/phy/phy.h>
++#include <linux/platform_device.h>
++
++/* USB_WRAP, OTG_CONF. */
++#define ESP32S3_USB_PHY_SEL			BIT(2)
++#define ESP32S3_USB_PAD_PULL_OVERRIDE		BIT(12)
++#define ESP32S3_USB_DP_PULLUP			BIT(13)
++#define ESP32S3_USB_DP_PULLDOWN			BIT(14)
++#define ESP32S3_USB_DM_PULLUP			BIT(15)
++#define ESP32S3_USB_DM_PULLDOWN			BIT(16)
++#define ESP32S3_USB_PAD_ENABLE			BIT(18)
++
++/* RTC_CNTL, USB_CONF. */
++#define ESP32S3_RTC_SW_USB_PHY_SEL		BIT(19)
++#define ESP32S3_RTC_SW_HW_USB_PHY_SEL		BIT(20)
++
++#define ESP32S3_USB_PHY_PULLS		(ESP32S3_USB_DP_PULLUP | \
++					 ESP32S3_USB_DP_PULLDOWN | \
++					 ESP32S3_USB_DM_PULLUP | \
++					 ESP32S3_USB_DM_PULLDOWN)
++
++struct esp32s3_usb_phy {
++	struct device *dev;
++	void __iomem *wrap;	/* USB_WRAP: OTG_CONF */
++	void __iomem *rtc;	/* RTC_CNTL: USB_CONF */
++};
++
++static void esp32s3_usb_phy_set(void __iomem *reg, u32 mask, u32 val)
++{
++	u32 v = readl(reg);
++
++	v = (v & ~mask) | (val & mask);
++	writel(v, reg);
++}
++
++static int esp32s3_usb_phy_init(struct phy *phy)
++{
++	struct esp32s3_usb_phy *p = phy_get_drvdata(phy);
++
++	/*
++	 * The order is the vendor's:
++	 *	USB_WRAP.otg_conf.pad_enable = 1;
++	 *	USB_WRAP.otg_conf.phy_sel = 0;		internal PHY
++	 *	RTC_CNTL.usb_conf.sw_hw_usb_phy_sel = 1;
++	 *	RTC_CNTL.usb_conf.sw_usb_phy_sel = 1;
++	 * Both mux bits set is what hands the pads to the OTG core and takes
++	 * them from USB-Serial/JTAG.
++	 */
++	esp32s3_usb_phy_set(p->wrap, ESP32S3_USB_PAD_ENABLE,
++			    ESP32S3_USB_PAD_ENABLE);
++	esp32s3_usb_phy_set(p->wrap, ESP32S3_USB_PHY_SEL, 0);
++	esp32s3_usb_phy_set(p->rtc,
++			    ESP32S3_RTC_SW_HW_USB_PHY_SEL |
++			    ESP32S3_RTC_SW_USB_PHY_SEL,
++			    ESP32S3_RTC_SW_HW_USB_PHY_SEL |
++			    ESP32S3_RTC_SW_USB_PHY_SEL);
++
++	dev_dbg(p->dev, "internal PHY handed to the OTG core\n");
++
++	return 0;
++}
++
++static int esp32s3_usb_phy_power_on(struct phy *phy)
++{
++	struct esp32s3_usb_phy *p = phy_get_drvdata(phy);
++
++	esp32s3_usb_phy_set(p->wrap,
++			    ESP32S3_USB_PAD_PULL_OVERRIDE | ESP32S3_USB_PHY_PULLS,
++			    ESP32S3_USB_PAD_PULL_OVERRIDE |
++			    ESP32S3_USB_DP_PULLDOWN | ESP32S3_USB_DM_PULLDOWN);
++
++	return 0;
++}
++
++static int esp32s3_usb_phy_power_off(struct phy *phy)
++{
++	struct esp32s3_usb_phy *p = phy_get_drvdata(phy);
++
++	esp32s3_usb_phy_set(p->wrap,
++			    ESP32S3_USB_PAD_PULL_OVERRIDE | ESP32S3_USB_PHY_PULLS,
++			    0);
++
++	return 0;
++}
++
++static int esp32s3_usb_phy_exit(struct phy *phy)
++{
++	struct esp32s3_usb_phy *p = phy_get_drvdata(phy);
++
++	esp32s3_usb_phy_set(p->wrap, ESP32S3_USB_PAD_ENABLE, 0);
++
++	return 0;
++}
++
++static const struct phy_ops esp32s3_usb_phy_ops = {
++	.init		= esp32s3_usb_phy_init,
++	.exit		= esp32s3_usb_phy_exit,
++	.power_on	= esp32s3_usb_phy_power_on,
++	.power_off	= esp32s3_usb_phy_power_off,
++	.owner		= THIS_MODULE,
++};
++
++static int esp32s3_usb_phy_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct esp32s3_usb_phy *p;
++	struct phy_provider *provider;
++	struct phy *phy;
++
++	p = devm_kzalloc(dev, sizeof(*p), GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++
++	p->dev = dev;
++
++	/*
++	 * The device tree's reg order, which is RTC_CNTL first and USB_WRAP
++	 * second. Swapping those two properties in the dts would silently
++	 * point each window at the other register, so they are named here
++	 * rather than indexed by a loop.
++	 */
++	p->rtc = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(p->rtc))
++		return dev_err_probe(dev, PTR_ERR(p->rtc),
++				     "cannot map RTC_CNTL USB_CONF\n");
++
++	p->wrap = devm_platform_ioremap_resource(pdev, 1);
++	if (IS_ERR(p->wrap))
++		return dev_err_probe(dev, PTR_ERR(p->wrap),
++				     "cannot map USB_WRAP OTG_CONF\n");
++
++	phy = devm_phy_create(dev, NULL, &esp32s3_usb_phy_ops);
++	if (IS_ERR(phy))
++		return dev_err_probe(dev, PTR_ERR(phy), "cannot create the phy\n");
++
++	phy_set_drvdata(phy, p);
++
++	/*
++	 * devm_of_phy_provider_register() returns a struct phy_provider *,
++	 * not an int, so it cannot be returned from here directly -- that is
++	 * a -Wint-conversion error and a build failure, not a warning. The
++	 * error is in the pointer, which is what PTR_ERR_OR_ZERO() extracts;
++	 * on success it is 0, which is what probe() should return.
++	 */
++	provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
++
++	return PTR_ERR_OR_ZERO(provider);
++}
++
++static const struct of_device_id esp32s3_usb_phy_of_match[] = {
++	{ .compatible = "esp,esp32s3-usb-phy" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, esp32s3_usb_phy_of_match);
++
++static struct platform_driver esp32s3_usb_phy_driver = {
++	.probe = esp32s3_usb_phy_probe,
++	.driver = {
++		.name = "esp32s3-usb-phy",
++		.of_match_table = esp32s3_usb_phy_of_match,
++	},
++};
++module_platform_driver(esp32s3_usb_phy_driver);
++
++MODULE_DESCRIPTION("ESP32-S3 USB PHY");
++MODULE_LICENSE("GPL");
+-- 
+2.55.0

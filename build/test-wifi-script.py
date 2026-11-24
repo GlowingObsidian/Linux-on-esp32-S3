@@ -109,6 +109,44 @@ iw() {{
         self.assertIn('killall -q wpa_supplicant', calls.read_text())
         self.assertFalse((self.dir / 'raw').exists())
 
+    def test_power_state_preserves_other_settings_and_file_mode(self):
+        state = self.dir / 'wifi-state'
+        state.write_text('# retained\nOTHER_SETTING=yes\nWIFI_RADIO_ENABLE=1\n')
+        state.chmod(0o640)
+        r = self.run_function(f'STATE={state}; sync() {{ :; }}; save_power 0; echo rc=$?')
+        self.assertIn('rc=0', r.stdout, r.stderr)
+        self.assertEqual(state.read_text(), '# retained\nOTHER_SETTING=yes\nWIFI_RADIO_ENABLE=0\n')
+        self.assertEqual(state.stat().st_mode & 0o777, 0o640)
+
+    def test_off_is_saved_before_the_connection_is_dropped(self):
+        state = self.dir / 'wifi-state'
+        r = self.run_function(f'''
+STATE={state}
+sync() {{ :; }}
+link_down() {{ grep -q '^WIFI_RADIO_ENABLE=0$' "$STATE" || return 10; echo remembered-before-down; }}
+ip() {{ :; }}
+disable_radio
+''')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('remembered-before-down', r.stdout)
+        self.assertIn('WIFI_RADIO_ENABLE=0', state.read_text())
+
+    def test_on_reuses_saved_credentials_or_opens_the_picker(self):
+        self.conf.write_text('network={\n ssid="saved"\n}\n')
+        fakes = '''
+enable_radio() { echo enabled; }
+iw() { echo 'Not connected.'; }
+apply_conf() { echo reuse-saved; }
+interactive() { echo picker; }
+'''
+        r = self.run_function(fakes + 'resume_or_select')
+        self.assertIn('reuse-saved', r.stdout)
+        self.assertNotIn('picker', r.stdout)
+        self.conf.unlink()
+        r = self.run_function(fakes + 'resume_or_select')
+        self.assertIn('picker', r.stdout)
+        self.assertNotIn('reuse-saved', r.stdout)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
