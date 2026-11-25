@@ -57,6 +57,16 @@ fastfetch
 
 ## Board measurements
 
+The QIO 120 MHz image completed a cold boot on the Arduino Nano ESP32.
+The NOR guard enabled writes automatically, and both `/etc` and `/home`
+mounted read-write. A software reboot reached the UART login prompt in
+**about 5 seconds** from the ROM banner with Wi-Fi and SSH off and no USB
+peripherals attached. This was one capture with roughly 1 s logging
+resolution. Linux reached init in **1.18 s** in the cold-boot log, compared
+with **1.38 s** in the earlier 80 MHz log. Write persistence and warm-load
+stability still need testing. The generic DIO 80 MHz image still awaits a
+hardware boot check.
+
 Measured on the earlier 80 MHz Nano ESP32 image with Wi-Fi and SSH off
 and no USB peripherals attached.
 
