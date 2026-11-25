@@ -14,6 +14,7 @@ p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--source', type=Path, required=True)
 p.add_argument('--output', type=Path, required=True)
 p.add_argument('--root-only', action='store_true', help='Repack rootfs without creating persistent partition seeds')
+p.add_argument('--profile', choices=('nano', 'generic'), default='nano')
 p.add_argument('--tools', type=Path, default=r / 'experiments/mmu-poc/out/programs/default-tools',
                help='Directory populated by build-default-tools.sh')
 a = p.parse_args()
@@ -40,12 +41,20 @@ with tempfile.TemporaryDirectory(prefix='flash-root-', dir=r / 'experiments/mmu-
     run('python3', r / 'build/install-default-tools.py', tree, a.tools,
         r / 'new-files/board/espressif/esp32s3/rootfs_overlay')
     # Retire wrappers inherited from the SD image before the final repack.
-    for name in ('sbin/hybrid-init', 'sbin/flash-init'):
+    for name in ('sbin/hybrid-init', 'sbin/flash-init', 'usr/sbin/flash-state-enable'):
         (tree / name).unlink(missing_ok=True)
-    for src, dest in [('flash-init.sh', 'sbin/flash-state-init'),
-                      ('flash-state-enable.sh', 'usr/sbin/flash-state-enable')]:
-        shutil.copyfile(r / 'build' / src, tree / dest)
-        (tree / dest).chmod(0o755)
+    init_hook = tree / 'sbin/flash-state-init'
+    shutil.copyfile(r / 'build/flash-init.sh', init_hook)
+    init_hook.chmod(0o755)
+    if a.profile == 'generic':
+        (tree / 'etc/hostname').write_text('esp32s3\n')
+        (tree / 'etc/issue').write_text('Welcome to ESP32-S3 Linux\n')
+        (tree / 'usr/bin/espctl').unlink(missing_ok=True)
+        version = tree / 'etc/esp-image-version'
+        if version.exists():
+            lines = version.read_text().splitlines()
+            version.write_text('\n'.join('BOARD=Espressif ESP32-S3 N16R8' if line.startswith('BOARD=') else line
+                                          for line in lines) + '\n')
     # gpio-leds owns the Nano RGB pins; the boot hook retires persisted copies.
     (tree / 'etc/init.d/S04led').unlink(missing_ok=True)
     inittab = tree / 'etc/inittab'
@@ -79,7 +88,7 @@ mtd:home /home jffs2 noauto,noatime 0 0
     assert (check / 'etc/inittab').read_text().count('::sysinit:/sbin/flash-state-init\n') == 1
     assert not (check / 'sbin/hybrid-init').exists()
     assert not (check / 'sbin/flash-init').exists()
-    assert (check / 'usr/sbin/flash-state-enable').read_bytes() == (r / 'build/flash-state-enable.sh').read_bytes()
+    assert not (check / 'usr/sbin/flash-state-enable').exists()
 
     partitions = []
     seed_layout = [] if a.root_only else [('etc', 0xd0000, 0x70000), ('home', home_offset, 0x1000000 - home_offset)]
@@ -93,13 +102,13 @@ mtd:home /home jffs2 noauto,noatime 0 0
         assert target.stat().st_size == size
         partitions.append(dict(name=name, offset=hex(offset), size=size,
                                erase_size=65536, sha256=sha(target)))
-    manifest = dict(profile='flash-xip-etc-home-native-nor',
+    manifest = dict(profile='flash-xip-etc-home-native-nor', board_profile=a.profile,
                     rootfs_sha256=sha(image), rootfs_bytes=image.stat().st_size,
                     source_rootfs_sha256=sha(a.source), bash_sha256=bash_sha,
                     busybox_sha256=busybox_sha, sd_required=False,
                     init='/sbin/init', state_mount_hook='/sbin/flash-state-init',
                     writable_dirs=['/etc', '/home'], automatic_flash_format=False,
-                    first_boot_writes_locked=True, partitions=partitions,
+                    automatic_writable_state=True, partitions=partitions,
                     hardware_verified=False)
     (a.output / 'flash-rootfs.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(json.dumps(manifest, indent=2))

@@ -10,23 +10,21 @@ mount -t sysfs sysfs /sys 2>/dev/null || :
 mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp
 mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /var/log
 
-# A fresh image has no marker. Keep it locked until the operator has passed
-# the explicit backed-up scratch test and run flash-state-enable once.
+# Confirm that both state filesystems can be read before permitting writes.
+# The guard checks cache coordination and identifies the flash at every boot.
 if [ -e "$guard_dev/rw_enable" ] && mount -t jffs2 -o ro,noatime mtd:etc /etc; then
-    if [ "$(cat /etc/.flash-rw-verified 2>/dev/null)" = flash-nor-v1 ]; then
-        if echo 3 > "$guard_dev/test" && echo 4 > "$guard_dev/test" &&
-           echo resume > "$guard_dev/rw_enable" &&
-           mount -o remount,rw,noatime /etc &&
-           mount -t jffs2 -o rw,noatime mtd:home /home; then
-            :
-        else
-            mount -o remount,ro /etc 2>/dev/null || :
-            echo 0 > "$guard_dev/rw_enable"
-            echo 'flash: writable-state validation failed; recovery with read-only defaults'
-        fi
+    if mount -t jffs2 -o ro,noatime mtd:home /home &&
+       echo 3 > "$guard_dev/test" && echo 4 > "$guard_dev/test" &&
+       echo resume > "$guard_dev/rw_enable" &&
+       mount -o remount,rw,noatime /etc &&
+       mount -o remount,rw,noatime /home; then
+        :
     else
-        umount /etc
-        echo 'flash: first boot; writes locked pending the manual NOR scratch test'
+        mount -o remount,ro /etc 2>/dev/null || :
+        echo 0 > "$guard_dev/rw_enable"
+        umount /home 2>/dev/null || :
+        umount /etc 2>/dev/null || :
+        echo 'flash: writable-state validation failed; recovery with read-only defaults'
     fi
 else
     echo 'flash: writable partitions unavailable; using read-only root defaults'

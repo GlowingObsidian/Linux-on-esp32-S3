@@ -47,6 +47,7 @@ sha256sum() {
 mount() {
     printf 'mount %s\n' "$*" >> "$TRACE"
     case "$*" in
+        *remount,rw*"/home") [ "$FAIL" != home-remount ] || return 1 ;;
         *remount,rw*) [ "$FAIL" != remount ] || return 1 ;;
         *mtd:home*) [ "$FAIL" != home ] || return 1 ;;
         *mtd:etc*) [ "$FAIL" != etc ] || return 1 ;;
@@ -63,7 +64,7 @@ sync() { echo sync >> "$TRACE"; [ "$FAIL" != sync ]; }
         if script=='flash-init.sh':
             assert result.returncode==0 and 'WIFI' in trace and 'INIT' not in trace,(name,result.stderr)
             assert 'mmcblk' not in trace and 'ext4' not in trace
-            if marker and driver and not fail:
+            if driver and not fail:
                 assert 'mtd:home' in trace and 'remount,rw' in trace and state=='resume'
                 assert (root/'sys/guard/test').read_text().strip()=='4'
                 assert 'persistent writable etc/home' not in result.stdout
@@ -76,8 +77,10 @@ sync() { echo sync >> "$TRACE"; [ "$FAIL" != sync ]; }
                     assert 'modified legacy' in result.stderr
             else:
                 assert state!='resume' and 'persistent writable etc/home' not in result.stdout
-                if marker and fail in ('home','remount','guard'):assert state=='0'
-                if not marker:assert not (root/'sys/guard/test').exists()
+                if driver and fail in ('home','remount','home-remount','guard'):
+                    assert state=='0' and 'umount ' in trace
+                if fail in ('home', 'etc'): assert not (root/'sys/guard/test').exists()
+            assert 'manual NOR scratch test' not in result.stdout
         elif rw!='1':
             assert result.returncode!=0 and 'mount ' not in trace
         elif args:
@@ -93,12 +96,12 @@ sync() { echo sync >> "$TRACE"; [ "$FAIL" != sync ]; }
             assert (root/'etc/.flash-rw-verified').read_text()=='flash-nor-v1\n'
         cases.append(dict(case=name,exit=result.returncode))
 
-run('flash-init.sh','first-boot-locked')
+run('flash-init.sh','first-boot-automatic-resume')
 run('flash-init.sh','marker-resumes',marker=True)
 run('flash-init.sh','retire-legacy-led',marker=True,led='original')
 run('flash-init.sh','preserve-custom-led',marker=True,led='custom')
 run('flash-init.sh','missing-driver',driver=False)
-for fault in ('etc','home','remount','guard'):
+for fault in ('etc','home','remount','home-remount','guard'):
     run('flash-init.sh','boot-failure-'+fault,marker=True,fail=fault)
 run('flash-state-enable.sh','enable-refuses-locked')
 run('flash-state-enable.sh','enable-after-scratch',rw='1')
@@ -108,4 +111,4 @@ for fault in ('etc','marker-write','sync'):
 run('flash-state-enable.sh','enable-rejects-sd-import',rw='1',args=('--import-sd',))
 out.parent.mkdir(parents=True,exist_ok=True)
 out.write_text(json.dumps(dict(passed=len(cases),cases=cases),indent=2)+'\n')
-print(f'PASS: {len(cases)} actual-script scenarios: locked first boot, marker resume, no SD mount, failed guard/mount recovery, and explicit state activation')
+print(f'PASS: {len(cases)} actual-script scenarios: automatic first boot, existing-state resume, no SD mount, failed guard/mount recovery, and explicit state activation')

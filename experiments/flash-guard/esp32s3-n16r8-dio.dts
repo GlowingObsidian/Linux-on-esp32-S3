@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "arduino-nano-esp32-wifi-iram.dts"
+
+/ {
+	model = "Espressif ESP32-S3 N16R8";
+	compatible = "espressif,esp32s3";
+	/delete-node/ leds;
+};
+
+&{/i2c0} {
+	status = "disabled";
+};

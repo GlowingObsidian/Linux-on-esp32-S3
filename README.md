@@ -10,9 +10,23 @@ The firmware settings, pin assignments, and flash layout target the Nano.
 
 ## Quick start
 
-Download the full factory image and its checksum from [Releases](https://github.com/GlowingObsidian/Linux-on-esp32-S3/releases),
-or build the image with Git and Docker. The new partition layout is for a
-clean install. Use matching artifacts from the same build.
+Download a full factory image and its checksum from [Releases](https://github.com/GlowingObsidian/Linux-on-esp32-S3/releases).
+
+| Image | Hardware | Flash and PSRAM |
+| --- | --- | --- |
+| ESP32-S3 DIO 80 | ESP32-S3 N16R8 with 16 MiB SPI NOR and 8 MiB octal PSRAM | 80 MHz DIO flash and 80 MHz octal PSRAM |
+| Nano ESP32 QIO 120 | Arduino Nano ESP32 (ABX00083) | 120 MHz QIO flash and 120 MHz octal PSRAM, experimental |
+
+The DIO image uses UART0 on GPIO43/44 and omits the Nano-specific RGB LED
+and I²C pin assignments. Automatic NOR write support covers JEDEC
+`c84018` and `ef4018`. Other chips fall back to read-only factory defaults.
+ESP-IDF uses an 80 MHz DOUT ROM header for the QIO profile and selects
+120 MHz QIO after ROM startup. The 120 MHz octal PSRAM timing is temperature
+sensitive. [Espressif MSPI timing guide](https://docs.espressif.com/projects/esp-idf/en/v5.1/esp32s3/api-guides/flash_psram_config.html)
+
+Use a clean install for the factory layout. Use matching artifacts from
+the same build. To build the image locally, clone the source with Git and
+use Docker.
 
 ```sh
 git clone https://github.com/GlowingObsidian/Linux-on-esp32-S3.git
@@ -26,9 +40,9 @@ replaces persistent state. Use UART0 on D0/D1 at **115200 8N1** for the
 Linux console. The onboard USB port can enter ROM download mode and
 becomes a USB host after Linux boots.
 
-Factory NOR writes start locked. The [one-time NOR verification](docs/writable-flash-research.md)
-enables writable `/etc` and `/home` on the board after the scratch test
-passes. The verified state is restored on later boots.
+The writable-state image mounts `/etc` and `/home` automatically after
+checking flash and cache coordination at boot. It falls back to read-only
+factory defaults if those checks or the state mounts fail.
 
 Log in as `root` with the factory password `arduino`. Run `wifi` to join a
 network and `remote-login ssh` to enable SSH. The fresh image ships an empty
@@ -43,8 +57,8 @@ fastfetch
 
 ## Board measurements
 
-Measured on one Arduino Nano ESP32 with Wi-Fi and SSH off and no USB
-peripherals attached.
+Measured on the earlier 80 MHz Nano ESP32 image with Wi-Fi and SSH off
+and no USB peripherals attached.
 
 | Measurement | Result |
 | --- | --- |
